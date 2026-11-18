@@ -7,8 +7,8 @@ PHDRS {
 
 SECTIONS {
     . = SIZEOF_HEADERS;
-    .text : { *(.text) } :text
+    .text : { *(.text.start) *(.text .text.*) } :text
     . = ALIGN(0x1000);
-    .rodata : { *(.rodata) } :rodata
-    /DISCARD/ : { *(.dynamic) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) }
+    .rodata : { *(.rodata .rodata.*) } :rodata
+    /DISCARD/ : { *(.dynamic) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash) *(.eh_frame*) }
 }

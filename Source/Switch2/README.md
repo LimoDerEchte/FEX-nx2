@@ -44,8 +44,24 @@ probe supplies a minimal initial stack and a limited syscall interface.
 The launcher appends checkpoints and FEXCore messages to
 `/switch/fex/fex-switch2-guest.log` and flushes each line.
 If the software closes, inspect the latest section beginning with
-`--- FEX Switch 2 launcher 0.3.1 started ---`. A crash before `main()` or
+`--- FEX Switch 2 launcher 0.4.0 started ---`. A crash before `main()` or
 failure to open the SD card can leave the file unchanged.
+
+## SD Maze
+
+Build with `make -C Source/Switch2 maze-elf`. Copy the entire
+`Source/Switch2/build/sd-maze/` folder into `/switch/fex/games/` on the SD
+card and launch `sd-maze.elf` from the 0.4.0 launcher. Use the D-pad to
+move and find the exit marked E. Press B or Plus to leave the game.
+Either outcome returns an exit status of 0 to the launcher.
+
+The launcher uses the ELF's parent folder as the guest working directory.
+An optional `<executable>.args` sidecar supplies one argument from its
+first line. The maze reads `data/maze.txt` relative to its working
+directory. The guest runtime supports read-only relative `openat`,
+`read`, `close`, private anonymous memory allocation and release, and
+controller-backed stdin. Other Linux ABI operations remain outside this
+probe's scope.
 
 ## JIT diagnostics
 

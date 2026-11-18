@@ -66,3 +66,28 @@ $(BUILD)/fex-hello.o: HelloGuest.S | $(BUILD)
 
 $(BUILD)/fex-hello.elf: $(BUILD)/fex-hello.o HelloGuest.ld
 	$(HOST_X86_LD) -m elf_x86_64 -pie --no-dynamic-linker -T HelloGuest.ld $< -o $@
+
+HOST_X86_CC ?= cc
+# Use a hyphenated folder so the same targets work with make and on the SD card.
+MAZE_DIR := $(BUILD)/sd-maze
+
+.PHONY: maze-elf
+maze-elf: $(MAZE_DIR)/sd-maze.elf $(MAZE_DIR)/sd-maze.elf.args $(MAZE_DIR)/data/maze.txt
+
+$(BUILD)/maze-start.o: Maze/Start.S | $(BUILD)
+	$(HOST_X86_AS) --64 $< -o $@
+
+$(BUILD)/maze.o: Maze/Maze.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -Os -ffreestanding -fPIE -fno-stack-protector -mgeneral-regs-only -Wall -Wextra -Werror -c $< -o $@
+
+$(MAZE_DIR)/sd-maze.elf: $(BUILD)/maze-start.o $(BUILD)/maze.o HelloGuest.ld
+	mkdir -p $(@D)
+	$(HOST_X86_LD) -m elf_x86_64 -pie --no-dynamic-linker -T HelloGuest.ld $(filter %.o,$^) -o $@
+
+$(MAZE_DIR)/sd-maze.elf.args: Maze/sd-maze.elf.args
+	mkdir -p $(@D)
+	cp $< $@
+
+$(MAZE_DIR)/data/maze.txt: Maze/data/maze.txt
+	mkdir -p $(@D)
+	cp $< $@
