@@ -344,7 +344,11 @@ public:
   TrackingStructure BlockDebuggerTracker {};
 public:
   struct {
+#ifdef __SWITCH2__
+    uint64_t VirtualMemSize {1ULL << 32};
+#else
     uint64_t VirtualMemSize {1ULL << 36};
+#endif
     uint64_t TSCScale = 0;
 
     // Used if the JIT needs to have its interrupt fault code emitted.

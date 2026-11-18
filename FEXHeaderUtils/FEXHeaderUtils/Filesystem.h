@@ -9,11 +9,12 @@
 #include <fcntl.h>
 #include <memory_resource>
 #include <string_view>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH2__)
 #include <linux/limits.h>
 #include <sys/sendfile.h>
 #else
 #include <filesystem>
+#include <limits.h>
 #endif
 #include <sys/stat.h>
 #include <unistd.h>
@@ -56,7 +57,7 @@ inline std::error_code RenameFile(const fextl::string& From, const fextl::string
   return rename(From.c_str(), To.c_str()) == 0 ? std::error_code {} : std::make_error_code(std::errc::io_error);
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH2__)
 inline bool ExistsAt(int FD, const fextl::string& Path) {
   return faccessat(FD, Path.c_str(), F_OK, 0) == 0;
 }

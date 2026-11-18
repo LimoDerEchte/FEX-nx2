@@ -15,8 +15,10 @@ endif()
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 cmake_policy(SET CMP0083 NEW) # Follow new PIE policy
-include(CheckPIESupported)
-check_pie_supported()
+if (NOT FEX_SWITCH2)
+  include(CheckPIESupported)
+  check_pie_supported()
+endif()
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 

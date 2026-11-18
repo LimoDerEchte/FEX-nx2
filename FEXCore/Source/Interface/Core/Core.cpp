@@ -452,6 +452,9 @@ void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
 
 #ifndef _WIN32
 void ContextImpl::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThread, bool Child) {
+#ifdef __SWITCH2__
+  ERROR_AND_DIE_FMT("Fork is unsupported on Switch 2");
+#else
   Allocator::UnlockAfterFork(LiveThread, Child);
 
   Profiler::PostForkAction(Child);
@@ -470,14 +473,19 @@ void ContextImpl::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThread
       FEXCore::Utils::SpinWaitLock::unlock(&StrictSplitLockMutex);
     }
   }
+#endif
 }
 
 void ContextImpl::LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {
+#ifdef __SWITCH2__
+  ERROR_AND_DIE_FMT("Fork is unsupported on Switch 2");
+#else
   CodeInvalidationMutex.lock();
   Allocator::LockBeforeFork(Thread);
   if (Config.StrictInProcessSplitLocks) {
     FEXCore::Utils::SpinWaitLock::lock(&StrictSplitLockMutex);
   }
+#endif
 }
 #endif
 

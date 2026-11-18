@@ -7,6 +7,10 @@
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/fextl/memory.h>
 
+#ifdef __SWITCH2__
+#include <FEXCore/Utils/Switch2/JitMemory.h>
+#endif
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -70,6 +74,9 @@ protected:
   AsmDispatch DispatchPtr;
   JITCallback CallbackPtr;
 private:
+#ifdef __SWITCH2__
+  FEXCore::Switch2::JitMemory ExecutableMemory;
+#endif
   /**
    * @name Dispatch Helper functions
    * @{ */

@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <limits.h>
 
-#if !defined(_WIN32)
+#if defined(__SWITCH2__)
+#include <shared_mutex>
+#elif !defined(_WIN32)
 #include <linux/futex.h> /* Definition of FUTEX_* constants */
 #include <sys/syscall.h> /* Definition of SYS_* constants */
 #include <unistd.h>
@@ -21,6 +23,9 @@
 #include <FEXCore/Utils/SpinWaitLock.h>
 
 namespace FEXCore::Utils::WritePriorityMutex {
+#ifdef __SWITCH2__
+using Mutex = std::shared_mutex;
+#else
 
 // A custom mutex that prioritizes exclusive locks.
 // In highly contested scenarios, this can help minimize overall contention time.
@@ -409,4 +414,5 @@ private:
   //  Bits[15:0]: Read-owner count.
   uint32_t Futex {};
 };
+#endif
 } // namespace FEXCore::Utils::WritePriorityMutex

@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
+if(NOT DEFINED ENV{DEVKITPRO})
+  set(ENV{DEVKITPRO} /opt/devkitpro)
+endif()
+set(DKP "$ENV{DEVKITPRO}")
+set(DKP_CXX "${DKP}/devkitA64/bin/aarch64-none-elf-g++")
+execute_process(COMMAND "${DKP_CXX}" -print-sysroot OUTPUT_VARIABLE DKP_SYSROOT OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${DKP_CXX}" -dumpfullversion OUTPUT_VARIABLE DKP_GCC_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+set(DKP_CXX_INCLUDE "${DKP_SYSROOT}/include/c++/${DKP_GCC_VERSION}")
+
+set(CMAKE_C_COMPILER clang)
+set(CMAKE_CXX_COMPILER clang++)
+set(CMAKE_C_COMPILER_TARGET aarch64-none-elf)
+set(CMAKE_CXX_COMPILER_TARGET aarch64-none-elf)
+set(CMAKE_AR "${DKP}/devkitA64/bin/aarch64-none-elf-ar")
+set(CMAKE_RANLIB "${DKP}/devkitA64/bin/aarch64-none-elf-ranlib")
+
+file(STRINGS "${DKP}/libounce/switch2_cpu.mk" DKP_CPU_LINE REGEX "^SWITCH2_CPU")
+string(REGEX REPLACE "^SWITCH2_CPU[ \t]*:=[ \t]*" "" DKP_CPU "${DKP_CPU_LINE}")
+set(DKP_COMMON_FLAGS "${DKP_CPU} -fPIE -femulated-tls")
+set(DKP_SYSTEM_INCLUDES "-isystem ${DKP_SYSROOT}/include -isystem ${DKP}/libounce/include -isystem ${DKP}/portlibs/switch2/include")
+set(CMAKE_C_FLAGS_INIT "${DKP_COMMON_FLAGS} ${DKP_SYSTEM_INCLUDES}")
+set(CMAKE_CXX_FLAGS_INIT "${DKP_COMMON_FLAGS} -nostdinc++ -isystem ${DKP_CXX_INCLUDE} -isystem ${DKP_CXX_INCLUDE}/aarch64-none-elf ${DKP_SYSTEM_INCLUDES}")

@@ -506,6 +506,7 @@ void Arm64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   }
 }
 
+#ifndef __SWITCH2__
 static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
@@ -537,6 +538,8 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
   // No need to reset HostCode here as the exit linker pointer is stored separately, and if the block is relinked it will be updated.
 }
 
+#endif
+
 uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
   auto Thread = Frame->Thread;
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
@@ -564,6 +567,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     }
   }
 
+#ifndef __SWITCH2__
   // See ExitFunction in BranchOps.cpp for an assembly level view of the handled cases.
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
@@ -616,7 +620,9 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
 
     Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
   }
-
+#else
+  // The executable view is read-only. Leave branches routed through the linker.
+#endif
   return HostCode;
 }
 
@@ -1136,12 +1142,10 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
     CodeData.HostCodeOffset = CodeData.BlockBegin - CurrentCodeBuffer->GetBufferBase();
 
     // Copy over CodeBuffer contents
-    memcpy(AllocatedInfo.BufferAllocationOffset, TempCodeBuffer, CodeData.Size);
+    CurrentCodeBuffer->StoreCode(AllocatedInfo.BufferAllocationOffset, TempCodeBuffer, CodeData.Size, CodeOnlySize);
   }
 
   TempCodeBufferAllocator.DelayedDisownBuffer();
-
-  ClearICache(CodeBegin, CodeOnlySize);
 
 #ifdef VIXL_DISASSEMBLER
   if (Disassemble() & FEXCore::Config::Disassemble::STATS) {
@@ -1181,8 +1185,7 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
   auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
 
   uint8_t* Dest = AllocatedInfo.BufferAllocationOffset;
-  memcpy(Dest, HostBytes.data(), HostBytes.size());
-  ClearICache(Dest, HostBytes.size());
+  CurrentCodeBuffer->StoreCode(Dest, HostBytes.data(), HostBytes.size(), HostBytes.size());
 
   CPUBackend::CompiledCode Result;
   Result.BlockBegin = Dest;

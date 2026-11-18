@@ -7,15 +7,16 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <signal.h>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH2__)
 #include <sys/syscall.h>
 #endif
 #include <unistd.h>
 #include <variant>
 
 namespace FEXCore {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH2__)
 // Replacement for std::mutexes to deal with unlocking issues in the face of Linux fork() semantics.
 //
 // A fork() only clones the parent's calling thread. Other threads are silently dropped, which permanently leaves any mutexes owned by them locked.
@@ -233,18 +234,18 @@ static auto GuardSignalDeferringSectionWithFallback(MutexType& mutex, FEXCore::C
 
 #else
 
-// Dummy implementations as Windows doesn't support forking or async signals.
+// Hosts without Linux fork or POSIX signal masking use ordinary mutexes.
 class ForkableUniqueMutex final : public std::mutex {
 public:
   void StealAndDropActiveLocks() {
-    LogMan::Msg::AFmt("{} is unsupported on WIN32 builds!", __func__);
+    LogMan::Msg::AFmt("{} is unsupported on this host!", __func__);
   }
 };
 
 class ForkableSharedMutex final : public std::shared_mutex {
 public:
   void StealAndDropActiveLocks() {
-    LogMan::Msg::AFmt("{} is unsupported on WIN32 builds!", __func__);
+    LogMan::Msg::AFmt("{} is unsupported on this host!", __func__);
   }
 };
 

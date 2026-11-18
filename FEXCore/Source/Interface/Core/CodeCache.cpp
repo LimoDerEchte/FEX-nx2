@@ -47,7 +47,7 @@ MappedCodeCacheFile::~MappedCodeCacheFile() {
     CacheManager->UnregisterMappedCodeBuffer(*this);
   }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH2__)
   if (!CodeBuffer.empty()) {
     FEXCore::Allocator::munmap(CodeBuffer.data(), CodeBuffer.size_bytes());
   }
@@ -295,6 +295,9 @@ template<typename T>
 concept OrderedContainer = requires { typename T::key_compare; };
 
 bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const ExecutableFileSectionInfo& SourceBinary, uint64_t SerializedBaseAddress) {
+#ifdef __SWITCH2__
+  return false;
+#else
   auto CodeBuffer = CTX.GetLatest();
   auto& LookupCache = *Thread.LookupCache->Shared;
   auto Relocations = Thread.CPUBackend->TakeRelocations(SourceBinary.FileStartVA);
@@ -380,6 +383,7 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
   }
 
   return true;
+#endif
 }
 
 void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<uint64_t> GuestBlocks, const fextl::set<uint64_t>& HostBlocks,
@@ -652,6 +656,9 @@ bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> C
 
 fextl::unique_ptr<MappedCodeCacheFile>
 CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& FileInfo, uint64_t FileStartVA) {
+#ifdef __SWITCH2__
+  return {};
+#else
   if (!EnableCodeCaching) {
     return nullptr;
   }
@@ -740,6 +747,7 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
   return fextl::unique_ptr<MappedCodeCacheFile>(
     new (Storage) MappedCodeCacheFile {this, CacheFile, CodeDataInFile, CodeBuffer, BlockListStart, header.NumBlocks, header.NumCodePages,
                                        std::move(PageRelocationRanges), fextl::vector<bool>(NumPages), FileStartVA});
+#endif
 }
 
 bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCodeCacheFile& Code, const ExecutableFileSectionInfo& BinarySection) {
@@ -932,6 +940,9 @@ std::span<std::byte> AbstractCodeCache::SelectCodeRangeToFinalize(MappedCodeCach
 namespace FEXCore::Context {
 
 void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte> CodeRange) {
+#ifdef __SWITCH2__
+  ERROR_AND_DIE_FMT("Mapped executable code caches are unsupported on Switch 2");
+#else
   const size_t StartOffset = CodeRange.data() - Code.CodeBuffer.data();
   const auto StartPage = StartOffset / Utils::FEX_PAGE_SIZE;
   const auto EndPage = StartPage + CodeRange.size_bytes() / Utils::FEX_PAGE_SIZE;
@@ -999,6 +1010,7 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
 #endif
 
   ARMEmitter::Emitter::ClearICache(CodeRange.data(), Size);
+#endif
 }
 
 } // namespace FEXCore::Context

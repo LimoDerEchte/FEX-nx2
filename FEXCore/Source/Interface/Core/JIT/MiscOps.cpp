@@ -5,7 +5,9 @@ tags: backend|arm64
 $end_info$
 */
 
-#ifndef _WIN32
+#ifdef __SWITCH2__
+#include <FEXHeaderUtils/Syscalls.h>
+#elif !defined(_WIN32)
 #include <syscall.h>
 #endif
 
@@ -245,7 +247,16 @@ DEF_OP(ProcessorID) {
     mrs(GetReg(Node), ARMEmitter::SystemRegister::TPIDRRO_EL0);
     return;
   }
-#ifdef _WIN32
+#if defined(__SWITCH2__)
+  // Horizon returns the processor number in w0. There is no NUMA node field.
+  PushDynamicRegs(TMP4);
+  SpillStaticRegs(TMP4);
+  LoadConstant(ARMEmitter::Size::i64Bit, TMP4, reinterpret_cast<uintptr_t>(svcGetCurrentProcessorNumber));
+  blr(TMP4);
+  FillStaticRegs();
+  PopDynamicRegs();
+  mov(GetReg(Node).W(), ARMEmitter::WReg::w0);
+#elif defined(_WIN32)
   else {
     // If on Windows and TPIDRRO isn't supported (like in wine), then this is a programming error.
     ERROR_AND_DIE_FMT("Unsupported");

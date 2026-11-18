@@ -2,7 +2,6 @@ set(MAN_DIR share/man CACHE PATH "MAN_DIR")
 
 set(FEXCORE_BASE_SRCS
   Interface/Config/Config.cpp
-  Utils/Allocator.cpp
   Utils/FileLoading.cpp
   Utils/FileUtils.cpp
   Utils/ForcedAssert.cpp
@@ -10,7 +9,11 @@ set(FEXCORE_BASE_SRCS
   Utils/SpinWaitLock.cpp
   Utils/WildcardMatcher.cpp)
 
-if (NOT MINGW)
+if (NOT FEX_SWITCH2)
+  list(APPEND FEXCORE_BASE_SRCS Utils/Allocator.cpp)
+endif()
+
+if (NOT MINGW AND NOT FEX_SWITCH2)
   list(APPEND FEXCORE_BASE_SRCS
     Utils/Allocator/64BitAllocator.cpp)
 endif()
@@ -19,7 +22,6 @@ set(SRCS
   Common/JitSymbols.cpp
   Interface/Context/Context.cpp
   Interface/Core/LookupCache.cpp
-  Interface/Core/DiskCache.cpp
   Interface/Core/CodeCache.cpp
   Interface/Core/Core.cpp
   Interface/Core/CPUBackend.cpp
@@ -74,6 +76,12 @@ set(SRCS
   Utils/WorkQueueThread.cpp
   Utils/Profiler.cpp)
 
+if (FEX_SWITCH2)
+  list(APPEND SRCS "${CMAKE_CURRENT_SOURCE_DIR}/../../Source/Switch2/HostDiskCache.cpp")
+else()
+  list(APPEND SRCS Interface/Core/DiskCache.cpp)
+endif()
+
 if (ARCHITECTURE_arm64)
   list(APPEND SRCS Utils/ArchHelpers/Arm64.cpp)
 else()
@@ -123,9 +131,9 @@ if (ENABLE_ZYDIS)
   list(APPEND LIBS Zydis::Zydis)
 endif()
 
-if (NOT MINGW)
+if (NOT MINGW AND NOT FEX_SWITCH2)
   list(APPEND LIBS dl)
-else()
+elseif (MINGW)
   list(APPEND LIBS synchronization)
   if (ARCHITECTURE_arm64ec)
     list(APPEND LIBS mincore)
@@ -298,7 +306,9 @@ endfunction()
 
 AddObject(${PROJECT_NAME}_object)
 AddLibrary(${PROJECT_NAME} STATIC)
-AddLibrary(${PROJECT_NAME}_shared SHARED)
+if (NOT FEX_SWITCH2)
+  AddLibrary(${PROJECT_NAME}_shared SHARED)
+endif()
 
 if (NOT MINGW AND NOT BUILD_STEAM_SUPPORT)
   install(TARGETS ${PROJECT_NAME}_shared LIBRARY
@@ -328,4 +338,8 @@ if (NOT MINGW)
 endif()
 
 # The shared library should always link enabled jemalloc libraries
-target_link_libraries(${PROJECT_NAME}_shared PRIVATE JemallocLibs)
+if (NOT FEX_SWITCH2)
+  target_link_libraries(${PROJECT_NAME}_shared PRIVATE JemallocLibs)
+else()
+  target_include_directories(JemallocLibs PRIVATE "${PROJECT_SOURCE_DIR}/include/")
+endif()

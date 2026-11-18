@@ -12,6 +12,10 @@ $end_info$
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
+#ifdef __SWITCH2__
+#include <FEXCore/Utils/Switch2/JitMemory.h>
+#endif
+
 #include <cstddef>
 #include <cstdint>
 
@@ -86,12 +90,19 @@ struct CodeBuffer {
     CodeBufferOffset = Ptr;
   }
 
-  // Returns the base of the buffer.
+  // Writes a compiled block and publishes its executable range.
+  void StoreCode(uint8_t* Destination, const void* Source, size_t Size, size_t InstructionSize);
+
+  // Returns the executable base of the buffer.
   uint8_t* GetBufferBase() const {
     return Ptr;
   }
 
 private:
+#ifdef __SWITCH2__
+  FEXCore::Switch2::JitMemory ExecutableMemory;
+  std::mutex PublicationMutex;
+#endif
   uint8_t* Ptr;
   uint8_t* CodeBufferEnd;
   size_t AllocatedSize; // including guard page; see UsableSize()

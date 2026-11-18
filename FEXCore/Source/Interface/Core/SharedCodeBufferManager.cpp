@@ -7,17 +7,35 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH2__)
 #include <FEXCore/Utils/PrctlUtils.h>
 #endif
 
+#include <CodeEmitter/Buffer.h>
+
+#include <cstdlib>
+#include <cstring>
+
 namespace FEXCore::CPU {
+#ifdef __SWITCH2__
+// The JIT staging and executable views use separate physical memory.
+static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024;
+#else
 static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
+#endif
 // We don't want to move above 128MB atm because that means we will have to encode longer jumps
 static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 
 CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
   : AllocatedSize(Size) {
+#ifdef __SWITCH2__
+  const Result Status = ExecutableMemory.Create(Size);
+  if (R_FAILED(Status)) {
+    LogMan::Msg::EFmt("Failed to allocate Switch 2 code cache: {:#x}", Status);
+    std::abort();
+  }
+  Ptr = ExecutableMemory.Executable();
+#else
   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
@@ -34,6 +52,7 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
 
   // Huge-pages reduce the amount of iTLB misses dramatically when it works.
   FEXCore::Allocator::VirtualTHPControl(Ptr, Size, FEXCore::Allocator::THPControl::Enable);
+#endif
 
   LookupCache = fextl::make_unique<GuestToHostMap>();
 
@@ -42,7 +61,25 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
 }
 
 CodeBuffer::~CodeBuffer() {
+#ifndef __SWITCH2__
   FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
+#endif
+}
+
+void CodeBuffer::StoreCode(uint8_t* Destination, const void* Source, size_t Size, size_t InstructionSize) {
+#ifdef __SWITCH2__
+  const size_t Offset = Destination - Ptr;
+  std::lock_guard Lock {PublicationMutex};
+  std::memcpy(ExecutableMemory.Writable() + Offset, Source, Size);
+  const Result Status = ExecutableMemory.PublishRange(Offset, Size);
+  if (R_FAILED(Status)) {
+    LogMan::Msg::EFmt("Failed to publish Switch 2 code cache range: {:#x}", Status);
+    std::abort();
+  }
+#else
+  std::memcpy(Destination, Source, Size);
+  ARMEmitter::Buffer::ClearICache(Destination, InstructionSize);
+#endif
 }
 
 SharedCodeBufferManager::SharedCodeBufferManager() {
@@ -57,7 +94,7 @@ SharedCodeBufferManager::SharedCodeBufferManager() {
 }
 
 fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH2__)
   // MDWE (Memory-Deny-Write-Execute) is a new Linux 6.3 feature.
   // It's equivalent to systemd's `MemoryDenyWriteExecute` but implemented entirely in the kernel.
   //

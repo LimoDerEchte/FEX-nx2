@@ -5,7 +5,9 @@
 #include <FEXCore/Utils/Telemetry.h>
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/string.h>
+#ifndef FEX_DISABLE_TELEMETRY
 #include <FEXHeaderUtils/Filesystem.h>
+#endif
 
 #include "Utils/Config.h"
 

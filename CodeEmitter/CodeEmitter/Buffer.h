@@ -16,8 +16,9 @@ public:
     SetBuffer(Base, BaseSize);
   }
 
-  void SetBuffer(uint8_t* Base, uint64_t BaseSize) {
+  void SetBuffer(uint8_t* Base, uint64_t BaseSize, uint8_t* ExecutableBase = nullptr) {
     BufferBase = Base;
+    ExecutableBufferBase = ExecutableBase ? ExecutableBase : Base;
     CurrentOffset = BufferBase;
     Size = BaseSize;
   }
@@ -66,6 +67,13 @@ public:
     __builtin___clear_cache(static_cast<char*>(Begin), static_cast<char*>(Begin) + Length);
   }
 
+  // Internal labels and patching use the writable cursor. Addresses exposed
+  // to generated code and its callers use the executable cursor.
+  template<typename T>
+  T GetExecutableCursorAddress() const {
+    return reinterpret_cast<T>(reinterpret_cast<uintptr_t>(ExecutableBufferBase) + GetCursorOffset());
+  }
+
   size_t GetCursorOffset() const {
     return static_cast<size_t>(CurrentOffset - BufferBase);
   }
@@ -94,6 +102,7 @@ public:
 protected:
 
   uint8_t* BufferBase;
+  uint8_t* ExecutableBufferBase;
   uint8_t* CurrentOffset;
   uint64_t Size;
 };

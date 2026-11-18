@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
+#ifndef __SWITCH2__
 #include <FEXCore/Utils/PrctlUtils.h>
+#endif
 
 #ifdef ENABLE_FEX_ALLOCATOR
 #include <rpmalloc/rpmalloc.h>
@@ -13,8 +15,8 @@
 #endif
 
 #include <cstdint>
-#include <malloc.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>

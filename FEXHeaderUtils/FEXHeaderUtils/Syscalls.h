@@ -7,7 +7,13 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
-#ifndef _WIN32
+#if defined(__SWITCH2__)
+extern "C" {
+#include <switch/kernel/random.h>
+#include <switch/kernel/svc.h>
+#include <switch/result.h>
+}
+#elif !defined(_WIN32)
 #include <syscall.h>
 #else
 #include <processthreadsapi.h>
@@ -51,7 +57,28 @@ namespace FHU::Syscalls {
 #define SYS_pidfd_open 434
 #endif
 
-#ifndef _WIN32
+#if defined(__SWITCH2__)
+inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {
+  if (cpu) {
+    *cpu = svcGetCurrentProcessorNumber();
+  }
+  if (node) {
+    *node = 0;
+  }
+  return 0;
+}
+
+inline uint64_t gettid() {
+  u64 ThreadID {};
+  svcGetThreadId(&ThreadID, CUR_THREAD_HANDLE);
+  return ThreadID;
+}
+
+inline ssize_t getrandom(void* Buffer, size_t Size, unsigned int) {
+  randomGet(Buffer, Size);
+  return Size;
+}
+#elif !defined(_WIN32)
 inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {
   // Third argument is unused
 #if defined(HAS_SYSCALL_GETCPU) && HAS_SYSCALL_GETCPU

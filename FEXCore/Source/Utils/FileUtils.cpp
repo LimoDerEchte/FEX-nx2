@@ -5,7 +5,9 @@
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/LogManager.h>
 
-#ifndef _WIN32
+#ifdef __SWITCH2__
+#include <filesystem>
+#elif !defined(_WIN32)
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -24,7 +26,29 @@ extern "C" NTSTATUS RtlUnicodeToUTF8N(OUT PCHAR UTF8StringDestination, IN ULONG 
 #endif
 
 namespace FEXCore::FileUtils {
-#ifndef _WIN32
+#ifdef __SWITCH2__
+FEX_DEFAULT_VISIBILITY bool RecursiveRemoveDirectory(const fextl::string& Directory) {
+  std::error_code Error;
+  std::filesystem::remove_all(std::filesystem::path {Directory}, Error);
+  return !Error;
+}
+
+FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
+                                         fextl::move_only_function<void(std::string_view name, bool is_dir, const void* user_data)> Callback,
+                                         const void* UserData) {
+  std::error_code Error;
+  const std::filesystem::path Path {Directory};
+  if (!std::filesystem::is_directory(std::filesystem::symlink_status(Path, Error))) {
+    return;
+  }
+  for (std::filesystem::directory_iterator Entry {Path, Error}, End; !Error && Entry != End; Entry.increment(Error)) {
+    const bool IsDirectory = std::filesystem::is_directory(Entry->symlink_status(Error));
+    if (!Error) {
+      Callback(Entry->path().filename().native(), IsDirectory, UserData);
+    }
+  }
+}
+#elif !defined(_WIN32)
 static inline bool unlinkat(int fd, const char* path, bool dir) {
   if (::unlinkat(fd, path, dir ? AT_REMOVEDIR : 0) == -1) {
     return errno == ENOENT;

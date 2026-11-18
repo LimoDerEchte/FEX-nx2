@@ -39,7 +39,13 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // We need one pointer per page of virtual memory
   // At 64GB of virtual memory this will allocate 128MB of virtual memory space
   PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
+#ifdef __SWITCH2__
+  if (!PagePointer) {
+    ERROR_AND_DIE_FMT("Failed to allocate Switch 2 guest lookup cache");
+  }
+#else
   LOGMAN_THROW_A_FMT(PagePointer != -1ULL, "Failed to allocate PagePointer");
+#endif
 
   // Disable THP on the Lookup cache.
   FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer), TotalCacheSize, FEXCore::Allocator::THPControl::Disable);

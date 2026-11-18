@@ -7,7 +7,9 @@
 #ifndef _WIN32
 #include <stdlib.h>
 #include <malloc.h>
+#ifndef __SWITCH2__
 #include <sys/mman.h>
+#endif
 #else
 #define NTDDI_VERSION 0x0A000005
 #include <memoryapi.h>
@@ -32,7 +34,7 @@ enum class THPControl {
   Disable,
 };
 
-#ifndef _WIN32
+#if !defined(_WIN32)
 FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize);
 #else
 using VirtualNamePtr = void (*)(const char*, const void*, size_t);
@@ -103,6 +105,14 @@ inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
 
 FEX_DEFAULT_VISIBILITY extern VirtualNamePtr VirtualName;
 FEX_DEFAULT_VISIBILITY extern VirtualTHPPtr VirtualTHPControl;
+#elif defined(__SWITCH2__)
+void* VirtualAlloc(size_t Size, bool Execute = false, bool Commit = true);
+void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true);
+void VirtualFree(void* Ptr, size_t Size);
+void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true);
+bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions Options);
+inline void VirtualName(const char*, const void*, size_t) {}
+inline void VirtualTHPControl(const void*, size_t, THPControl) {}
 #else
 using MMAP_Hook = void* (*)(void*, size_t, int, int, int, off_t);
 using MUNMAP_Hook = int (*)(void*, size_t);
@@ -148,6 +158,7 @@ inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) 
 
 #endif
 
+
 // Memory allocation routines to be defined externally.
 // This allows to use jemalloc for emulation while using the normal allocator
 // for host tools without building FEXCore twice.
@@ -164,9 +175,9 @@ void aligned_free(void* ptr);
 
 FEX_DEFAULT_VISIBILITY extern void InitializeThread();
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH2__)
 void SetupAllocatorHooks(void* (*)(void* addr, size_t length, int prot, int flags, int fd, off_t offset), int (*)(void* addr, size_t length));
-#else
+#elif defined(_WIN32)
 void SetupAllocatorHooks(void (*)(const char* name, const void* address, size_t size));
 #endif
 
@@ -185,7 +196,7 @@ struct FEXAllocOperators {
     return FEXCore::Allocator::free(ptr);
   }
 
-  void operator delete(void* ptr, std::align_val_t align) {
+  void operator delete(void* ptr, std::align_val_t) {
     return FEXCore::Allocator::aligned_free(ptr);
   }
 };

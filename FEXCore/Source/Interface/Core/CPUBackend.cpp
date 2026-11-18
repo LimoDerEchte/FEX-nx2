@@ -7,7 +7,6 @@
 
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
-#include <FEXCore/Utils/PrctlUtils.h>
 
 #include <cstdint>
 

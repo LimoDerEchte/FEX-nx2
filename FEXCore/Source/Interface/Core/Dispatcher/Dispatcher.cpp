@@ -28,6 +28,9 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#ifdef __SWITCH2__
+#include <cstdlib>
+#endif
 
 namespace FEXCore::CPU {
 
@@ -38,18 +41,38 @@ static void SleepThread(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::CpuSt
 constexpr size_t MAX_DISPATCHER_CODE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE * 4;
 
 Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
+#ifdef __SWITCH2__
+  : Arm64Emitter(ctx, nullptr, 0)
+#else
   : Arm64Emitter(ctx, FEXCore::Allocator::VirtualAlloc(MAX_DISPATCHER_CODE_SIZE, true), MAX_DISPATCHER_CODE_SIZE)
+#endif
   , CTX {ctx} {
+#ifdef __SWITCH2__
+  auto Status = ExecutableMemory.Create(MAX_DISPATCHER_CODE_SIZE);
+  if (R_SUCCEEDED(Status)) {
+    Status = ExecutableMemory.BeginWrite();
+  }
+  if (R_FAILED(Status)) {
+    LogMan::Msg::EFmt("Failed to open Switch 2 dispatcher JIT memory: {:#x}", Status);
+    std::abort();
+  }
+  SetBuffer(ExecutableMemory.Writable(), ExecutableMemory.Size(), ExecutableMemory.Executable());
+#endif
+
   EmitDispatcher();
 
+#ifndef __SWITCH2__
   FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(GetBufferBase()), MAX_DISPATCHER_CODE_SIZE);
+#endif
 }
 
 Dispatcher::~Dispatcher() {
+#ifndef __SWITCH2__
   auto BufferSize = GetBufferSize();
   if (BufferSize) {
     FEXCore::Allocator::VirtualFree(GetBufferBase(), BufferSize);
   }
+#endif
 }
 
 void Dispatcher::EmitDispatcher() {
@@ -59,7 +82,7 @@ void Dispatcher::EmitDispatcher() {
   const auto DisasmBegin = GetCursorAddress<const vixl::aarch64::Instruction*>();
 #endif
 
-  DispatchPtr = GetCursorAddress<AsmDispatch>();
+  DispatchPtr = GetExecutableCursorAddress<AsmDispatch>();
 
   // while (true) {
   //    Ptr = FindBlock(RIP)
@@ -88,7 +111,7 @@ void Dispatcher::EmitDispatcher() {
   str(ARMEmitter::XReg::x0, STATE_PTR(CpuStateFrame, ReturningStackLocation));
 
   ARMEmitter::ForwardLabel CompileSingleStep;
-  AbsoluteLoopTopAddressFillSRA = GetCursorAddress<uint64_t>();
+  AbsoluteLoopTopAddressFillSRA = GetExecutableCursorAddress<uint64_t>();
 
   FillStaticRegs();
   ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
@@ -99,7 +122,7 @@ void Dispatcher::EmitDispatcher() {
 #ifdef ARCHITECTURE_arm64ec
   (void)b(&LoopTop);
 
-  AbsoluteLoopTopAddressEnterECFillSRA = GetCursorAddress<uint64_t>();
+  AbsoluteLoopTopAddressEnterECFillSRA = GetExecutableCursorAddress<uint64_t>();
   ldr(STATE, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_DATA_OFFSET);
   FillStaticRegs();
 
@@ -110,7 +133,7 @@ void Dispatcher::EmitDispatcher() {
   // Enter JIT
   (void)b(&LoopTop);
 
-  AbsoluteLoopTopAddressEnterEC = GetCursorAddress<uint64_t>();
+  AbsoluteLoopTopAddressEnterEC = GetExecutableCursorAddress<uint64_t>();
   // Load ThreadState and write the target PC there
   ldr(STATE, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_DATA_OFFSET);
   str(EC_CALL_CHECKER_PC_REG, STATE_PTR(CpuStateFrame, State.rip));
@@ -142,7 +165,7 @@ void Dispatcher::EmitDispatcher() {
   Align16B();
 
   (void)Bind(&LoopTop);
-  AbsoluteLoopTopAddress = GetCursorAddress<uint64_t>();
+  AbsoluteLoopTopAddress = GetExecutableCursorAddress<uint64_t>();
 
   // Load in our RIP
   ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
@@ -238,10 +261,10 @@ void Dispatcher::EmitDispatcher() {
   }
 
   {
-    ThreadStopHandlerAddressSpillSRA = GetCursorAddress<uint64_t>();
+    ThreadStopHandlerAddressSpillSRA = GetExecutableCursorAddress<uint64_t>();
     SpillStaticRegs(TMP1);
 
-    ThreadStopHandlerAddress = GetCursorAddress<uint64_t>();
+    ThreadStopHandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
     PopCalleeSavedRegisters();
 
@@ -290,7 +313,7 @@ void Dispatcher::EmitDispatcher() {
   };
 
   {
-    ExitFunctionLinkerAddress = GetCursorAddress<uint64_t>();
+    ExitFunctionLinkerAddress = GetExecutableCursorAddress<uint64_t>();
     EmitSignalGuardedRegion([&]() {
       SpillStaticRegs(TMP1);
 
@@ -383,7 +406,7 @@ void Dispatcher::EmitDispatcher() {
   }
 
   {
-    SignalHandlerReturnAddress = GetCursorAddress<uint64_t>();
+    SignalHandlerReturnAddress = GetExecutableCursorAddress<uint64_t>();
 
     // Now to get back to our old location we need to do a fault dance
     // We can't use SIGTRAP here since gdb catches it and never gives it to the application!
@@ -391,7 +414,7 @@ void Dispatcher::EmitDispatcher() {
   }
 
   {
-    SignalHandlerReturnAddressRT = GetCursorAddress<uint64_t>();
+    SignalHandlerReturnAddressRT = GetExecutableCursorAddress<uint64_t>();
 
     // Now to get back to our old location we need to do a fault dance
     // We can't use SIGTRAP here since gdb catches it and never gives it to the application!
@@ -401,7 +424,7 @@ void Dispatcher::EmitDispatcher() {
   {
     // Guest SIGILL handler
     // Needs to be distinct from the SignalHandlerReturnAddress
-    GuestSignal_SIGILL = GetCursorAddress<uint64_t>();
+    GuestSignal_SIGILL = GetExecutableCursorAddress<uint64_t>();
 
     SpillStaticRegs(TMP1);
 
@@ -411,7 +434,7 @@ void Dispatcher::EmitDispatcher() {
   {
     // Guest SIGTRAP handler
     // Needs to be distinct from the SignalHandlerReturnAddress
-    GuestSignal_SIGTRAP = GetCursorAddress<uint64_t>();
+    GuestSignal_SIGTRAP = GetExecutableCursorAddress<uint64_t>();
 
     SpillStaticRegs(TMP1);
 
@@ -422,7 +445,7 @@ void Dispatcher::EmitDispatcher() {
   {
     // Guest Overflow handler
     // Needs to be distinct from the SignalHandlerReturnAddress
-    GuestSignal_SIGSEGV = GetCursorAddress<uint64_t>();
+    GuestSignal_SIGSEGV = GetExecutableCursorAddress<uint64_t>();
 
     SpillStaticRegs(TMP1);
 
@@ -448,7 +471,7 @@ void Dispatcher::EmitDispatcher() {
     // Some games abuse SIGILL/SIGTRAP/SIGSEGV heavily and the fault overhead is visible.
     // Instead of double faulting, clean up state and jump to the frontend to handle this.
     // `FEXCore::Core::CpuStateFrame::SynchronousFaultData` needs to be setup at this point.
-    GuestSignal_SynchronousFault = GetCursorAddress<uint64_t>();
+    GuestSignal_SynchronousFault = GetExecutableCursorAddress<uint64_t>();
 
     SpillStaticRegs(TMP1);
 
@@ -464,10 +487,10 @@ void Dispatcher::EmitDispatcher() {
   }
 
   {
-    ThreadPauseHandlerAddressSpillSRA = GetCursorAddress<uint64_t>();
+    ThreadPauseHandlerAddressSpillSRA = GetExecutableCursorAddress<uint64_t>();
     SpillStaticRegs(TMP1);
 
-    ThreadPauseHandlerAddress = GetCursorAddress<uint64_t>();
+    ThreadPauseHandlerAddress = GetExecutableCursorAddress<uint64_t>();
     // We are pausing, this means the frontend should be waiting for this thread to idle
     // We will have faulted and jumped to this location at this point
 
@@ -481,7 +504,7 @@ void Dispatcher::EmitDispatcher() {
       blr(ARMEmitter::Reg::r2);
     }
 
-    PauseReturnInstruction = GetCursorAddress<uint64_t>();
+    PauseReturnInstruction = GetExecutableCursorAddress<uint64_t>();
     // Fault to start running again
     hlt(0);
   }
@@ -502,7 +525,7 @@ void Dispatcher::EmitDispatcher() {
     // On return to the thunk, the thunk can get whatever its return value is from the thread context depending on ABI handling on its end
     // When the thunk itself returns, it'll do its regular return logic there
     // void ReentrantCallback(FEXCore::Core::InternalThreadState *Thread, uint64_t RIP);
-    CallbackPtr = GetCursorAddress<JITCallback>();
+    CallbackPtr = GetExecutableCursorAddress<JITCallback>();
 
     // We expect the thunk to have previously pushed the registers it was using
     PushCalleeSavedRegisters();
@@ -570,7 +593,7 @@ void Dispatcher::EmitDispatcher() {
   {
     // All dynamic and static registers are spilled coming in to this handler.
     // It's also the end of block and RIP might have changed, so we jump directly to the top of the loop.
-    ThreadDispatchSyscallHandler = GetCursorAddress<uint64_t>();
+    ThreadDispatchSyscallHandler = GetExecutableCursorAddress<uint64_t>();
 
     // Store in the state that we are in a syscall
     // 16bit LoadConstant to be a single instruction
@@ -605,7 +628,7 @@ void Dispatcher::EmitDispatcher() {
   {
     // All dynamic and static registers are spilled coming in to this handler.
     // It's also the end of block and RIP might have changed, so we jump directly to the top of the loop.
-    ThreadDispatchCPUIDHandler = GetCursorAddress<uint64_t>();
+    ThreadDispatchCPUIDHandler = GetExecutableCursorAddress<uint64_t>();
 
     // CPUID behaves like an ISB.
     isb();
@@ -688,7 +711,7 @@ void Dispatcher::EmitDispatcher() {
   {
     // All dynamic and static registers are spilled coming in to this handler.
     // It's also the end of block and RIP might have changed, so we jump directly to the top of the loop.
-    ThreadDispatchRemoveCodeEntry = GetCursorAddress<uint64_t>();
+    ThreadDispatchRemoveCodeEntry = GetExecutableCursorAddress<uint64_t>();
 
     // Arguments are already in x0, x1. Just jump to the handler.
     ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadRemoveCodeEntryFromJIT));
@@ -761,8 +784,16 @@ void Dispatcher::EmitDispatcher() {
   dc64(PMFCompileSingleStep.GetConvertedPointer());
 
   Start = reinterpret_cast<uint64_t>(DispatchPtr);
-  End = GetCursorAddress<uint64_t>();
+  End = GetExecutableCursorAddress<uint64_t>();
+#ifdef __SWITCH2__
+  const auto Status = ExecutableMemory.Publish();
+  if (R_FAILED(Status)) {
+    LogMan::Msg::EFmt("Failed to publish Switch 2 dispatcher JIT memory: {:#x}", Status);
+    std::abort();
+  }
+#else
   ClearICache(reinterpret_cast<void*>(DispatchPtr), End - reinterpret_cast<uint64_t>(DispatchPtr));
+#endif
 
   if (CTX->Config.BlockJITNaming()) {
     fextl::string Name = fextl::fmt::format("Dispatch_{}", FHU::Syscalls::gettid());
@@ -1020,7 +1051,7 @@ void Dispatcher::EmitF64ToExtF80() {
 }
 
 void Dispatcher::EmitF64Sin() {
-  F64SinHandlerAddress = GetCursorAddress<uint64_t>();
+  F64SinHandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   constexpr auto V2 = ARMEmitter::VReg::v2;
   constexpr auto V3 = ARMEmitter::VReg::v3;
@@ -1151,7 +1182,7 @@ void Dispatcher::EmitF64Sin() {
 }
 
 void Dispatcher::EmitF64Cos() {
-  F64CosHandlerAddress = GetCursorAddress<uint64_t>();
+  F64CosHandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   constexpr auto Accum = ARMEmitter::VReg::v2;
 
@@ -1274,7 +1305,7 @@ void Dispatcher::EmitF64Cos() {
 }
 
 void Dispatcher::EmitF64Tan() {
-  F64TanHandlerAddress = GetCursorAddress<uint64_t>();
+  F64TanHandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   constexpr auto Accum = ARMEmitter::VReg::v2;
 
@@ -1419,7 +1450,7 @@ void Dispatcher::EmitF64Tan() {
 void Dispatcher::EmitF64Scale() {
   // Computes result = src1 * 2^trunc(src2).
   // Input: VTMP1 = base (src1), VTMP2 = exponent (src2). Output: VTMP1.
-  F64ScaleHandlerAddress = GetCursorAddress<uint64_t>();
+  F64ScaleHandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   ARMEmitter::ForwardLabel Fallback;
 
@@ -1470,7 +1501,7 @@ void Dispatcher::EmitF64F2XM1() {
   // then compute 2^x - 1 = 2^n * (2^r - 1) + (2^n - 1).
   // 2^r - 1 is approximated via a 13-term Horner polynomial in r.
   // Input in VTMP1.D(), output in VTMP1.D().
-  F64F2XM1HandlerAddress = GetCursorAddress<uint64_t>();
+  F64F2XM1HandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   constexpr auto Accum = ARMEmitter::VReg::v2;
 
@@ -1594,7 +1625,7 @@ void Dispatcher::EmitF64F2XM1() {
 // Algorithm: 20-term Horner polynomial from ARM optimized-routines atan_data.c.
 // atan(z) = z + z^3 * P(z^2), with range reduction to [0,1] and quadrant adjustment.
 void Dispatcher::EmitF64Atan() {
-  F64AtanHandlerAddress = GetCursorAddress<uint64_t>();
+  F64AtanHandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   constexpr auto Accum = ARMEmitter::VReg::v2;
 
@@ -1773,7 +1804,7 @@ void Dispatcher::EmitF64Atan() {
 // Input: VTMP1 = x, VTMP2 = y. Output: VTMP1 = y * log2(x).
 // Constants in `C` are shared with EmitF64FYL2XP1 and emitted by EmitF64Log2Constants.
 void Dispatcher::EmitF64FYL2X(F64Log2Constants& C) {
-  F64FYL2XHandlerAddress = GetCursorAddress<uint64_t>();
+  F64FYL2XHandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   constexpr auto Accum = ARMEmitter::VReg::v2;
 
@@ -1874,7 +1905,7 @@ void Dispatcher::EmitF64FYL2X(F64Log2Constants& C) {
 // Loses 1-2 ulps of precision near x=0 (FYL2XP1's original purpose) but
 // matches main's lowering and avoids the range-check cliff into a fallback.
 void Dispatcher::EmitF64FYL2XP1(F64Log2Constants& C) {
-  F64FYL2XP1HandlerAddress = GetCursorAddress<uint64_t>();
+  F64FYL2XP1HandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   constexpr auto Accum = ARMEmitter::VReg::v2;
 
@@ -2132,7 +2163,7 @@ void Dispatcher::EmitF64Log2Constants(F64Log2Constants& C) {
 void Dispatcher::EmitF64FPREM() {
   // JIT-inlined double-precision FPREM (C-library style truncated remainder).
   // Input: VTMP1 = dividend (src1), VTMP2 = divisor (src2). Output: VTMP1.
-  F64FPREMHandlerAddress = GetCursorAddress<uint64_t>();
+  F64FPREMHandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   constexpr auto Scratch = ARMEmitter::VReg::v2;
   ARMEmitter::ForwardLabel ReturnX;
@@ -2258,7 +2289,7 @@ void Dispatcher::EmitF64FPREM() {
 void Dispatcher::EmitF64FPREM1() {
   // JIT-inlined double-precision FPREM1 (IEEE round-to-nearest remainder).
   // Input: VTMP1 = dividend (src1), VTMP2 = divisor (src2). Output: VTMP1.
-  F64FPREM1HandlerAddress = GetCursorAddress<uint64_t>();
+  F64FPREM1HandlerAddress = GetExecutableCursorAddress<uint64_t>();
 
   constexpr auto Scratch = ARMEmitter::VReg::v2;
   ARMEmitter::ForwardLabel ReturnX;
@@ -2346,7 +2377,7 @@ void Dispatcher::EmitF64FPREM1() {
 }
 
 uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
-  auto Address = GetCursorAddress<uint64_t>();
+  auto Address = GetExecutableCursorAddress<uint64_t>();
   constexpr static auto FallbackPointerReg = TMP4;
   constexpr static auto ABI1 = ARMEmitter::XReg::x0;
   constexpr static auto ABI2 = ARMEmitter::XReg::x1;
