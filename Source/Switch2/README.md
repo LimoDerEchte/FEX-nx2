@@ -44,7 +44,7 @@ probe supplies a minimal initial stack and a limited syscall interface.
 The launcher appends checkpoints and FEXCore messages to
 `/switch/fex/fex-switch2-guest.log` and flushes each line.
 If the software closes, inspect the latest section beginning with
-`--- FEX Switch 2 launcher 0.5.0 started ---`. A crash before `main()` or
+`--- FEX Switch 2 launcher 0.6.0 started ---`. A crash before `main()` or
 failure to open the SD card can leave the file unchanged.
 
 ## SD Maze
@@ -77,6 +77,24 @@ and draws it into a 320 × 180 frame. The Switch 2 launcher presents the
 frame at 1280 × 720 through libounce. The graphics interface is a
 fork-specific frame presentation syscall. A Linux graphics API bridge
 will be a separate milestone.
+
+## Star Catch and SDL2
+
+Build with `make -C Source/Switch2 star-catch`. The build uses installed
+SDL2 development headers. Copy the `build/star-catch/` folder into
+`/switch/fex/games/` and launch its ELF from the 0.6.0 launcher.
+
+Move left or right to catch five falling stars. Three missed stars end the
+round. Press B or Plus to return to the launcher. The blue paddle, score
+markers, and lives are drawn by the game. It reads its star texture from
+`data/star.rgba`.
+
+The x86-64 guest links a small SDL2 source-compatibility library for the
+APIs used by this game. It supports one 320 × 180 window, software rectangle
+drawing and RGBA texture uploads and copies, directional key events and held
+state, a quit event, millisecond timing, and read-only SDL file streams.
+Existing dynamically linked SDL2 games, audio, and accelerated renderers
+require additional runtime work.
 
 ## JIT diagnostics
 

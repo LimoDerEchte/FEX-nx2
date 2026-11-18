@@ -54,6 +54,7 @@ clean:
 	$(RM) $(BUILD)/JitProbe.o $(BUILD)/JitProbe.d $(TARGET).elf $(TARGET).nacp $(TARGET).nro $(FMT_HEADERS) $(BUILD)/fex-hello.o $(BUILD)/fex-hello.elf
 	$(RM) $(BUILD)/maze-start.o $(BUILD)/maze.o $(MAZE_DIR)/sd-maze.elf $(MAZE_DIR)/sd-maze.elf.args $(MAZE_DIR)/data/maze.txt
 	$(RM) $(BUILD)/texture-start.o $(BUILD)/texture-demo.o $(GRAPHICS_DIR)/texture-demo.elf $(GRAPHICS_DIR)/data/sprite.rgba
+	$(RM) $(BUILD)/sdl2-start.o $(BUILD)/sdl2-guest.o $(BUILD)/star-catch.o $(STAR_DIR)/star-catch.elf $(STAR_DIR)/data/star.rgba
 
 -include $(OFILES:.o=.d)
 
@@ -110,5 +111,28 @@ $(GRAPHICS_DIR)/texture-demo.elf: $(BUILD)/texture-start.o $(BUILD)/texture-demo
 	$(HOST_X86_LD) -m elf_x86_64 -pie --no-dynamic-linker -T HelloGuest.ld $(filter %.o,$^) -o $@
 
 $(GRAPHICS_DIR)/data/sprite.rgba: Graphics/MakeTexture.py
+	mkdir -p $(@D)
+	python3 $< $@
+
+SDL2_CFLAGS ?= $(shell pkg-config --cflags sdl2)
+STAR_DIR := $(BUILD)/star-catch
+
+.PHONY: star-catch
+star-catch: $(STAR_DIR)/star-catch.elf $(STAR_DIR)/data/star.rgba
+
+$(BUILD)/sdl2-start.o: SDL2/Start.S | $(BUILD)
+	$(HOST_X86_AS) --64 $< -o $@
+
+$(BUILD)/sdl2-guest.o: SDL2/SDL2.c SDL2/GuestSyscall.h GuestVideo.h | $(BUILD)
+	$(HOST_X86_CC) $(SDL2_CFLAGS) -m64 -Os -ffreestanding -fPIE -fno-stack-protector -mgeneral-regs-only -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/star-catch.o: SDL2/StarCatch.c | $(BUILD)
+	$(HOST_X86_CC) $(SDL2_CFLAGS) -DSDL_MAIN_HANDLED -m64 -Os -ffreestanding -fPIE -fno-stack-protector -mgeneral-regs-only -Wall -Wextra -Werror -c $< -o $@
+
+$(STAR_DIR)/star-catch.elf: $(BUILD)/sdl2-start.o $(BUILD)/sdl2-guest.o $(BUILD)/star-catch.o HelloGuest.ld
+	mkdir -p $(@D)
+	$(HOST_X86_LD) -m elf_x86_64 -pie --no-dynamic-linker -T HelloGuest.ld $(filter %.o,$^) -o $@
+
+$(STAR_DIR)/data/star.rgba: Graphics/MakeTexture.py
 	mkdir -p $(@D)
 	python3 $< $@

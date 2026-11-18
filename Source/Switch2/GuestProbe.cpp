@@ -114,7 +114,7 @@ alignas(GuestPageSize) constexpr std::array<uint8_t, GuestPageSize> GuestCode {
   0x0f, 0x0b,       // ud2
 };
 
-alignas(16) std::array<uint8_t, GuestPageSize> GuestStack;
+alignas(16) std::array<uint8_t, 64 * 1024> GuestStack;
 
 void PrintStage(const char* Text);
 
@@ -173,6 +173,9 @@ public:
       break;
     case 11: Result = UnmapGuest(A, B); break;
     case FEX_NX2_PRESENT_RGBA: Result = PresentGuestFrame(A); break;
+    case FEX_NX2_POLL_INPUT: Result = PollGameInput(); break;
+    case FEX_NX2_TICKS_MS: Result = armTicksToNs(armGetSystemTick() - StartTick) / 1'000'000; break;
+    case FEX_NX2_DELAY_MS: svcSleepThread(std::min<uint64_t>(A, 1000) * 1'000'000); Result = 0; break;
     case 257: // openat
       Result = OpenGuest(A, B, C);
       break;
@@ -232,6 +235,20 @@ private:
       }
     }
     return 0;
+  }
+
+  int64_t PollGameInput() {
+    if (!appletMainLoop()) {
+      return FEX_NX2_QUIT;
+    }
+    padUpdate(&Input);
+    const auto Held = padGetButtons(&Input);
+    const auto Pressed = padGetButtonsDown(&Input);
+    return ((Held & HidNpadButton_AnyUp) ? FEX_NX2_UP : 0) |
+           ((Held & HidNpadButton_AnyDown) ? FEX_NX2_DOWN : 0) |
+           ((Held & HidNpadButton_AnyLeft) ? FEX_NX2_LEFT : 0) |
+           ((Held & HidNpadButton_AnyRight) ? FEX_NX2_RIGHT : 0) |
+           ((Pressed & (HidNpadButton_B | HidNpadButton_Plus)) ? FEX_NX2_QUIT : 0);
   }
 
   int64_t PresentGuestFrame(uint64_t Address) {
@@ -452,6 +469,7 @@ private:
   std::array<std::optional<OpenFile>, 16> Files {};
   std::array<Mapping, 8> Mappings {};
   PadState Input {};
+  const u64 StartTick {armGetSystemTick()};
   Framebuffer Video {};
   bool Presented {};
 
@@ -962,7 +980,7 @@ private:
 
 int main() {
   const Result LogStatus = OpenLog();
-  WriteLog("--- FEX Switch 2 launcher 0.5.0 started ---");
+  WriteLog("--- FEX Switch 2 launcher 0.6.0 started ---");
   WriteLog("Initializing console...");
   consoleInit(nullptr);
   if (R_FAILED(LogStatus)) {
