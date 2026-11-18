@@ -17,11 +17,15 @@ namespace FEXCore::SHMStats {
  */
 static inline uint64_t GetCycleCounter() {
   uint64_t Result {};
+#ifdef __SWITCH2__
+  __asm volatile("isb; mrs %[Res], CNTPCT_EL0" : [Res] "=r"(Result));
+#else
   __asm volatile(R"(
       isb;
       mrs %[Res], CNTVCT_EL0;
     )"
                  : [Res] "=r"(Result));
+#endif
   return Result;
 }
 #else

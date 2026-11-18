@@ -26,7 +26,7 @@ to select, B to go back, and Plus to exit. If only the old `/switch/fex` folder 
 last folder while the launcher is open.
 
 **Settings** lets you select the starting folder and choose standard or
-detailed logging. Settings are saved to `/fex/fex-switch2.cfg`. Diagnostics
+detailed logging, or Trace for flushed syscall and JIT compilation checkpoints. Settings are saved to `/fex/fex-switch2.cfg`. Diagnostics
 offers the embedded x86-64 guest and the ARM64 JIT publication probe.
 
 Build the sample with `make -C Source/Switch2 hello-elf`. Copy
@@ -45,7 +45,7 @@ probe supplies a minimal initial stack and a limited syscall interface.
 The launcher appends checkpoints and FEXCore messages to
 `/fex/fex-switch2-guest.log` and flushes each line.
 If the software closes, inspect the latest section beginning with
-`--- FEX Switch 2 launcher 0.7.0 started ---`. A crash before `main()` or
+`--- FEX Switch 2 launcher 0.8.4 started ---`. A crash before `main()` or
 failure to open the SD card can leave the file unchanged.
 
 ## SD Maze
@@ -119,6 +119,38 @@ The launcher accepts position-independent x86-64 program images and
 supplies the Linux auxiliary vector. Distribution loaders and general
 Linux applications still need file-backed mappings, broader syscall and
 TLS coverage, and other runtime work.
+
+## Stock glibc test
+
+Build a matching rootfs and test executables on an x86-64 Linux development
+machine with `make -C Source/Switch2 stock-glibc`. Copy the staged
+`build/stock-glibc/fex/` tree to the SD root, merging it with the existing
+`/fex` directory. The staging step copies stock `true`, the glibc test
+program, their interpreter, libc, and libm from the same local system.
+
+Launch `true.elf` with the 0.8.4 launcher and check for exit status 0.
+Then launch `glibc-probe.elf`. It should print
+`glibc + TLS + dlopen = 42` and exit with status 42. If either fails,
+set Logging to Trace in Settings and send the relevant 0.8.4 run
+from `/fex/fex-switch2-guest.log`.
+
+To keep two distributions side by side, place each filesystem tree in a
+named subfolder of `/fex/rootfs`. An optional `<executable>.rootfs` file
+beside the ELF selects that subfolder by name. The interpreter and all
+absolute guest file lookups use the selected tree. The Bookworm test
+package uses the subfolder `bookworm-baseline-236` and distinct executable
+names `bookworm-true.elf` and `bookworm-glibc-baseline.elf`. The latter
+uses Debian's startup objects to avoid the host distribution's x86-64-v4
+requirement. Both passed on Switch 2 with 0.8.4.
+See [the active milestone](NextMilestone.md) for the next implementation plan.
+
+The runtime implements private file-backed mappings, fixed overlays in
+guest-owned memory, subrange protections and unmapping, guest FS/GS
+bases, basic file metadata and offset reads, heap growth, randomness,
+and process exit. Page permissions are tracked for FEX and syscall
+validation. Guest code and data still share the NRO's address space.
+See [the Linux runtime plan](LinuxRuntimePlan.md) for the startup trace
+and remaining process and desktop milestones.
 
 ## JIT diagnostics
 

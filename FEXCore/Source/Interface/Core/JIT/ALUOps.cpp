@@ -90,6 +90,13 @@ DEF_OP(InlineEntrypointOffset) {
 
 DEF_OP(CycleCounter) {
   auto Op = IROp->C<IR::IROp_CycleCounter>();
+#ifdef __SWITCH2__
+  // Horizon exposes the physical counter used by libounce's armGetSystemTick().
+  if (Op->SelfSynchronizingLoads) {
+    isb();
+  }
+  mrs(GetReg(Node), ARMEmitter::SystemRegister::CNTPCT_EL0);
+#else
   if (CTX->HostFeatures.SupportsECV && Op->SelfSynchronizingLoads) {
     // CNTVCTSS_EL0 is "self-synchronizing", which means loads can't speculate past this instruction.
     // Stores still aren't synchronized although.
@@ -101,6 +108,7 @@ DEF_OP(CycleCounter) {
     }
     mrs(GetReg(Node), ARMEmitter::SystemRegister::CNTVCT_EL0);
   }
+#endif
 }
 
 DEF_OP(AddShift) {

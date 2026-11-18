@@ -363,6 +363,7 @@ enum class SystemRegister : uint32_t {
   FPCR = GenSystemReg<0b11, 0b011, 0b0100, 0b0100, 0b000>,
   TPIDRRO_EL0 = GenSystemReg<0b11, 0b011, 0b1101, 0b0000, 0b011>,
   CNTFRQ_EL0 = GenSystemReg<0b11, 0b011, 0b1110, 0b0000, 0b000>,
+  CNTPCT_EL0 = GenSystemReg<0b11, 0b011, 0b1110, 0b0000, 0b001>,
   CNTVCT_EL0 = GenSystemReg<0b11, 0b011, 0b1110, 0b0000, 0b010>,
   CNTVCTSS_EL0 = GenSystemReg<0b11, 0b011, 0b1110, 0b0000, 0b110>,
 };

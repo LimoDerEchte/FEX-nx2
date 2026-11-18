@@ -78,6 +78,10 @@ $end_info$
 #include <utility>
 #include <xxhash.h>
 
+#ifdef __SWITCH2__
+#include <FEXCore/Utils/Switch2/GuestTrace.h>
+#endif
+
 namespace FEXCore::Context {
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
@@ -812,9 +816,15 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
     }
   }
 
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("IR begin", GuestRIP, MaxInst);
+#endif
   // Generate IR + Meta Info
   auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("IR complete", GuestRIP, TotalInstructions);
+#endif
   if (!IRView) {
     Thread->FrontendDecoder->ValidateDisownedOrFree();
     Thread->OpDispatcher->ValidateDisownedOrFree();
@@ -846,8 +856,14 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   // If the trap flag is set we generate single instruction blocks that each check to generate a single step exception.
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
 
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("JIT begin", GuestRIP, Length);
+#endif
   auto CompiledCode = Thread->CPUBackend->EmitJITCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
 
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("JIT complete", GuestRIP, reinterpret_cast<uint64_t>(CompiledCode.BlockBegin));
+#endif
   // Release the IR
   Thread->OpDispatcher->DelayedDisownBuffer();
 
@@ -878,6 +894,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
 
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("Compile entry", GuestRIP, Frame->State.gregs[X86State::REG_RSP]);
+#endif
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
@@ -889,6 +908,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     return HostCode;
   }
 
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("Decoder setup", GuestRIP);
+#endif
   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
 
   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
@@ -1021,6 +1043,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("Register block", GuestRIP, CompiledCode.EntryPoints.size());
+#endif
   // Insert to lookup cache
   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
     Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
@@ -1034,6 +1059,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   Thread->FrontendDecoder->ValidateDisownedOrFree();
   Thread->OpDispatcher->ValidateDisownedOrFree();
 
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("Dispatch compiled block", GuestRIP, reinterpret_cast<uint64_t>(CodePtr));
+#endif
   return (uintptr_t)CodePtr;
 }
 

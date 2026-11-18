@@ -9,11 +9,11 @@ inline constexpr char Root[] = "/fex/rootfs";
 
 // Absolute Linux paths live inside the rootfs. Relative paths retain the ELF's
 // working directory. Reject traversal and device aliases before calling FS.
-inline std::optional<std::string> ResolvePath(std::string_view Path, std::string_view Folder) {
+inline std::optional<std::string> ResolvePath(std::string_view Path, std::string_view Folder, std::string_view RootPath = Root) {
   if (Path.empty() || Path.find_first_of(":\\") != Path.npos) {
     return std::nullopt;
   }
-  const auto Mount = Path.starts_with('/') ? std::string_view {Root} : Folder;
+  const auto Mount = Path.starts_with('/') ? RootPath : Folder;
   if (Path.starts_with('/')) {
     Path.remove_prefix(1);
   }

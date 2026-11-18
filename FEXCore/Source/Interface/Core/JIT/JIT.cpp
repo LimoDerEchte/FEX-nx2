@@ -34,6 +34,10 @@ $end_info$
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 
+#ifdef __SWITCH2__
+#include <FEXCore/Utils/Switch2/GuestTrace.h>
+#endif
+
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -1142,6 +1146,9 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
     CodeData.HostCodeOffset = CodeData.BlockBegin - CurrentCodeBuffer->GetBufferBase();
 
     // Copy over CodeBuffer contents
+#ifdef __SWITCH2__
+    FEXCore::Switch2::TraceGuest("Publish JIT block", Entry, CodeData.Size);
+#endif
     CurrentCodeBuffer->StoreCode(AllocatedInfo.BufferAllocationOffset, TempCodeBuffer, CodeData.Size, CodeOnlySize);
   }
 

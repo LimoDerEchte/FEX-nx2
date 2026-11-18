@@ -168,3 +168,33 @@ $(DYNAMIC_DIR)/rootfs/lib/libfex-demo.so: $(BUILD)/dynamic-library.o
 $(DYNAMIC_DIR)/games/dynamic-demo.elf: $(BUILD)/dynamic-main.o $(DYNAMIC_DIR)/rootfs/lib/libfex-demo.so
 	mkdir -p $(@D)
 	$(HOST_X86_LD) -m elf_x86_64 -pie --hash-style=sysv --dynamic-linker /lib/ld-fex-demo-x86-64.so.2 $^ -o $@
+
+HOST_CXX ?= c++
+STOCK_TRUE ?= /usr/bin/true
+STOCK_DIR ?= $(BUILD)/stock-glibc
+STOCK_LIB_DIR ?=
+STOCK_CRT_DIR ?=
+STOCK_PROBE := $(BUILD)/glibc-probe.elf
+ifneq ($(strip $(STOCK_CRT_DIR)),)
+STOCK_PROBE := $(BUILD)/glibc-probe-baseline.elf
+endif
+
+.PHONY: stock-glibc check-guest-memory
+stock-glibc: $(STOCK_PROBE)
+	python3 LinuxRuntime/StageRootFS.py $(STOCK_DIR)/fex "$(STOCK_TRUE)" "$<" "$(HOST_X86_CC)" "$(STOCK_LIB_DIR)"
+
+$(BUILD)/glibc-probe.elf: LinuxRuntime/GlibcProbe.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -O2 -fPIE -pie -Wall -Wextra -Werror $< -ldl -o $@
+
+$(BUILD)/glibc-probe-baseline.o: LinuxRuntime/GlibcProbe.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/glibc-probe-baseline.elf: $(BUILD)/glibc-probe-baseline.o $(STOCK_CRT_DIR)/Scrt1.o $(STOCK_CRT_DIR)/crti.o $(STOCK_CRT_DIR)/crtn.o $(STOCK_LIB_DIR)/libc.so.6
+	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(STOCK_LIB_DIR)" \
+		"$(STOCK_CRT_DIR)/Scrt1.o" "$(STOCK_CRT_DIR)/crti.o" $< "$(STOCK_LIB_DIR)/libc.so.6" "$(STOCK_CRT_DIR)/crtn.o" -o $@
+
+check-guest-memory: $(BUILD)/guest-address-space-test
+	$<
+
+$(BUILD)/guest-address-space-test: LinuxRuntime/AddressSpaceTest.cpp GuestAddressSpace.h GuestElf.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@

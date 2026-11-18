@@ -58,11 +58,15 @@ FEX_DEFAULT_VISIBILITY extern uint64_t CyclesPerNanosecond;
 /// `CNTVCTSS_EL0` also does the same thing, but requires the FEAT_ECV feature.
 static inline uint64_t GetCycleCounter() {
   uint64_t Result {};
+#ifdef __SWITCH2__
+  __asm volatile("isb; mrs %[Res], CNTPCT_EL0" : [Res] "=r"(Result));
+#else
   __asm volatile(R"(
       isb;
       mrs %[Res], CNTVCT_EL0;
     )"
                  : [Res] "=r"(Result));
+#endif
   return Result;
 }
 

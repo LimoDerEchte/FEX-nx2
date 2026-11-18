@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "GuestElf.h"
+#include "GuestAddressSpace.h"
 #include "GuestRootFS.h"
 #include "GuestVideo.h"
 
@@ -12,6 +13,7 @@
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/Switch2/GuestTrace.h>
 
 #include <switch.h>
 
@@ -40,7 +42,9 @@ FsFile LogFile {};
 s64 LogOffset {};
 bool LogOpen {};
 bool LogWriteFailed {};
-bool DetailedLogging {};
+enum class LogLevel { Standard, Detailed, Trace };
+LogLevel Logging {};
+constexpr const char* LogLevelLabels[] {"Logging  Standard", "Logging  Detailed", "Logging  Trace"};
 bool GraphicsActive {};
 
 Result EnsureDirectory(FsFileSystem& SdCard, const char* Path) {
@@ -119,8 +123,16 @@ void WriteLog(const char* Text) {
   }
 }
 
+void TraceGuest(const char* Stage, uint64_t RIP, uint64_t Detail) {
+  char Message[160];
+  std::snprintf(Message, sizeof(Message), "%s  guest RIP=%#llx  detail=%#llx", Stage,
+                static_cast<unsigned long long>(RIP), static_cast<unsigned long long>(Detail));
+  WriteLog(Message);
+}
+
 // The guest deliberately uses no external loader, libraries, or filesystem.
 alignas(GuestPageSize) constexpr std::array<uint8_t, GuestPageSize> GuestCode {
+  0x0f, 0x31,       // rdtsc
   0xbf, 7, 0, 0, 0, // mov edi, 7
   0x6b, 0xff, 6,    // imul edi, edi, 6
   0xb8, LinuxExitSyscall, 0, 0, 0, // mov eax, 60
@@ -128,15 +140,19 @@ alignas(GuestPageSize) constexpr std::array<uint8_t, GuestPageSize> GuestCode {
   0x0f, 0x0b,       // ud2
 };
 
-alignas(16) std::array<uint8_t, 64 * 1024> GuestStack;
+alignas(GuestPageSize) std::array<uint8_t, 64 * 1024> GuestStack;
 
 void PrintStage(const char* Text);
 
 class ProbeSyscalls final : public FEXCore::HLE::SyscallHandler {
 public:
-  ProbeSyscalls(std::span<const Switch2Guest::Segment> Segments, std::string Folder)
-    : Segments {Segments}
-    , Folder {std::move(Folder)} {
+  ProbeSyscalls(std::span<const Switch2Guest::Segment> Segments, std::string Folder, std::string RootPath)
+    : Folder {std::move(Folder)}
+    , RootPath {std::move(RootPath)} {
+    for (const auto& Segment : Segments) {
+      Memory.Register(Segment.Start, Segment.Size, Segment.Flags);
+    }
+    Memory.Register(reinterpret_cast<uint64_t>(GuestStack.data()), GuestStack.size(), PF_R | PF_W);
     padInitializeDefault(&Input);
     padUpdate(&Input);
   }
@@ -147,9 +163,6 @@ public:
       if (File && !File->Virtual) {
         fsFileClose(&File->Handle);
       }
-    }
-    for (const auto& Mapping : Mappings) {
-      std::free(Mapping.Ptr);
     }
   }
 
@@ -168,9 +181,19 @@ public:
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
     using namespace FEXCore::X86State;
     auto& Registers = Frame->State.gregs;
-    if (Registers[REG_RAX] == LinuxExitSyscall) {
-      Number = LinuxExitSyscall;
+    if (Logging == LogLevel::Trace) {
+      char Message[224];
+      std::snprintf(Message, sizeof(Message), "Syscall %llu enter rip=%#llx args=%#llx,%#llx,%#llx,%#llx,%#llx,%#llx",
+                    static_cast<unsigned long long>(Registers[REG_RAX]), static_cast<unsigned long long>(Frame->State.rip),
+                    static_cast<unsigned long long>(Registers[REG_RDI]), static_cast<unsigned long long>(Registers[REG_RSI]),
+                    static_cast<unsigned long long>(Registers[REG_RDX]), static_cast<unsigned long long>(Registers[REG_R10]),
+                    static_cast<unsigned long long>(Registers[REG_R8]), static_cast<unsigned long long>(Registers[REG_R9]));
+      WriteLog(Message);
+    }
+    if (Registers[REG_RAX] == LinuxExitSyscall || Registers[REG_RAX] == 231) {
+      Number = Registers[REG_RAX];
       ExitStatus = Registers[REG_RDI] & 0xff;
+      FlushGuestOutput();
       WriteLog("Guest requested exit.");
       std::longjmp(ReturnToHost, 1);
     }
@@ -182,11 +205,19 @@ public:
     case 0: Result = ReadGuest(A, B, C); break;
     case LinuxWriteSyscall: Result = WriteGuest(A, B, C); break;
     case 3: Result = CloseGuest(A); break;
+    case 5: Result = StatGuest(A, B); break;
     case 9: // mmap
-      Result = MapGuest(A, B, C, Registers[REG_R10], Registers[REG_R8], Registers[REG_R9]);
+      Result = MapGuest(Frame, A, B, C, Registers[REG_R10], Registers[REG_R8], Registers[REG_R9]);
       break;
-    case 10: Result = ProtectGuest(A, B, C); break;
-    case 11: Result = UnmapGuest(A, B); break;
+    case 10: Result = ProtectGuest(Frame, A, B, C); break;
+    case 11: Result = UnmapGuest(Frame, A, B); break;
+    case 12: Result = SetHeapEnd(A); break;
+    case 17: Result = ReadAtGuest(A, B, C, Registers[REG_R10]); break;
+    case 20: Result = WriteVectorGuest(A, B, C); break;
+    case 21: Result = AccessGuest(A, B); break;
+    case 158: Result = ArchPrctl(Frame, A, B); break;
+    case 262: Result = StatAtGuest(A, B, C, Registers[REG_R10]); break;
+    case 318: Result = RandomGuest(A, B, C); break;
     case FEX_NX2_PRESENT_RGBA: Result = PresentGuestFrame(A); break;
     case FEX_NX2_POLL_INPUT: Result = PollGameInput(); break;
     case FEX_NX2_TICKS_MS: Result = armTicksToNs(armGetSystemTick() - StartTick) / 1'000'000; break;
@@ -195,27 +226,27 @@ public:
       Result = OpenGuest(A, B, C);
       break;
     }
+    if (Logging == LogLevel::Trace || (Logging == LogLevel::Detailed && Result < 0 && Result >= -4095)) {
+      char Message[128];
+      std::snprintf(Message, sizeof(Message), "Guest syscall %llu at %#llx returned %lld",
+                    static_cast<unsigned long long>(Registers[REG_RAX]), static_cast<unsigned long long>(Frame->State.rip),
+                    static_cast<long long>(Result));
+      WriteLog(Message);
+    }
     Registers[REG_RAX] = Result;
     Frame->State.rip += 2;
   }
 
   void PreCompile() override {
-    if (DetailedLogging) {
+    if (Logging == LogLevel::Detailed) {
       WriteLog("FEXCore entered guest compilation.");
     }
   }
 
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Address) override {
-    for (const auto& Segment : Segments) {
-      if ((Segment.Flags & PF_X) && Address >= Segment.Start && Address - Segment.Start < Segment.Size) {
-        return {Segment.Start, Segment.Size, (Segment.Flags & PF_W) != 0};
-      }
-    }
-    for (const auto& Map : Mappings) {
-      const auto Start = reinterpret_cast<uint64_t>(Map.Ptr);
-      if ((Map.Flags & PF_X) && Address >= Start && Address - Start < Map.Size) {
-        return {Start, Map.Size, (Map.Flags & PF_W) != 0};
-      }
+    const auto Range = Memory.Query(Address);
+    if (Range.Flags & PF_X) {
+      return {Range.Start, Range.Size, (Range.Flags & PF_W) != 0};
     }
     return {};
   }
@@ -233,31 +264,142 @@ private:
     s64 Offset;
     bool Virtual {};
     std::string_view Contents;
+    uint64_t Inode;
   };
-  struct Mapping {
-    void* Ptr;
-    size_t Size;
-    uint32_t Flags;
+  struct LinuxStat {
+    uint64_t Device, Inode, Links;
+    uint32_t Mode, Uid, Gid, Pad;
+    uint64_t Rdev;
+    int64_t Size, BlockSize, Blocks;
+    uint64_t Times[6];
+    int64_t Reserved[3];
   };
+  static_assert(sizeof(LinuxStat) == 144);
+
+  static constexpr uint64_t CurrentDirectory = static_cast<uint64_t>(-100);
+  static bool IsCwd(uint64_t FD) { return FD == CurrentDirectory || FD == static_cast<uint32_t>(CurrentDirectory); }
+  OpenFile* GetFile(uint64_t FD) {
+    return FD >= 3 && FD - 3 < Files.size() && Files[FD - 3] ? &*Files[FD - 3] : nullptr;
+  }
 
   size_t Available(uint64_t Address, uint32_t Flags) const {
-    const auto InRange = [&](uint64_t Start, uint64_t Size, uint32_t Access) -> size_t {
-      return (Access & Flags) == Flags && Address >= Start && Address - Start < Size ? Size - (Address - Start) : 0;
-    };
-    for (const auto& Segment : Segments) {
-      if (const auto Size = InRange(Segment.Start, Segment.Size, Segment.Flags)) {
-        return Size;
-      }
+    const auto Range = Memory.Query(Address);
+    return (Range.Flags & Flags) == Flags && Range.Size ? Range.Size - (Address - Range.Start) : 0;
+  }
+
+  std::optional<std::string_view> GuestString(uint64_t Address) const {
+    const auto* Data = reinterpret_cast<const char*>(Address);
+    const size_t Limit = std::min<size_t>(Available(Address, PF_R), FS_MAX_PATH);
+    if (!Limit) return std::nullopt;
+    const auto* End = static_cast<const char*>(std::memchr(Data, 0, Limit));
+    if (!End) return std::nullopt;
+    return std::string_view {Data, static_cast<size_t>(End - Data)};
+  }
+
+  static uint64_t FileInode(std::string_view Path) {
+    uint64_t Hash = 14695981039346656037ULL;
+    for (const auto Byte : Path) {
+      Hash = (Hash ^ static_cast<uint8_t>(Byte)) * 1099511628211ULL;
     }
-    if (const auto Size = InRange(reinterpret_cast<uint64_t>(GuestStack.data()), GuestStack.size(), PF_R | PF_W)) {
-      return Size;
+    return Hash;
+  }
+
+  static LinuxStat MakeStat(uint32_t Mode, int64_t Size, uint64_t Inode) {
+    LinuxStat Info {};
+    Info.Device = 1;
+    Info.Inode = Inode;
+    Info.Links = 1;
+    Info.Mode = Mode;
+    Info.Size = Size;
+    Info.BlockSize = GuestPageSize;
+    Info.Blocks = (Size + 511) / 512;
+    return Info;
+  }
+
+  int64_t StatGuest(uint64_t FD, uint64_t Output) {
+    if (sizeof(LinuxStat) > Available(Output, PF_W)) return Fault;
+    LinuxStat Info {};
+    if (FD <= 2) {
+      Info = MakeStat(0020000 | 0600, 0, FD + 1);
+    } else if (auto* File = GetFile(FD)) {
+      s64 Size = File->Contents.size();
+      if (!File->Virtual && R_FAILED(fsFileGetSize(&File->Handle, &Size))) return -5;
+      Info = MakeStat(0100000 | 0444, Size, File->Inode);
+    } else {
+      return BadFile;
     }
-    for (const auto& Map : Mappings) {
-      if (const auto Size = InRange(reinterpret_cast<uint64_t>(Map.Ptr), Map.Size, Map.Flags)) {
-        return Size;
-      }
-    }
+    std::memcpy(reinterpret_cast<void*>(Output), &Info, sizeof(Info));
     return 0;
+  }
+
+  int64_t StatAtGuest(uint64_t FD, uint64_t Address, uint64_t Output, uint64_t Flags) {
+    constexpr uint64_t EmptyPath = 0x1000;
+    constexpr uint64_t NoFollow = 0x100;
+    if (Flags & ~(EmptyPath | NoFollow)) return Invalid;
+    const auto Name = GuestString(Address);
+    if (!Name) return Fault;
+    if (Name->empty() && (Flags & EmptyPath)) return StatGuest(FD, Output);
+    if (!IsCwd(FD) && !Name->starts_with('/')) return BadFile;
+    if (sizeof(LinuxStat) > Available(Output, PF_W)) return Fault;
+    const auto Path = Switch2Guest::ResolvePath(*Name, Folder, RootPath);
+    if (!Path || Path->size() >= FS_MAX_PATH) return Invalid;
+    FsFileSystem SdCard {};
+    if (R_FAILED(fsOpenSdCardFileSystem(&SdCard))) return -5;
+    FsDirEntryType Type {};
+    const Result Status = fsFsGetEntryType(&SdCard, Path->c_str(), &Type);
+    s64 Size {};
+    bool Readable = R_SUCCEEDED(Status);
+    if (Readable && Type == FsDirEntryType_File) {
+      FsFile File {};
+      Readable = R_SUCCEEDED(fsFsOpenFile(&SdCard, Path->c_str(), FsOpenMode_Read, &File));
+      if (Readable) {
+        Readable = R_SUCCEEDED(fsFileGetSize(&File, &Size));
+        fsFileClose(&File);
+      }
+    }
+    fsFsClose(&SdCard);
+    if (!Readable) return -2;
+    const auto Info = MakeStat(Type == FsDirEntryType_Dir ? 0040555 : 0100444, Size, FileInode(*Path));
+    std::memcpy(reinterpret_cast<void*>(Output), &Info, sizeof(Info));
+    return 0;
+  }
+
+  int64_t AccessGuest(uint64_t Address, uint64_t Mode) {
+    if ((Mode & ~7ULL) || (Mode & 2)) return -13;
+    const auto Name = GuestString(Address);
+    if (!Name) return Fault;
+    const auto Path = Switch2Guest::ResolvePath(*Name, Folder, RootPath);
+    if (!Path || Path->size() >= FS_MAX_PATH) return Invalid;
+    FsFileSystem SdCard {};
+    if (R_FAILED(fsOpenSdCardFileSystem(&SdCard))) return -5;
+    FsDirEntryType Type {};
+    const auto Status = fsFsGetEntryType(&SdCard, Path->c_str(), &Type);
+    fsFsClose(&SdCard);
+    return R_SUCCEEDED(Status) ? 0 : -2;
+  }
+
+  int64_t ArchPrctl(FEXCore::Core::CpuStateFrame* Frame, uint64_t Code, uint64_t Value) {
+    switch (Code) {
+    case 0x1001: Frame->State.gs_cached = Value; return 0;
+    case 0x1002: Frame->State.fs_cached = Value; return 0;
+    case 0x1003:
+    case 0x1004: {
+      if (sizeof(uint64_t) > Available(Value, PF_W)) return Fault;
+      const auto Base = Code == 0x1003 ? Frame->State.fs_cached : Frame->State.gs_cached;
+      std::memcpy(reinterpret_cast<void*>(Value), &Base, sizeof(Base));
+      return 0;
+    }
+    default: return Invalid;
+    }
+  }
+
+  int64_t RandomGuest(uint64_t Address, uint64_t Count, uint64_t Flags) {
+    if (Flags & ~3ULL) return Invalid;
+    Count = std::min<uint64_t>(Count, 65536);
+    if (!Count) return 0;
+    if (Count > Available(Address, PF_W)) return Fault;
+    randomGet(reinterpret_cast<void*>(Address), Count);
+    return Count;
   }
 
   int64_t PollGameInput() {
@@ -328,6 +470,46 @@ private:
     return 0;
   }
 
+  void FlushGuestOutput() {
+    if (!OutputLog.empty()) {
+      WriteLog(OutputLog.c_str());
+      OutputLog.clear();
+    }
+  }
+
+  void LogGuestOutput(const char* Text, size_t Count) {
+    for (size_t Index = 0; Index < Count; ++Index) {
+      const auto Byte = static_cast<unsigned char>(Text[Index]);
+      if (Byte == '\n' || OutputLog.size() == 960) {
+        FlushGuestOutput();
+      }
+      if (Byte >= 32 && Byte != 127) {
+        OutputLog += static_cast<char>(Byte);
+      } else if (Byte == '\t') {
+        OutputLog += ' ';
+      }
+    }
+  }
+
+  int64_t WriteVectorGuest(uint64_t FD, uint64_t Address, uint64_t Count) {
+    struct IoVector { uint64_t Base; uint64_t Size; };
+    if (FD != 1 && FD != 2) return BadFile;
+    if (!Count) return 0;
+    if (Count > 1024) return Invalid;
+    if (Count * sizeof(IoVector) > Available(Address, PF_R)) return Fault;
+
+    int64_t Total = 0;
+    for (uint64_t Index = 0; Index < Count; ++Index) {
+      IoVector Vector;
+      std::memcpy(&Vector, reinterpret_cast<const void*>(Address + Index * sizeof(Vector)), sizeof(Vector));
+      const auto Written = WriteGuest(FD, Vector.Base, Vector.Size);
+      if (Written < 0) return Total ? Total : Written;
+      Total += Written;
+      if (static_cast<uint64_t>(Written) < Vector.Size) break;
+    }
+    return Total;
+  }
+
   int64_t WriteGuest(uint64_t FD, uint64_t Address, uint64_t Count) {
     if (FD != 1 && FD != 2) {
       return BadFile;
@@ -338,6 +520,9 @@ private:
     }
     if (Count > Available(Address, PF_R)) {
       return Fault;
+    }
+    if (FD == 2 || Logging == LogLevel::Trace) {
+      LogGuestOutput(reinterpret_cast<const char*>(Address), Count);
     }
     if (GraphicsActive) {
       // The console renderer shares the display with the game.
@@ -350,9 +535,8 @@ private:
   }
 
   int64_t OpenGuest(uint64_t Directory, uint64_t Address, uint64_t Flags) {
-    constexpr uint64_t CurrentDirectory = static_cast<uint64_t>(-100);
     constexpr uint64_t CloseOnExec = 02000000;
-    if ((Directory != CurrentDirectory && Directory != static_cast<uint32_t>(CurrentDirectory)) || (Flags & ~CloseOnExec)) {
+    if (!IsCwd(Directory) || (Flags & ~CloseOnExec)) {
       return Invalid;
     }
     const auto* Name = reinterpret_cast<const char*>(Address);
@@ -365,7 +549,7 @@ private:
       return Fault;
     }
     const std::string_view GuestPath {Name, static_cast<size_t>(End - Name)};
-    const auto Path = Switch2Guest::ResolvePath(GuestPath, Folder);
+    const auto Path = Switch2Guest::ResolvePath(GuestPath, Folder, RootPath);
     if (!Path) {
       return Invalid;
     }
@@ -377,7 +561,7 @@ private:
     if (GuestPath == "/dev/null" || GuestPath == "/proc/version" || GuestPath == "/proc/self/status") {
       const std::string_view Contents = GuestPath == "/proc/version" ? "Linux version 5.0.0 (FEX Switch 2 guest)\n" :
         GuestPath == "/proc/self/status" ? "Name:\tfex-guest\nThreads:\t1\n" : "";
-      *Slot = OpenFile {{}, 0, true, Contents};
+      *Slot = OpenFile {{}, 0, true, Contents, FileInode(GuestPath)};
       return Slot - Files.begin() + 3;
     }
     if (Path->size() >= FS_MAX_PATH) {
@@ -390,10 +574,15 @@ private:
     FsFile File {};
     const Result ResultCode = fsFsOpenFile(&SdCard, Path->c_str(), FsOpenMode_Read, &File);
     fsFsClose(&SdCard);
+    if (Logging == LogLevel::Trace) {
+      char Message[1024];
+      std::snprintf(Message, sizeof(Message), "openat %s -> 0x%08x", Path->c_str(), ResultCode);
+      WriteLog(Message);
+    }
     if (R_FAILED(ResultCode)) {
       return -2; // ENOENT
     }
-    *Slot = OpenFile {File, 0, false, {}};
+    *Slot = OpenFile {File, 0, false, {}, FileInode(*Path)};
     WriteLog(GuestPath.starts_with('/') ? "Guest opened a rootfs file." : "Guest opened a data file from its working directory.");
     return Slot - Files.begin() + 3;
   }
@@ -432,22 +621,32 @@ private:
       }
       return 0;
     }
-    auto& File = *Files[FD - 3];
+    auto& File = *GetFile(FD);
+    const auto Read = ReadFileAt(File, Buffer, Count, File.Offset);
+    if (Read > 0) File.Offset += Read;
+    return Read;
+  }
+
+  static int64_t ReadFileAt(OpenFile& File, void* Buffer, size_t Count, uint64_t Offset) {
+    if (Offset > INT64_MAX) return Invalid;
     if (File.Virtual) {
-      const auto Data = File.Contents.substr(static_cast<size_t>(File.Offset));
-      const size_t Read = std::min<size_t>(Data.size(), Count);
-      if (Read) {
-        std::memcpy(Buffer, Data.data(), Read);
-        File.Offset += Read;
-      }
+      if (Offset >= File.Contents.size()) return 0;
+      const auto Data = File.Contents.substr(Offset);
+      const size_t Read = std::min(Data.size(), Count);
+      std::memcpy(Buffer, Data.data(), Read);
       return Read;
     }
     u64 Read {};
-    if (R_FAILED(fsFileRead(&File.Handle, File.Offset, Buffer, Count, FsReadOption_None, &Read))) {
-      return -5; // EIO
-    }
-    File.Offset += Read;
-    return Read;
+    return R_SUCCEEDED(fsFileRead(&File.Handle, Offset, Buffer, Count, FsReadOption_None, &Read)) ? static_cast<int64_t>(Read) : -5;
+  }
+
+  int64_t ReadAtGuest(uint64_t FD, uint64_t Address, uint64_t Count, uint64_t Offset) {
+    auto* File = GetFile(FD);
+    if (!File) return BadFile;
+    Count = std::min<uint64_t>(Count, 65536);
+    if (!Count) return 0;
+    if (Count > Available(Address, PF_W)) return Fault;
+    return ReadFileAt(*File, reinterpret_cast<void*>(Address), Count, Offset);
   }
 
   int64_t CloseGuest(uint64_t FD) {
@@ -461,55 +660,110 @@ private:
     return 0;
   }
 
-  int64_t MapGuest(uint64_t Address, uint64_t Size, uint64_t Protection, uint64_t Flags, uint64_t FD, uint64_t Offset) {
-    constexpr uint64_t AnonymousPrivate = 0x22;
-    if (Address || !Size || Size > 1024 * 1024 || (Protection & ~7ULL) ||
-        Flags != AnonymousPrivate || static_cast<uint32_t>(FD) != UINT32_MAX || Offset) {
-      return Invalid;
-    }
-    const auto Slot = std::find_if(Mappings.begin(), Mappings.end(), [](const auto& Map) { return !Map.Ptr; });
-    if (Slot == Mappings.end()) {
-      return -12; // ENOMEM
-    }
-    const auto Rounded = (Size + GuestPageSize - 1) & ~(GuestPageSize - 1);
-    auto* Memory = std::aligned_alloc(GuestPageSize, Rounded);
-    if (!Memory) {
-      return -12; // ENOMEM
-    }
-    std::memset(Memory, 0, Rounded);
-    *Slot = {Memory, Rounded, static_cast<uint32_t>(((Protection & 1) ? PF_R : 0) | ((Protection & 2) ? PF_W : 0) | ((Protection & 4) ? PF_X : 0))};
-    return reinterpret_cast<int64_t>(Memory);
+  static uint8_t PageFlags(uint64_t Protection) {
+    return ((Protection & 1) ? PF_R : 0) | ((Protection & 2) ? PF_W : 0) | ((Protection & 4) ? PF_X : 0);
   }
 
-  int64_t ProtectGuest(uint64_t Address, uint64_t Size, uint64_t Protection) {
-    if (Protection & ~7ULL) {
-      return Invalid;
+  void InvalidateExecutableRange(FEXCore::Core::CpuStateFrame* Frame, uint64_t Start, size_t Size, uint8_t NewFlags) {
+    bool Invalidate = NewFlags & PF_X;
+    for (size_t Offset = 0; !Invalidate && Offset < Size; Offset += GuestPageSize) {
+      Invalidate = Memory.Query(Start + Offset).Flags & PF_X;
     }
-    for (auto& Map : Mappings) {
-      if (Map.Ptr && !(Map.Flags & PF_X) && Address == reinterpret_cast<uint64_t>(Map.Ptr) &&
-          Size && Size <= Map.Size && Map.Size - Size < GuestPageSize) {
-        Map.Flags = ((Protection & 1) ? PF_R : 0) | ((Protection & 2) ? PF_W : 0) | ((Protection & 4) ? PF_X : 0);
-        return 0;
+    if (!Invalidate) return;
+    auto* Thread = Frame->Thread;
+    auto* Context = Thread->CTX;
+    std::unique_lock Lock {Context->GetCodeInvalidationMutex()};
+    Context->InvalidateCodeBuffersCodeRange(Start, Size);
+    Context->InvalidateThreadCachedCodeRange(Thread, Start, Size);
+  }
+
+  bool OverlapsHeap(uint64_t Address, size_t Size) const {
+    return HeapStart && Address < HeapStart + HeapLimit && HeapStart < Address + Size;
+  }
+
+  int64_t MapGuest(FEXCore::Core::CpuStateFrame* Frame, uint64_t Address, uint64_t Size, uint64_t Protection, uint64_t Flags,
+                   uint64_t FD, uint64_t Offset) {
+    constexpr uint64_t Private = 2, Fixed = 0x10, Anonymous = 0x20, DenyWrite = 0x800, Executable = 0x1000;
+    const bool IsFixed = Flags & Fixed;
+    const bool IsAnonymous = Flags & Anonymous;
+    if (!Size || Size > Memory.MaxMapping || (Protection & ~7ULL) || !(Flags & Private) ||
+        (Flags & ~(Private | Fixed | Anonymous | DenyWrite | Executable)) || Offset % GuestPageSize ||
+        (IsAnonymous && (Offset || static_cast<uint32_t>(FD) != UINT32_MAX))) return Invalid;
+    auto* File = IsAnonymous ? nullptr : GetFile(FD);
+    if (!IsAnonymous && !File) return BadFile;
+    const auto Rounded = Memory.RoundUp(Size);
+    if (IsFixed && (Address % GuestPageSize || !Memory.Owns(Address, Rounded) || OverlapsHeap(Address, Rounded))) return Invalid;
+    const auto Access = PageFlags(Protection);
+    if (!IsFixed) {
+      Address = Memory.Allocate(Size, Access);
+      if (!Address) return -12;
+      if (File && ReadFileAt(*File, reinterpret_cast<void*>(Address), Rounded, Offset) < 0) {
+        Memory.Set(Address, Rounded, Memory.Unmapped, true);
+        return -5;
       }
+      return Address;
     }
-    return Invalid;
+
+    std::unique_ptr<void, decltype(&std::free)> Copy {nullptr, &std::free};
+    if (File) {
+      Copy.reset(std::calloc(1, Rounded));
+      if (!Copy) return -12;
+      if (ReadFileAt(*File, Copy.get(), Rounded, Offset) < 0) return -5;
+    }
+    InvalidateExecutableRange(Frame, Address, Rounded, Access);
+    if (Copy) {
+      std::memcpy(reinterpret_cast<void*>(Address), Copy.get(), Rounded);
+    } else {
+      std::memset(reinterpret_cast<void*>(Address), 0, Rounded);
+    }
+    Memory.Set(Address, Rounded, Access, true);
+    return Address;
   }
 
-  int64_t UnmapGuest(uint64_t Address, uint64_t Size) {
-    for (auto& Map : Mappings) {
-      if (Map.Ptr && !(Map.Flags & PF_X) && Address == reinterpret_cast<uint64_t>(Map.Ptr) && Size && Size <= Map.Size && Map.Size - Size < GuestPageSize) {
-        std::free(Map.Ptr);
-        Map = {};
-        return 0;
-      }
-    }
-    return Invalid;
+  int64_t ProtectGuest(FEXCore::Core::CpuStateFrame* Frame, uint64_t Address, uint64_t Size, uint64_t Protection) {
+    if ((Protection & ~7ULL) || Address % GuestPageSize || Size > Memory.MaxMapping) return Invalid;
+    if (!Size) return 0;
+    const auto Rounded = Memory.RoundUp(Size);
+    if (!Memory.IsMapped(Address, Rounded)) return -12;
+    const auto Access = PageFlags(Protection);
+    InvalidateExecutableRange(Frame, Address, Rounded, Access);
+    return Memory.Set(Address, Rounded, Access) ? 0 : Invalid;
   }
 
-  std::span<const Switch2Guest::Segment> Segments;
+  int64_t UnmapGuest(FEXCore::Core::CpuStateFrame* Frame, uint64_t Address, uint64_t Size) {
+    if (Address % GuestPageSize || !Size || Size > Memory.MaxMapping) return Invalid;
+    const auto Rounded = Memory.RoundUp(Size);
+    if (!Memory.Owns(Address, Rounded) || OverlapsHeap(Address, Rounded)) return Invalid;
+    InvalidateExecutableRange(Frame, Address, Rounded, 0);
+    return Memory.Set(Address, Rounded, Memory.Unmapped, true) ? 0 : Invalid;
+  }
+
+  int64_t SetHeapEnd(uint64_t Requested) {
+    if (!HeapStart) {
+      HeapStart = Memory.Allocate(HeapLimit, 0);
+      HeapEnd = HeapStart;
+    }
+    if (!HeapStart || Requested < HeapStart || Requested - HeapStart > HeapLimit) return HeapEnd;
+    const size_t OldSize = Memory.RoundUp(HeapEnd - HeapStart);
+    const size_t NewSize = Memory.RoundUp(Requested - HeapStart);
+    if (NewSize > OldSize) {
+      std::memset(reinterpret_cast<void*>(HeapStart + OldSize), 0, NewSize - OldSize);
+      Memory.Set(HeapStart + OldSize, NewSize - OldSize, PF_R | PF_W, true);
+    } else if (NewSize < OldSize) {
+      Memory.Set(HeapStart + NewSize, OldSize - NewSize, 0, true);
+    }
+    HeapEnd = Requested;
+    return HeapEnd;
+  }
+
+  static constexpr size_t HeapLimit = 8 * 1024 * 1024;
+  uint64_t HeapStart {};
+  uint64_t HeapEnd {};
+  Switch2Guest::GuestAddressSpace Memory;
   std::string Folder;
+  std::string RootPath;
+  std::string OutputLog;
   std::array<std::optional<OpenFile>, 16> Files {};
-  std::array<Mapping, 8> Mappings {};
   PadState Input {};
   const u64 StartTick {armGetSystemTick()};
   Framebuffer Video {};
@@ -527,7 +781,8 @@ void PrintStage(const char* Text) {
 
 std::optional<uint64_t> RunGuest(uint64_t Entry, std::span<const Switch2Guest::Segment> Segments,
                                  const std::string& Folder = "/", std::string_view Program = "probe", std::string_view Argument = {},
-                                 const Switch2Guest::ElfImage* ProgramImage = nullptr, uint64_t InterpreterBase = 0) {
+                                 const Switch2Guest::ElfImage* ProgramImage = nullptr, uint64_t InterpreterBase = 0,
+                                 const std::string& RootPath = Switch2Guest::Root) {
   using namespace FEXCore;
   Config::Set(Config::CONFIG_IS64BIT_MODE, "1");
   Config::Set(Config::CONFIG_DISKCACHE, "0");
@@ -537,7 +792,7 @@ std::optional<uint64_t> RunGuest(uint64_t Entry, std::span<const Switch2Guest::S
   Features.ProcessFeatures.Is64BitMode = true;
   Features.DCacheLineLog2 = 4;
   SignalDelegator Signals;
-  auto Syscalls = fextl::make_unique<ProbeSyscalls>(Segments, Folder);
+  auto Syscalls = fextl::make_unique<ProbeSyscalls>(Segments, Folder, RootPath);
 
   PrintStage("Creating FEXCore context...");
   auto Context = Context::Context::CreateNewContext(Features);
@@ -599,11 +854,17 @@ std::optional<uint64_t> RunGuest(uint64_t Entry, std::span<const Switch2Guest::S
   auto* Thread = Context->CreateThread(&State);
   Thread->CallRetStackBase = ReturnStack.get();
 
+  if (Logging == LogLevel::Trace) {
+    TraceGuest("Program image", ProgramImage ? ProgramImage->Entry : Entry, ProgramImage ? ProgramImage->Base : Entry);
+    TraceGuest("Interpreter start", Entry, InterpreterBase);
+    FEXCore::Switch2::TraceHandler = TraceGuest;
+  }
   PrintStage("Running x86-64 guest...");
   const bool GuestExited = setjmp(Syscalls->ReturnToHost) != 0;
   if (!GuestExited) {
     Context->ExecuteThread(Thread);
   }
+  FEXCore::Switch2::TraceHandler = nullptr;
   Syscalls->CloseVideo();
   if (GuestExited) {
     char ResultText[96];
@@ -716,7 +977,8 @@ public:
       }
       return;
     }
-    DetailedLogging = std::fgetc(File) == '1';
+    const int StoredLevel = std::fgetc(File);
+    Logging = StoredLevel == '2' ? LogLevel::Trace : StoredLevel == '1' ? LogLevel::Detailed : LogLevel::Standard;
     if (std::fgetc(File) == '\n') {
       StartFolder = ReadSavedFolder(File, DefaultFolder);
     }
@@ -763,7 +1025,7 @@ public:
     case Screen::Settings:
       std::puts("Settings\n");
       DrawItem(0, ("Start folder  " + DisplayName(StartFolder)).c_str());
-      DrawItem(1, DetailedLogging ? "Logging  Detailed" : "Logging  Standard");
+      DrawItem(1, LogLevelLabels[static_cast<int>(Logging)]);
       DrawItem(2, "Diagnostics");
       if (!Notice.empty()) {
         std::printf("\n%s\n", Notice.c_str());
@@ -867,7 +1129,7 @@ private:
       Notice = "Could not save settings to the SD card.";
       return;
     }
-    const int Written = std::fprintf(File, "%d\n%s\n", DetailedLogging, StartFolder.c_str());
+    const int Written = std::fprintf(File, "%d\n%s\n", static_cast<int>(Logging), StartFolder.c_str());
     if (std::fclose(File) != 0 || Written < 0) {
       Notice = "Could not save settings to the SD card.";
     }
@@ -968,7 +1230,7 @@ private:
       SaveSettings();
       break;
     case 1:
-      DetailedLogging = !DetailedLogging;
+      Logging = static_cast<LogLevel>((static_cast<int>(Logging) + 1) % 3);
       SaveSettings();
       break;
     case 2:
@@ -982,8 +1244,30 @@ private:
     Image = {};
     Interpreter = {};
     LoadError = ReadElf(SelectedFile.c_str(), Image);
+    SelectedRoot = Switch2Guest::Root;
     if (!LoadError && !Image.Interpreter.empty()) {
-      const auto Path = Switch2Guest::ResolvePath(Image.Interpreter, "/");
+      const std::string Sidecar = "sdmc:" + SelectedFile + ".rootfs";
+      if (auto* File = std::fopen(Sidecar.c_str(), "r")) {
+        char Buffer[80] {};
+        const bool Read = std::fgets(Buffer, sizeof(Buffer), File) != nullptr;
+        const bool Complete = Read && (std::strchr(Buffer, '\n') || std::feof(File));
+        std::fclose(File);
+        Buffer[strcspn(Buffer, "\r\n")] = 0;
+        const std::string_view Name {Buffer};
+        if (!Complete || Name.empty() ||
+            Name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != Name.npos) {
+          LoadError = "Invalid .rootfs sidecar. Use a rootfs folder name.";
+          Open(Screen::Details);
+          return;
+        }
+        SelectedRoot += '/';
+        SelectedRoot += Name;
+      } else if (errno != ENOENT) {
+        LoadError = "Could not read the .rootfs sidecar.";
+        Open(Screen::Details);
+        return;
+      }
+      const auto Path = Switch2Guest::ResolvePath(Image.Interpreter, "/", SelectedRoot);
       LoadError = Path ? ReadElf(Path->c_str(), Interpreter) : "Invalid interpreter path.";
       if (!LoadError && !Interpreter.Interpreter.empty()) {
         LoadError = "An ELF interpreter cannot have its own interpreter.";
@@ -1009,10 +1293,11 @@ private:
     const auto InterpreterSegments = Interpreter.GetSegments();
     Segments.insert(Segments.end(), InterpreterSegments.begin(), InterpreterSegments.end());
     if (Interpreter.Entry) {
-      PrintStage("Starting the guest ELF interpreter...");
+      PrintStage(("Guest rootfs " + SelectedRoot).c_str());
+      PrintStage(("Starting interpreter " + Image.Interpreter).c_str());
     }
     const auto Exit = RunGuest(Interpreter.Entry ? Interpreter.Entry : Image.Entry, Segments, Folder, SelectedFile, Argument,
-                               &Image, Interpreter.Base);
+                               &Image, Interpreter.Base, SelectedRoot);
     Image = {};
     Interpreter = {};
     LastResult = Exit ? "Exited with status " + std::to_string(*Exit) : "Guest did not reach exit.";
@@ -1047,6 +1332,7 @@ private:
   std::string LastFolder;
   std::string Folder {"/"};
   std::string SelectedFile;
+  std::string SelectedRoot;
   std::string Notice;
   std::string LastResult;
   std::vector<DirectoryEntry> Entries;
@@ -1059,7 +1345,7 @@ private:
 
 int main() {
   const Result LogStatus = OpenLog();
-  WriteLog("--- FEX Switch 2 launcher 0.7.0 started ---");
+  WriteLog("--- FEX Switch 2 launcher 0.8.4 started ---");
   WriteLog("Initializing console...");
   consoleInit(nullptr);
   if (R_FAILED(LogStatus)) {
