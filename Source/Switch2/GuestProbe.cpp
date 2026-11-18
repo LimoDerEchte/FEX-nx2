@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "GuestElf.h"
+#include "GuestVideo.h"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
@@ -39,6 +40,7 @@ s64 LogOffset {};
 bool LogOpen {};
 bool LogWriteFailed {};
 bool DetailedLogging {};
+bool GraphicsActive {};
 
 Result EnsureDirectory(FsFileSystem& SdCard, const char* Path) {
   const Result Status = fsFsCreateDirectory(&SdCard, Path);
@@ -126,6 +128,7 @@ public:
   }
 
   ~ProbeSyscalls() override {
+    CloseVideo();
     for (auto& File : Files) {
       if (File) {
         fsFileClose(&File->Handle);
@@ -139,6 +142,14 @@ public:
   std::jmp_buf ReturnToHost;
   uint64_t Number {};
   uint64_t ExitStatus {};
+
+  void CloseVideo() {
+    if (GraphicsActive) {
+      framebufferClose(&Video);
+      GraphicsActive = false;
+      consoleInit(nullptr);
+    }
+  }
 
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
     using namespace FEXCore::X86State;
@@ -161,6 +172,7 @@ public:
       Result = MapGuest(A, B, C, Registers[REG_R10], Registers[REG_R8], Registers[REG_R9]);
       break;
     case 11: Result = UnmapGuest(A, B); break;
+    case FEX_NX2_PRESENT_RGBA: Result = PresentGuestFrame(A); break;
     case 257: // openat
       Result = OpenGuest(A, B, C);
       break;
@@ -222,6 +234,60 @@ private:
     return 0;
   }
 
+  int64_t PresentGuestFrame(uint64_t Address) {
+    constexpr u32 Width = FEX_NX2_FRAME_WIDTH;
+    constexpr u32 Height = FEX_NX2_FRAME_HEIGHT;
+    constexpr u32 Scale = 4;
+    if (Address % alignof(uint32_t) || Available(Address, PF_R) < Width * Height * sizeof(uint32_t)) {
+      return Fault;
+    }
+    if (!GraphicsActive) {
+      WriteLog("Opening the graphical display.");
+      consoleExit(nullptr);
+      Result Status = framebufferCreate(&Video, nwindowGetDefault(), Width * Scale, Height * Scale, PIXEL_FORMAT_RGBA_8888, 2);
+      if (R_SUCCEEDED(Status)) {
+        Status = framebufferMakeLinear(&Video);
+        if (R_FAILED(Status)) {
+          framebufferClose(&Video);
+        }
+      }
+      if (R_FAILED(Status)) {
+        consoleInit(nullptr);
+        char Message[96];
+        std::snprintf(Message, sizeof(Message), "Could not open the graphical display (0x%08x).", Status);
+        PrintStage(Message);
+        return -5; // EIO
+      }
+      GraphicsActive = true;
+      WriteLog("Graphical display initialized.");
+    }
+
+    u32 Stride {};
+    auto* Destination = static_cast<uint8_t*>(framebufferBegin(&Video, &Stride));
+    if (!Destination) {
+      WriteLog("Could not dequeue a graphical framebuffer.");
+      return -5;
+    }
+    const auto* Source = reinterpret_cast<const uint32_t*>(Address);
+    constexpr size_t RowBytes = Width * Scale * sizeof(uint32_t);
+    for (u32 Y = 0; Y < Height; ++Y) {
+      auto* FirstRow = Destination + Y * Scale * Stride;
+      auto* Row = reinterpret_cast<uint32_t*>(FirstRow);
+      for (u32 X = 0; X < Width; ++X) {
+        std::fill_n(Row + X * Scale, Scale, Source[Y * Width + X]);
+      }
+      for (u32 Copy = 1; Copy < Scale; ++Copy) {
+        std::memcpy(FirstRow + Copy * Stride, FirstRow, RowBytes);
+      }
+    }
+    framebufferEnd(&Video);
+    if (!Presented) {
+      Presented = true;
+      WriteLog("Presented the first guest frame.");
+    }
+    return 0;
+  }
+
   int64_t WriteGuest(uint64_t FD, uint64_t Address, uint64_t Count) {
     if (FD != 1 && FD != 2) {
       return BadFile;
@@ -232,6 +298,10 @@ private:
     }
     if (Count > Available(Address, PF_R)) {
       return Fault;
+    }
+    if (GraphicsActive) {
+      // The console renderer shares the display with the game.
+      return Count;
     }
     const size_t Written = std::fwrite(reinterpret_cast<const void*>(Address), 1, Count, stdout);
     std::fflush(stdout);
@@ -320,7 +390,11 @@ private:
             return 1;
           }
         }
-        consoleUpdate(nullptr);
+        if (GraphicsActive) {
+          svcSleepThread(10'000'000);
+        } else {
+          consoleUpdate(nullptr);
+        }
       }
       return 0;
     }
@@ -378,13 +452,17 @@ private:
   std::array<std::optional<OpenFile>, 16> Files {};
   std::array<Mapping, 8> Mappings {};
   PadState Input {};
+  Framebuffer Video {};
+  bool Presented {};
 
 };
 
 void PrintStage(const char* Text) {
   WriteLog(Text);
-  std::puts(Text);
-  consoleUpdate(nullptr);
+  if (!GraphicsActive) {
+    std::puts(Text);
+    consoleUpdate(nullptr);
+  }
 }
 
 std::optional<uint64_t> RunGuest(uint64_t Entry, std::span<const Switch2Guest::Segment> Segments,
@@ -451,6 +529,7 @@ std::optional<uint64_t> RunGuest(uint64_t Entry, std::span<const Switch2Guest::S
   if (!GuestExited) {
     Context->ExecuteThread(Thread);
   }
+  Syscalls->CloseVideo();
   if (GuestExited) {
     char ResultText[96];
     std::snprintf(ResultText, sizeof(ResultText), "Guest syscall %llu, exit status %llu",
@@ -883,7 +962,7 @@ private:
 
 int main() {
   const Result LogStatus = OpenLog();
-  WriteLog("--- FEX Switch 2 launcher 0.4.0 started ---");
+  WriteLog("--- FEX Switch 2 launcher 0.5.0 started ---");
   WriteLog("Initializing console...");
   consoleInit(nullptr);
   if (R_FAILED(LogStatus)) {

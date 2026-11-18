@@ -52,6 +52,8 @@ $(TARGET).nro: NROFLAGS = --icon=$(APP_ICON) --nacp=$(TARGET).nacp
 
 clean:
 	$(RM) $(BUILD)/JitProbe.o $(BUILD)/JitProbe.d $(TARGET).elf $(TARGET).nacp $(TARGET).nro $(FMT_HEADERS) $(BUILD)/fex-hello.o $(BUILD)/fex-hello.elf
+	$(RM) $(BUILD)/maze-start.o $(BUILD)/maze.o $(MAZE_DIR)/sd-maze.elf $(MAZE_DIR)/sd-maze.elf.args $(MAZE_DIR)/data/maze.txt
+	$(RM) $(BUILD)/texture-start.o $(BUILD)/texture-demo.o $(GRAPHICS_DIR)/texture-demo.elf $(GRAPHICS_DIR)/data/sprite.rgba
 
 -include $(OFILES:.o=.d)
 
@@ -91,3 +93,22 @@ $(MAZE_DIR)/sd-maze.elf.args: Maze/sd-maze.elf.args
 $(MAZE_DIR)/data/maze.txt: Maze/data/maze.txt
 	mkdir -p $(@D)
 	cp $< $@
+
+GRAPHICS_DIR := $(BUILD)/texture-demo
+
+.PHONY: texture-demo
+texture-demo: $(GRAPHICS_DIR)/texture-demo.elf $(GRAPHICS_DIR)/data/sprite.rgba
+
+$(BUILD)/texture-start.o: Graphics/Start.S | $(BUILD)
+	$(HOST_X86_AS) --64 $< -o $@
+
+$(BUILD)/texture-demo.o: Graphics/TextureDemo.c GuestVideo.h | $(BUILD)
+	$(HOST_X86_CC) -m64 -Os -ffreestanding -fPIE -fno-stack-protector -mgeneral-regs-only -Wall -Wextra -Werror -c $< -o $@
+
+$(GRAPHICS_DIR)/texture-demo.elf: $(BUILD)/texture-start.o $(BUILD)/texture-demo.o HelloGuest.ld
+	mkdir -p $(@D)
+	$(HOST_X86_LD) -m elf_x86_64 -pie --no-dynamic-linker -T HelloGuest.ld $(filter %.o,$^) -o $@
+
+$(GRAPHICS_DIR)/data/sprite.rgba: Graphics/MakeTexture.py
+	mkdir -p $(@D)
+	python3 $< $@

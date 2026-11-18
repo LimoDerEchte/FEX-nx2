@@ -44,7 +44,7 @@ probe supplies a minimal initial stack and a limited syscall interface.
 The launcher appends checkpoints and FEXCore messages to
 `/switch/fex/fex-switch2-guest.log` and flushes each line.
 If the software closes, inspect the latest section beginning with
-`--- FEX Switch 2 launcher 0.4.0 started ---`. A crash before `main()` or
+`--- FEX Switch 2 launcher 0.5.0 started ---`. A crash before `main()` or
 failure to open the SD card can leave the file unchanged.
 
 ## SD Maze
@@ -62,6 +62,21 @@ directory. The guest runtime supports read-only relative `openat`,
 `read`, `close`, private anonymous memory allocation and release, and
 controller-backed stdin. Other Linux ABI operations remain outside this
 probe's scope.
+
+## Texture demo
+
+Build with `make -C Source/Switch2 texture-demo`. Copy the entire
+`Source/Switch2/build/texture-demo/` folder into `/switch/fex/games/` and
+launch `texture-demo.elf` from the 0.5.0 launcher. A colored diamond should
+appear over a full-screen checkerboard. Move it with the D-pad or stick,
+then press B or Plus to return to the launcher with exit status 0.
+
+The x86-64 guest opens and reads `data/sprite.rgba` using its guest
+working directory, checks that it contains exactly 32 × 32 RGBA8 pixels,
+and draws it into a 320 × 180 frame. The Switch 2 launcher presents the
+frame at 1280 × 720 through libounce. The graphics interface is a
+fork-specific frame presentation syscall. A Linux graphics API bridge
+will be a separate milestone.
 
 ## JIT diagnostics
 
