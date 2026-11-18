@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <elf.h>
+#include <optional>
 
 namespace Switch2Guest {
 const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
@@ -16,7 +17,7 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
       Header.e_ident[EI_DATA] != ELFDATA2LSB || Header.e_ident[EI_VERSION] != EV_CURRENT ||
       Header.e_version != EV_CURRENT || Header.e_machine != EM_X86_64 || Header.e_type != ET_DYN ||
       Header.e_ehsize != sizeof(Header)) {
-    return "Expected a little-endian x86-64 static PIE.";
+    return "Expected a little-endian x86-64 position-independent ELF.";
   }
 
   if (Header.e_phentsize != sizeof(Elf64_Phdr) || Header.e_phnum == 0 || Header.e_phoff > File.size() ||
@@ -28,13 +29,24 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
   std::array<Elf64_Phdr, 16> Loads {};
   uint64_t ImageEnd {};
   bool EntryIsExecutable {};
+  std::optional<uint64_t> ProgramHeaders;
+  bool HasDynamicSegment {};
   for (size_t Index = 0; Index < Header.e_phnum; ++Index) {
     Elf64_Phdr SegmentHeader {};
     std::memcpy(&SegmentHeader, File.data() + Header.e_phoff + Index * sizeof(SegmentHeader), sizeof(SegmentHeader));
-    if (SegmentHeader.p_type == PT_INTERP || SegmentHeader.p_type == PT_DYNAMIC || SegmentHeader.p_type == PT_TLS) {
-      return "ELF requires a dynamic loader, relocations, or TLS.";
+    if (SegmentHeader.p_type == PT_INTERP) {
+      if (!Loaded.Interpreter.empty() || SegmentHeader.p_filesz < 2 || SegmentHeader.p_filesz > 256 ||
+          SegmentHeader.p_offset > File.size() || SegmentHeader.p_filesz > File.size() - SegmentHeader.p_offset) {
+        return "Invalid ELF interpreter entry.";
+      }
+      const char* Path = reinterpret_cast<const char*>(File.data() + SegmentHeader.p_offset);
+      if (Path[0] != '/' || std::memchr(Path, 0, SegmentHeader.p_filesz) != Path + SegmentHeader.p_filesz - 1) {
+        return "Invalid ELF interpreter path.";
+      }
+      Loaded.Interpreter.assign(Path, SegmentHeader.p_filesz - 1);
     }
-    if (SegmentHeader.p_type != PT_LOAD) {
+    HasDynamicSegment |= SegmentHeader.p_type == PT_DYNAMIC;
+    if (SegmentHeader.p_type != PT_LOAD || (SegmentHeader.p_filesz == 0 && SegmentHeader.p_memsz == 0)) {
       continue;
     }
     if (Loaded.SegmentCount == Loads.size() || SegmentHeader.p_filesz > SegmentHeader.p_memsz ||
@@ -44,9 +56,6 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
         (SegmentHeader.p_align > 1 && ((SegmentHeader.p_align & (SegmentHeader.p_align - 1)) ||
          (SegmentHeader.p_vaddr % SegmentHeader.p_align != SegmentHeader.p_offset % SegmentHeader.p_align)))) {
       return "Invalid or unsupported ELF load segment.";
-    }
-    if (SegmentHeader.p_memsz == 0) {
-      continue;
     }
     const uint64_t End = SegmentHeader.p_vaddr + SegmentHeader.p_memsz;
     for (size_t Previous = 0; Previous < Loaded.SegmentCount; ++Previous) {
@@ -59,12 +68,21 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
         Header.e_entry - SegmentHeader.p_vaddr < SegmentHeader.p_filesz) {
       EntryIsExecutable = true;
     }
+    const auto TableBytes = size_t {Header.e_phnum} * sizeof(Elf64_Phdr);
+    if (Header.e_phoff >= SegmentHeader.p_offset && Header.e_phoff - SegmentHeader.p_offset <= SegmentHeader.p_filesz &&
+        TableBytes <= SegmentHeader.p_filesz - (Header.e_phoff - SegmentHeader.p_offset)) {
+      ProgramHeaders = SegmentHeader.p_vaddr + Header.e_phoff - SegmentHeader.p_offset;
+    }
     ImageEnd = std::max(ImageEnd, End);
     Loads[Loaded.SegmentCount++] = SegmentHeader;
   }
 
   if (!EntryIsExecutable) {
     return "ELF entry point is outside executable file data.";
+  }
+
+  if (!Loaded.Interpreter.empty() && (!ProgramHeaders || !HasDynamicSegment)) {
+    return "Dynamic ELF must map its program headers and dynamic table.";
   }
 
   // Reserve a zeroed page beyond the image for the decoder's lookahead.
@@ -81,6 +99,9 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
     Loaded.Segments[Index] = {Base + Load.p_vaddr, Load.p_memsz, Load.p_flags};
   }
   Loaded.Entry = Base + Header.e_entry;
+  Loaded.Base = Base;
+  Loaded.ProgramHeaders = ProgramHeaders ? Base + *ProgramHeaders : 0;
+  Loaded.ProgramHeaderCount = Header.e_phnum;
   Image = std::move(Loaded);
   return nullptr;
 }

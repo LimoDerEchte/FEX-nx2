@@ -20,16 +20,17 @@ driver with libounce's startup code for the NRO.
 
 Copy `Source/Switch2/build/guest/fex-switch2-guest.nro` to the SD card and
 launch it from hbmenu under kaiHEN. Use the D-pad or stick to navigate, A
-to select, B to go back, and Plus to exit. On startup the launcher creates
-`/switch/fex/games`. The browser defaults to that folder and remembers the
+to select, B to go back, and Plus to exit. If only the old `/switch/fex` folder exists, the launcher moves it to
+`/fex` on startup. If both folders exist, the launcher uses `/fex`. It creates
+`/fex/games`. The browser defaults to that folder and remembers the
 last folder while the launcher is open.
 
 **Settings** lets you select the starting folder and choose standard or
-detailed logging. Settings are saved to `/switch/fex/fex-switch2.cfg`. Diagnostics
+detailed logging. Settings are saved to `/fex/fex-switch2.cfg`. Diagnostics
 offers the embedded x86-64 guest and the ARM64 JIT publication probe.
 
 Build the sample with `make -C Source/Switch2 hello-elf`. Copy
-`Source/Switch2/build/fex-hello.elf` to `/switch/fex/games`, then choose
+`Source/Switch2/build/fex-hello.elf` to `/fex/games`, then choose
 **Browse ELF files**, select the sample, and press **A** on its launch
 screen. A successful run prints `Hello from an x86-64 ELF on Switch 2!`
 and reports exit status 42. On the result screen, A retries, B goes
@@ -42,15 +43,15 @@ the console and can read buffers within readable ELF segments. This
 probe supplies a minimal initial stack and a limited syscall interface.
 
 The launcher appends checkpoints and FEXCore messages to
-`/switch/fex/fex-switch2-guest.log` and flushes each line.
+`/fex/fex-switch2-guest.log` and flushes each line.
 If the software closes, inspect the latest section beginning with
-`--- FEX Switch 2 launcher 0.6.0 started ---`. A crash before `main()` or
+`--- FEX Switch 2 launcher 0.7.0 started ---`. A crash before `main()` or
 failure to open the SD card can leave the file unchanged.
 
 ## SD Maze
 
 Build with `make -C Source/Switch2 maze-elf`. Copy the entire
-`Source/Switch2/build/sd-maze/` folder into `/switch/fex/games/` on the SD
+`Source/Switch2/build/sd-maze/` folder into `/fex/games/` on the SD
 card and launch `sd-maze.elf` from the 0.4.0 launcher. Use the D-pad to
 move and find the exit marked E. Press B or Plus to leave the game.
 Either outcome returns an exit status of 0 to the launcher.
@@ -66,7 +67,7 @@ probe's scope.
 ## Texture demo
 
 Build with `make -C Source/Switch2 texture-demo`. Copy the entire
-`Source/Switch2/build/texture-demo/` folder into `/switch/fex/games/` and
+`Source/Switch2/build/texture-demo/` folder into `/fex/games/` and
 launch `texture-demo.elf` from the 0.5.0 launcher. A colored diamond should
 appear over a full-screen checkerboard. Move it with the D-pad or stick,
 then press B or Plus to return to the launcher with exit status 0.
@@ -82,7 +83,7 @@ will be a separate milestone.
 
 Build with `make -C Source/Switch2 star-catch`. The build uses installed
 SDL2 development headers. Copy the `build/star-catch/` folder into
-`/switch/fex/games/` and launch its ELF from the 0.6.0 launcher.
+`/fex/games/` and launch its ELF from the 0.6.0 launcher.
 
 Move left or right to catch five falling stars. Three missed stars end the
 round. Press B or Plus to return to the launcher. The blue paddle, score
@@ -95,6 +96,29 @@ drawing and RGBA texture uploads and copies, directional key events and held
 state, a quit event, millisecond timing, and read-only SDL file streams.
 Existing dynamically linked SDL2 games, audio, and accelerated renderers
 require additional runtime work.
+
+## Linux rootfs and dynamic ELF test
+
+The SD card layout is `/fex/games`, `/fex/rootfs`, and the launcher log and
+config in `/fex`. The launcher creates the initial rootfs directory tree.
+Absolute guest paths resolve under the rootfs. Relative guest paths resolve
+beside the selected ELF. Read-only `/proc/version`, `/proc/self/status`,
+and `/dev/null` are supplied by the launcher.
+
+Build with `make -C Source/Switch2 dynamic-demo`. Copy the contents of
+`build/dynamic-demo/` into `/fex/`, preserving `games/` and `rootfs/`.
+Launch `dynamic-demo.elf` with the 0.7.0 launcher. The ELF's `PT_INTERP`
+selects `/lib/ld-fex-demo-x86-64.so.2` in the rootfs. That interpreter
+reads the `DT_NEEDED` library, resolves the demo's PLT relocation, and
+hands control to the program. The dynamically linked function prints a
+guest kernel version and a hello message, then the program exits with 42.
+
+This rootfs contains a test interpreter and library. The interpreter
+supports the demo's single dependency and x86-64 PLT relocations.
+The launcher accepts position-independent x86-64 program images and
+supplies the Linux auxiliary vector. Distribution loaders and general
+Linux applications still need file-backed mappings, broader syscall and
+TLS coverage, and other runtime work.
 
 ## JIT diagnostics
 

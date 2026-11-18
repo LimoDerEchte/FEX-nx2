@@ -55,6 +55,8 @@ clean:
 	$(RM) $(BUILD)/maze-start.o $(BUILD)/maze.o $(MAZE_DIR)/sd-maze.elf $(MAZE_DIR)/sd-maze.elf.args $(MAZE_DIR)/data/maze.txt
 	$(RM) $(BUILD)/texture-start.o $(BUILD)/texture-demo.o $(GRAPHICS_DIR)/texture-demo.elf $(GRAPHICS_DIR)/data/sprite.rgba
 	$(RM) $(BUILD)/sdl2-start.o $(BUILD)/sdl2-guest.o $(BUILD)/star-catch.o $(STAR_DIR)/star-catch.elf $(STAR_DIR)/data/star.rgba
+	$(RM) $(BUILD)/dynamic-start.o $(BUILD)/dynamic-main.o $(BUILD)/dynamic-loader.o $(BUILD)/dynamic-library.o
+	$(RM) $(DYNAMIC_DIR)/games/dynamic-demo.elf $(DYNAMIC_DIR)/rootfs/lib/ld-fex-demo-x86-64.so.2 $(DYNAMIC_DIR)/rootfs/lib/libfex-demo.so
 
 -include $(OFILES:.o=.d)
 
@@ -136,3 +138,33 @@ $(STAR_DIR)/star-catch.elf: $(BUILD)/sdl2-start.o $(BUILD)/sdl2-guest.o $(BUILD)
 $(STAR_DIR)/data/star.rgba: Graphics/MakeTexture.py
 	mkdir -p $(@D)
 	python3 $< $@
+
+DYNAMIC_DIR := $(BUILD)/dynamic-demo
+DYNAMIC_CFLAGS := -m64 -Os -ffreestanding -fPIE -fno-stack-protector -mgeneral-regs-only -Wall -Wextra -Werror
+
+.PHONY: dynamic-demo
+dynamic-demo: $(DYNAMIC_DIR)/games/dynamic-demo.elf $(DYNAMIC_DIR)/rootfs/lib/ld-fex-demo-x86-64.so.2
+
+$(BUILD)/dynamic-start.o: Dynamic/Start.S | $(BUILD)
+	$(HOST_X86_AS) --64 $< -o $@
+
+$(BUILD)/dynamic-main.o: Dynamic/Demo.S | $(BUILD)
+	$(HOST_X86_AS) --64 $< -o $@
+
+$(BUILD)/dynamic-loader.o: Dynamic/Loader.c SDL2/GuestSyscall.h | $(BUILD)
+	$(HOST_X86_CC) $(DYNAMIC_CFLAGS) -c $< -o $@
+
+$(BUILD)/dynamic-library.o: Dynamic/Library.c SDL2/GuestSyscall.h | $(BUILD)
+	$(HOST_X86_CC) $(DYNAMIC_CFLAGS) -fPIC -c $< -o $@
+
+$(DYNAMIC_DIR)/rootfs/lib/ld-fex-demo-x86-64.so.2: $(BUILD)/dynamic-start.o $(BUILD)/dynamic-loader.o HelloGuest.ld
+	mkdir -p $(@D)
+	$(HOST_X86_LD) -m elf_x86_64 -pie --no-dynamic-linker -T HelloGuest.ld $(filter %.o,$^) -o $@
+
+$(DYNAMIC_DIR)/rootfs/lib/libfex-demo.so: $(BUILD)/dynamic-library.o
+	mkdir -p $(@D)
+	$(HOST_X86_LD) -m elf_x86_64 -shared --hash-style=sysv -soname libfex-demo.so $< -o $@
+
+$(DYNAMIC_DIR)/games/dynamic-demo.elf: $(BUILD)/dynamic-main.o $(DYNAMIC_DIR)/rootfs/lib/libfex-demo.so
+	mkdir -p $(@D)
+	$(HOST_X86_LD) -m elf_x86_64 -pie --hash-style=sysv --dynamic-linker /lib/ld-fex-demo-x86-64.so.2 $^ -o $@

@@ -15,13 +15,13 @@ set(ARCHITECTURE_arm64 ON)
 set(FEX_SWITCH2 ON)
 set(BUILD_TESTING OFF)
 set(BUILD_STEAM_SUPPORT ON)
-set(CMAKE_INSTALL_FULL_LIBDIR "sdmc:/switch/fex/lib")
-set(CMAKE_INSTALL_PREFIX "sdmc:/switch/fex")
+set(CMAKE_INSTALL_FULL_LIBDIR "sdmc:/fex/lib")
+set(CMAKE_INSTALL_PREFIX "sdmc:/fex")
 set(GIT_DESCRIBE "switch2")
 set(GIT_HASH "switch2")
 
 add_compile_definitions(__SWITCH__ __SWITCH2__ ARCHITECTURE_arm64=1 FEX_DISABLE_TELEMETRY=1
-  GLOBAL_DATA_DIRECTORY="sdmc:/switch/fex/")
+  GLOBAL_DATA_DIRECTORY="sdmc:/fex/")
 add_compile_options(-ffunction-sections -fdata-sections)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
 
@@ -77,7 +77,7 @@ set(GUEST_NACP "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nacp")
 set(GUEST_NRO "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nro")
 set(GUEST_ICON "${DKP}/libounce/default_icon.jpg")
 add_custom_command(OUTPUT "${GUEST_NACP}"
-  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Switch 2 fork" "0.6.0" "${GUEST_NACP}"
+  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Switch 2 fork" "0.7.0" "${GUEST_NACP}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   VERBATIM)
 add_custom_command(OUTPUT "${GUEST_NRO}"
