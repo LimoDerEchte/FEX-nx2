@@ -12,6 +12,11 @@ requested outcome is delivered or concrete user action is required. Keep
 working through recoverable failures and take authorized next steps without
 waiting for another prompt.
 
+Investigate and fix the root cause of a failure. Use diagnostic builds to
+distinguish plausible causes, and label temporary experiments clearly.
+Verify the fix against the original failure and revert experiments that
+regress behavior or lack supporting evidence.
+
 Use `Source/Switch2/NextMilestone.md` as the durable handoff for the active
 Switch 2 milestone. Read it after compaction or resuming the project. Update it
 when the milestone or its hardware verification changes. Work on the `nx2`

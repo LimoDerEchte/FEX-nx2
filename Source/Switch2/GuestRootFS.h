@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -8,12 +9,13 @@ namespace Switch2Guest {
 inline constexpr char Root[] = "/fex/rootfs";
 
 // Absolute Linux paths live inside the rootfs. Relative paths retain the ELF's
-// working directory. Reject traversal and device aliases before calling FS.
+// working directory. Absolute Linux paths clamp parent traversal at the root.
 inline std::optional<std::string> ResolvePath(std::string_view Path, std::string_view Folder, std::string_view RootPath = Root) {
   if (Path.empty() || Path.find_first_of(":\\") != Path.npos) {
     return std::nullopt;
   }
-  const auto Mount = Path.starts_with('/') ? RootPath : Folder;
+  const bool Absolute = Path.starts_with('/');
+  const auto Mount = Absolute ? RootPath : Folder;
   if (Path.starts_with('/')) {
     Path.remove_prefix(1);
   }
@@ -22,9 +24,9 @@ inline std::optional<std::string> ResolvePath(std::string_view Path, std::string
     const auto Slash = Path.find('/');
     const auto Part = Path.substr(0, Slash);
     if (Part == "..") {
-      return std::nullopt;
-    }
-    if (!Part.empty() && Part != ".") {
+      if (!Absolute) return std::nullopt;
+      if (Resolved.size() > Mount.size()) Resolved.resize(std::max(Mount.size(), Resolved.rfind('/')));
+    } else if (!Part.empty() && Part != ".") {
       if (!Resolved.ends_with('/')) {
         Resolved += '/';
       }

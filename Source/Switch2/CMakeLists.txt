@@ -66,7 +66,7 @@ target_link_libraries(fex_switch2_host PRIVATE FEXCore_Base)
 # Use the devkit driver for its startup objects, newlib, libstdc++ and Switch specs.
 set(CMAKE_CXX_LINK_EXECUTABLE
   "${CMAKE_COMMAND} -E env DEVKITPRO=${DKP} ${DKP_CXX} ${DKP_CPU} -mtp=soft -fPIE -specs=${DKP}/libounce/switch.specs <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
-add_executable(fex-switch2-guest GuestProbe.cpp GuestElf.cpp JitProbe.cpp)
+add_executable(fex-switch2-guest GuestProbe.cpp GuestRuntime.cpp GuestElf.cpp JitProbe.cpp)
 target_compile_definitions(fex-switch2-guest PRIVATE FEX_SWITCH2_LAUNCHER=1)
 target_include_directories(fex-switch2-guest PRIVATE "${CMAKE_BINARY_DIR}/include")
 target_link_directories(fex-switch2-guest PRIVATE "${DKP}/portlibs/switch2/lib" "${DKP}/libounce/lib")
@@ -77,7 +77,7 @@ set(GUEST_NACP "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nacp")
 set(GUEST_NRO "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nro")
 set(GUEST_ICON "${DKP}/libounce/default_icon.jpg")
 add_custom_command(OUTPUT "${GUEST_NACP}"
-  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Switch 2 fork" "0.8.4" "${GUEST_NACP}"
+  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Switch 2 fork" "0.9.17" "${GUEST_NACP}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   VERBATIM)
 add_custom_command(OUTPUT "${GUEST_NRO}"

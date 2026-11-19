@@ -1113,6 +1113,9 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
   // Can't use Align16B here as vl64pair can cause non-4byte alignment.
   Align(16);
 
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("ARM64 emission complete", Entry, GetCursorOffset());
+#endif
   // Beginning of emission is guaranteed to be offset zero. So the code data size is just the current cursor offset.
   CodeData.Size = GetCursorOffset();
 

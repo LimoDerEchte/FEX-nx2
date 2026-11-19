@@ -779,6 +779,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     Thread->OpDispatcher->Finalize();
   }
 
+#ifdef __SWITCH2__
+  FEXCore::Switch2::TraceGuest("IR lowering complete", GuestRIP, TotalInstructions);
+#endif
   Thread->FrontendDecoder->DelayedDisownBuffer();
 
   IR::IREmitter* IREmitter = Thread->OpDispatcher.get();

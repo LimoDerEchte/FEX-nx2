@@ -30,7 +30,7 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
   uint64_t ImageEnd {};
   bool EntryIsExecutable {};
   std::optional<uint64_t> ProgramHeaders;
-  bool HasDynamicSegment {};
+  std::optional<Elf64_Phdr> DynamicSegment;
   for (size_t Index = 0; Index < Header.e_phnum; ++Index) {
     Elf64_Phdr SegmentHeader {};
     std::memcpy(&SegmentHeader, File.data() + Header.e_phoff + Index * sizeof(SegmentHeader), sizeof(SegmentHeader));
@@ -45,7 +45,7 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
       }
       Loaded.Interpreter.assign(Path, SegmentHeader.p_filesz - 1);
     }
-    HasDynamicSegment |= SegmentHeader.p_type == PT_DYNAMIC;
+    if (SegmentHeader.p_type == PT_DYNAMIC) DynamicSegment = SegmentHeader;
     if (SegmentHeader.p_type != PT_LOAD || (SegmentHeader.p_filesz == 0 && SegmentHeader.p_memsz == 0)) {
       continue;
     }
@@ -81,7 +81,7 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
     return "ELF entry point is outside executable file data.";
   }
 
-  if (!Loaded.Interpreter.empty() && (!ProgramHeaders || !HasDynamicSegment)) {
+  if (!Loaded.Interpreter.empty() && (!ProgramHeaders || !DynamicSegment)) {
     return "Dynamic ELF must map its program headers and dynamic table.";
   }
 
@@ -97,6 +97,32 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
     const auto& Load = Loads[Index];
     std::memcpy(Loaded.Storage.get() + Load.p_vaddr, File.data() + Load.p_offset, Load.p_filesz);
     Loaded.Segments[Index] = {Base + Load.p_vaddr, Load.p_memsz, Load.p_flags};
+  }
+  if (DynamicSegment) {
+    const auto& Dynamic = *DynamicSegment;
+    const auto ContainsDynamic = [&](const Elf64_Phdr& Load) {
+      return Dynamic.p_vaddr >= Load.p_vaddr && Dynamic.p_vaddr - Load.p_vaddr <= Load.p_filesz &&
+             Dynamic.p_filesz <= Load.p_filesz - (Dynamic.p_vaddr - Load.p_vaddr);
+    };
+    if (Dynamic.p_filesz < sizeof(Elf64_Dyn) || Dynamic.p_filesz % sizeof(Elf64_Dyn) ||
+        std::none_of(Loads.begin(), Loads.begin() + Loaded.SegmentCount, ContainsDynamic)) {
+      return "ELF dynamic table is outside the file-backed image.";
+    }
+    const auto* Table = Loaded.Storage.get() + Dynamic.p_vaddr;
+    bool HasStringTable = false;
+    bool Terminated = false;
+    for (size_t Offset = 0; Offset < Dynamic.p_filesz; Offset += sizeof(Elf64_Dyn)) {
+      Elf64_Dyn Entry {};
+      std::memcpy(&Entry, Table + Offset, sizeof(Entry));
+      if (Entry.d_tag == DT_NULL) {
+        Terminated = true;
+        break;
+      }
+      HasStringTable |= Entry.d_tag == DT_STRTAB;
+    }
+    if (!Terminated || (!Loaded.Interpreter.empty() && !HasStringTable)) {
+      return "Invalid ELF dynamic table. Recopy the binary from the original archive.";
+    }
   }
   Loaded.Entry = Base + Header.e_entry;
   Loaded.Base = Base;

@@ -44,7 +44,16 @@ DEF_OP(CallbackReturn) {
 }
 
 DEF_OP(ExitFunction) {
+#ifdef __SWITCH2__
+  // Horizon has no guest fault handler to recover from unbalanced shadow
+  // stack operations, including returns after a cooperative dispatch restart.
+  constexpr bool UseCallRetStack = false;
+#else
+  constexpr bool UseCallRetStack = true;
+#endif
   auto Op = IROp->C<IR::IROp_ExitFunction>();
+  const bool CacheCall = UseCallRetStack && Op->Hint == IR::BranchHint::Call;
+  const bool CacheReturn = UseCallRetStack && Op->Hint == IR::BranchHint::Return;
 
   ResetStack();
 
@@ -165,7 +174,7 @@ DEF_OP(ExitFunction) {
 
       ARMEmitter::ForwardLabel l_BranchHost;
       ARMEmitter::ForwardLabel l_CallReturn;
-      if (Op->Hint == IR::BranchHint::Call) {
+      if (CacheCall) {
         if (!Op->CallReturnBlock.IsInvalid()) {
           auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
           PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
@@ -186,7 +195,7 @@ DEF_OP(ExitFunction) {
         (void)Bind(&TFUnset);
       }
 
-      EmitLinkedBranch(NewRIP, Op->Hint == IR::BranchHint::Call, Op->PatchSiteAddress, Op->PatchSiteSize);
+      EmitLinkedBranch(NewRIP, CacheCall, Op->PatchSiteAddress, Op->PatchSiteSize);
       (void)Bind(&l_CallReturn);
 #ifdef ARCHITECTURE_arm64ec
     }
@@ -195,7 +204,7 @@ DEF_OP(ExitFunction) {
     ARMEmitter::ForwardLabel SkipFullLookup;
     auto RipReg = GetReg(Op->NewRIP);
 
-    if (Op->Hint == IR::BranchHint::Return) {
+    if (CacheReturn) {
       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
       ldp<ARMEmitter::IndexType::POST>(TMP1, TMP2, REG_CALLRET_SP, 0x10);
       sub(TMP1, TMP1, RipReg.X());
@@ -219,7 +228,7 @@ DEF_OP(ExitFunction) {
     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
 
     (void)Bind(&SkipFullLookup);
-    if (Op->Hint == IR::BranchHint::Call) {
+    if (CacheCall) {
       ARMEmitter::ForwardLabel l_CallReturn;
       if (!Op->CallReturnBlock.IsInvalid()) {
         auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
@@ -231,7 +240,7 @@ DEF_OP(ExitFunction) {
       }
       blr(TMP2);
       (void)Bind(&l_CallReturn);
-    } else if (Op->Hint == IR::BranchHint::Return) {
+    } else if (CacheReturn) {
       ret(TMP2);
     } else {
       br(TMP2);
