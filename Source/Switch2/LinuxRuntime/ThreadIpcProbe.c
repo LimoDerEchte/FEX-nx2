@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -38,6 +39,22 @@ static void *worker(void *argument) {
 }
 
 int main(void) {
+  int channel[2];
+  char pipe_byte;
+  check(pipe2(channel, O_NONBLOCK | O_CLOEXEC) == 0, "pipe2");
+  check((fcntl(channel[0], F_GETFD) & FD_CLOEXEC) != 0, "pipe close-on-exec");
+  check(read(channel[0], &pipe_byte, 1) == -1 && errno == EAGAIN, "empty nonblocking pipe");
+  check(write(channel[0], "p", 1) == -1 && errno == EBADF, "read-only pipe end");
+  check(read(channel[1], &pipe_byte, 1) == -1 && errno == EBADF, "write-only pipe end");
+  const int writer = dup(channel[1]);
+  check(writer >= 0 && close(channel[1]) == 0, "duplicate pipe writer");
+  check(write(writer, "p", 1) == 1 && close(writer) == 0, "write and close pipe");
+  struct pollfd pipe_event = {channel[0], POLLIN, 0};
+  check(poll(&pipe_event, 1, 0) == 1 && (pipe_event.revents & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP),
+        "pipe pending data and hangup");
+  check(read(channel[0], &pipe_byte, 1) == 1 && pipe_byte == 'p', "pipe data");
+  check(read(channel[0], &pipe_byte, 1) == 0 && close(channel[0]) == 0, "pipe EOF");
+
   int pair[2];
   check(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair) == 0, "socketpair");
   char reply[2];

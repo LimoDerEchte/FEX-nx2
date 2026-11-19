@@ -1,4 +1,180 @@
-# Active milestone — Debian tools and guest IPC
+# Switch 2 milestone handoff
+
+Interactive Bash 0.11.5 passed on Switch 2. The user confirmed the
+result screen, repeat launches in the same NRO, and consecutive external
+commands in one shell. The next milestone is pending selection.
+
+The shortest path to Wayland is guest Unix descriptor passing and
+file-backed shared mappings, followed by a native software compositor
+and a Debian x86-64 client. A desktop session and Steam remain later
+targets. The runtime and terminal limitations below still apply.
+
+## Completed milestone — interactive Bash terminal
+
+The 0.9.17 Bash smoke test passed on Switch 2 in Trace mode. The Debian
+runtime and IPC baseline is committed on `nx2` as `bc32e7ccc`. The
+current milestone is an interactive terminal. Guest subprocess launch
+and cross-process IPC follow it.
+
+## Interactive subprocess build 0.11.0
+
+The earlier tty build returned exit successfully but left the app's
+screen black. The launcher now tears down the terminal renderer and
+reinitializes the native console on the launcher thread before drawing
+the result.
+
+The 0.11.0 process path implements Bash's observed `clone` fork variant,
+separate process IDs and groups, inherited descriptor references,
+private versus shared memory views, `execve` with the guest argument and
+environment vectors, close-on-exec, and `wait4` reaping. A child runs its
+real fork continuation before loading a new ELF. Only one guest process
+runs at a time. Switches restore private bytes to the original addresses;
+shared mappings retain their bytes. Horizon does not enforce guest memory
+isolation. Process and pthread waits use the same cooperative scheduler.
+Terminal input also gives that scheduler a chance to run other guests.
+
+Build and host verification passed. The host address-space test checked
+that fork clones restore private bytes, preserve shared bytes, and can
+unmap pages independently. The new Debian-linked process probe passed
+on native Linux. Hardware verification remains required:
+
+1. Launch **Bash shell**. Run `ls -la /bin`, then `echo returned:$?`.
+   Verify the stock Debian listing, the prompt returning, and status 0.
+2. Enter `exit 42`. Verify the launcher result screen stays visible
+   and B returns to the home menu.
+3. Run `process-probe.elf` from the updated SD bundle and expect
+   `fork + pipe + execve + waitpid passed` and exit 42. Run it twice.
+4. Rerun the pthread/IPC and noninteractive Bash probes with Trace.
+
+The first hardware run of 0.11.0 closed the application on `ls`.
+Horizon did not deliver the native exception record, so the only
+persisted record ended before the trace buffer began. Version 0.11.1
+moves fork snapshot and child context setup to the scheduler, after
+the JIT dispatch has unwound. It validates native permissions before
+copying private regions and persists sparse lifecycle checkpoints at
+scheduler boundaries. Compiler and syscall trace lines remain buffered.
+Use **Trace** and run a single `ls`; the last `Process checkpoint`
+should distinguish snapshot creation, child restoration/dispatch,
+exec replacement, and child retirement. Use `process-probe.elf` to
+verify the same path without Bash.
+
+The 0.11.1 hardware checkpoints reached child dispatch and successful
+exec image preparation for `ls`; no child exit was recorded. The
+0.11.2 scheduler now separates fork-shared native addresses from
+independent exec address spaces. Only views that can overwrite one
+another are snapshotted on a process switch; an inactive parent
+still restores its saved bytes after its child execs. The diagnostic
+logs first dispatch of the replacement and the first 12 completed
+child syscalls. Rerun `ls` with Trace. Also compare
+`exec /bin/ls` from a fresh shell, which replaces Bash directly and
+isolates the exec path from fork.
+
+Both 0.11.2 hardware runs reached the first replacement-image dispatch
+and closed the application before the first syscall completion. Direct
+`exec /bin/ls` reproduced the failure independently of fork. Version
+0.11.3 retains the process's native FEX dispatcher across exec, clears
+old translations, and initializes the new thread's CPU and segment descriptor
+table with the same defaults as a fresh launch. Trace saves up to six
+compiler checkpoints on the first replacement dispatch. The NRO build
+and host terminal, log-buffer, and address-space checks passed. On
+hardware, retest direct exec in Trace first, then test plain `ls` in a
+fresh Bash session if direct exec succeeds.
+
+On 0.11.3 hardware, direct `exec /bin/ls` printed the listing and
+returned status 0. The launcher logged the result but the display went
+black. Plain `ls` completed in a separate shell. The same shell then
+crashed on `ls -la /bin`. Its log ends at PID 102's first fork
+continuation dispatch, before an exec request for that command.
+
+Version 0.11.4 keeps the initialized console renderer when the shell
+returns, resets its text attributes, and submits the result screen.
+Trace records the guest entry and stack ranges, native dispatcher
+permissions, and up to six compiler and six syscall checkpoints for
+each fork continuation. The process probe now exercises two sequential
+children in one guest run. The native Debian probe ended with status 42
+and the host terminal, log-buffer, and address-space checks passed.
+On Switch 2, compare `ls -la /bin` as the first command with
+`ls` followed by `ls -la /bin` in a fresh shell. Retest both
+`exec /bin/ls` and `exit 42` for a visible result screen.
+
+On 0.11.4 hardware, `ls -la /bin` reached child exit when it was
+the first command. After a prior `ls`, PID 102 reached successful
+x86 decode and IR generation with an executable native dispatcher,
+then stopped before the dispatch of its first compiled block.
+Direct `exec /bin/ls` returned status 0 and B worked from the blank
+result screen. A subsequent guest launch in the same NRO closed the
+application before a new buffered trace was saved.
+
+Version 0.11.5 restores non-writable heap runs to read/write before
+returning virtual allocations to the host allocator. The old free
+path ignored permission failures across mixed-permission ranges.
+This corrects a cleanup hazard that could affect later use of a
+compiler guard page's backing; its connection to the hardware crash
+remains to be verified. Native JIT close failures and FEX errors now
+persist in the log. The startup trace covers worker and context
+lifetime and the initial block through ARM64 emission and publication.
+The launcher draws the result as a regular page after the worker
+returns. The ARM64 diagnostic now creates, publishes, executes, and
+closes JIT memory twice to exercise mapping reuse directly.
+
+General asynchronous guest signals, stop/continue notifications,
+background job control, scripts selected through shebang, and writable
+file redirection are still pending. The 0.11.0 implementation targets
+the real foreground fork/exec/wait path used by Bash. Do not treat the
+remaining Bash/Linux compatibility work as verified.
+
+## Terminal build 0.10.1
+
+- **Bash shell** is the third home-menu item. It starts the stock
+  Debian `/bin/bash --noprofile --norc -i`. The rootfs browser keeps
+  using the existing `bash.args` smoke test.
+- The guest terminal uses libounce USB HID keyboard input with a US
+  layout and key repeat. It provides the terminal ioctls, descriptor
+  duplication, and input readiness calls used by Bash/readline.
+  ANSI foreground and background colors use the native console.
+- Press both sticks together for a one-line Horizon keyboard. Confirming
+  enters the line and submits Enter. Canceling leaves the shell input
+  alone. Plus closes terminal input.
+- The updated `build/debian-runtime.zip` includes Debian's ANSI terminfo
+  at `/fex/rootfs/lib/terminfo/a/ansi`. Copy that file alone if the
+  existing rootfs has the verified Debian files.
+
+Hardware on 0.10.0 showed that Bash accepted the `ls` command and
+rendered the cyan prompt. The preceding `2004h` was readline's DEC
+private bracketed-paste control leaking through the console parser.
+0.10.1 consumes private mode controls across split writes while
+retaining ANSI color and cursor sequences. It also implements
+`pipe`/`pipe2` for Bash's process-group channel.
+
+A native trace of the same Debian Bash running `ls` then showed
+`clone(CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | SIGCHLD)` with no
+child stack, process-group setup in parent and child, child
+`execve("/bin/ls", ...)`, and parent `wait4`. This clone requests
+an independent process with a private address-space view. The
+existing pthread clone shares the address space and descriptor table,
+so it cannot implement this call. Implement process isolation and
+descriptor inheritance before enabling that clone variant; then add
+exec and reaping and verify that `ls` returns to the same Bash prompt.
+
+Host terminal, log ring, and VMA tests passed. The stock Bash PTY
+reference passed color, arrow-key history, and exit 42 with the staged
+ANSI terminfo. The NRO is built. Switch 2 hardware checks for 0.10.1 are pending:
+
+1. Start **Bash shell** from the third home-menu item. Type `pwd` and
+   `echo hello` on a physical USB keyboard. Test Backspace and Up.
+2. Run `printf '\033[31mred\033[0m\n'` and verify red output and
+   normal color afterward.
+3. Open the Horizon keyboard with both stick clicks, enter
+   `echo controller`, and confirm. Test cancellation separately.
+4. Type `exit 42` and verify the launcher displays 42. Repeat the
+   noninteractive Bash and thread/IPC probes with Trace.
+
+The terminal launches a real interactive Bash. This phase covers
+builtins and line editing. Running external programs, general
+job control, and asynchronous terminal signal delivery need the
+guest process and signal work listed below.
+
+## Previous milestone — Debian tools and guest IPC
 
 Branch `nx2`. Version 0.8.4 passed on Switch 2 with Debian 12 amd64 glibc
 2.36. Debian `true` exited with status 0 and the glibc TLS and `dlopen`

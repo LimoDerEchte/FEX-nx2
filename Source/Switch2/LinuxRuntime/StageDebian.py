@@ -13,7 +13,7 @@ def elf_info(path, *options):
     return subprocess.check_output(["readelf", *options, path], text=True)
 
 
-def stage(source, output, probe, glibc_probe):
+def stage(source, output, probe, glibc_probe, process_probe):
     root = output / "fex/rootfs"
     library_dirs = ["lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu"]
     installed = set()
@@ -48,7 +48,14 @@ def stage(source, output, probe, glibc_probe):
     install(source / "bin/true", root / "bin/true")
     install(probe, output / "fex/games/thread-ipc.elf")
     install(glibc_probe, output / "fex/games/glibc-probe.elf")
+    install(process_probe, output / "fex/games/process-probe.elf")
     install(source / library_dirs[0] / "libm.so.6", root / library_dirs[0] / "libm.so.6")
+
+    ansi = Path("lib/terminfo/a/ansi")
+    if not (source / ansi).is_file():
+        raise SystemExit("Missing Debian ANSI terminfo. Extract the ncurses-base package.")
+    (root / ansi).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source / ansi, root / ansi)
 
     (root / "bin/ls.args").write_text("-lna\n/bin\n", encoding="utf-8")
     (root / "bin/bash.args").write_text(
@@ -64,5 +71,6 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path, help="Directory in which to create fex/")
     parser.add_argument("probe", type=Path)
     parser.add_argument("glibc_probe", type=Path)
+    parser.add_argument("process_probe", type=Path)
     args = parser.parse_args()
-    stage(args.source.resolve(), args.output.resolve(), args.probe.resolve(), args.glibc_probe.resolve())
+    stage(args.source.resolve(), args.output.resolve(), args.probe.resolve(), args.glibc_probe.resolve(), args.process_probe.resolve())

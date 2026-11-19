@@ -47,7 +47,7 @@ The launcher appends checkpoints and FEXCore messages to
 in memory and writes it in batches when the guest returns. The native
 exception handler also attempts to save this buffer if Horizon calls it.
 If the software closes, inspect the latest section beginning with
-`--- FEX Switch 2 launcher 0.9.17 started ---`. A crash before `main()` or
+`--- FEX Switch 2 launcher 0.11.5 started ---`. A crash before `main()` or
 failure to open the SD card can leave the file unchanged.
 
 ## SD Maze
@@ -124,7 +124,7 @@ TLS coverage, and other runtime work.
 ## Debian 12 runtime smoke tests
 
 Stage the official Debian 12 amd64 `bash`, `coreutils`, `libc6`,
-`libc6-dev`, `libtinfo6`, `libselinux1`, and `libpcre2-8-0` packages by
+`libc6-dev`, `libtinfo6`, `libselinux1`, `libpcre2-8-0`, and `ncurses-base` packages by
 extracting their data into a common development directory. From the
 repository root, run:
 
@@ -144,6 +144,23 @@ package symlinks when copying libraries to the SD card.
 See [the active milestone](NextMilestone.md) for hardware results and the
 next runtime work. [The glibc bring-up notes](LinuxRuntimePlan.md) record
 the prior 0.8.4 tests.
+
+## Interactive Bash terminal
+
+Choose **Bash shell**, the third item on the home menu, to open the
+stock Debian Bash in interactive mode. Connect a physical USB keyboard
+and use the US layout. Arrow keys, Backspace, Enter, and common control
+keys are translated for readline. Press both stick buttons together to
+open Horizon's keyboard. **Send** submits one line. **Plus** closes
+terminal input, and `exit` returns to the launcher with a guest exit status.
+
+The shell uses the rootfs's `/lib/terminfo/a/ansi` entry and libounce's
+ANSI console colors. Try `printf '\033[31mred\033[0m\n'`. Session
+history lives in memory. The 0.11.5 build adds the foreground fork, exec, and wait path used by
+Bash for external commands. Test with `ls -la /bin` and `exit 42`. The
+new `process-probe.elf` checks private/shared fork mappings, inherited
+pipes, close-on-exec, and exit status. General signal delivery and job
+control remain open.
 
 ## JIT diagnostics
 

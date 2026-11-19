@@ -123,6 +123,12 @@ void WriteLog(const char* Text) {
   if (WriteLogBytes({Line, Length + 1})) FlushLogFile();
 }
 
+void WriteRunCheckpoint(const char* Text) {
+  char Line[256];
+  const auto Length = std::snprintf(Line, sizeof(Line), "%s\n", Text);
+  if (Length > 0 && WriteLogBytes({Line, std::min<size_t>(Length, sizeof(Line) - 1)})) FlushLogFile();
+}
+
 void BeginGuestLog() {
   WriteLog("Guest run started. Runtime trace is buffered.");
   GuestLog.Clear();
@@ -276,7 +282,8 @@ public:
       }
       DrawItem(0, "Browse ELF files");
       DrawItem(1, "Browse Linux rootfs");
-      DrawItem(2, "Settings");
+      DrawItem(2, "Bash shell");
+      DrawItem(3, "Settings");
       if (!LastResult.empty()) {
         std::printf("\nLast run  %s\n", LastResult.c_str());
       }
@@ -300,8 +307,9 @@ public:
       break;
     }
     case Screen::Details:
-      std::printf("Launch ELF\n\n%s\n\n", DisplayName(SelectedFile).c_str());
+      std::printf("%s\n\n%s\n\n", ShellLaunch ? "Bash shell" : "Launch ELF", DisplayName(SelectedFile).c_str());
       std::puts(LoadError ? LoadError : Image.Interpreter.empty() ? "x86-64 Linux static PIE" : "x86-64 Linux PIE with an ELF interpreter");
+      if (ShellLaunch && !LoadError) std::puts("USB keyboard   L Stick + R Stick  On-screen input");
       std::puts(LoadError ? "\nB Back" : "\nA Run    X Run single-block    B Back");
       break;
     case Screen::Settings:
@@ -321,6 +329,9 @@ public:
       std::puts("\nA Run    B Back");
       break;
     case Screen::Result:
+      std::puts(LastResult.c_str());
+      std::puts(ResultFromElf ? (ShellLaunch ? "\nA Retry    B Home" : "\nA Retry    B Browser    Y Home")
+                              : "\nB Diagnostics    Y Home");
       break;
     }
   }
@@ -333,19 +344,25 @@ public:
           OpenFolder(LastFolder.empty() ? StartFolder : LastFolder);
         } else if (Selected == 1) {
           OpenFolder(Switch2Guest::Root);
+        } else if (Selected == 2) {
+          ShellLaunch = true;
+          SelectedFile = std::string {Switch2Guest::Root} + "/bin/bash";
+          InspectSelectedElf();
+          if (!LoadError) RunSelectedElf();
         } else {
           Open(Screen::Settings);
         }
         return true;
       }
-      return Move(Buttons, 3);
+      return Move(Buttons, 4);
     case Screen::Browse:
       return UpdateBrowser(Buttons);
     case Screen::Details:
       if (Buttons & HidNpadButton_B) {
         Image = {};
         Interpreter = {};
-        BackToBrowser();
+        if (ShellLaunch) Open(Screen::Home);
+        else BackToBrowser();
         return true;
       }
       if ((Buttons & (HidNpadButton_A | HidNpadButton_X)) && !LoadError) {
@@ -372,7 +389,8 @@ public:
       }
       if (Buttons & HidNpadButton_B) {
         if (ResultFromElf) {
-          BackToBrowser();
+          if (ShellLaunch) Open(Screen::Home);
+          else BackToBrowser();
         } else {
           Open(Screen::Diagnostics);
         }
@@ -488,6 +506,7 @@ private:
       } else if (Entry.IsDirectory) {
         OpenFolder(std::move(Path));
       } else {
+        ShellLaunch = false;
         SelectedFile = std::move(Path);
         BrowserSelection = Selected;
         InspectSelectedElf();
@@ -541,9 +560,11 @@ private:
   void RunSelectedElf(bool SingleBlock = false) {
     consoleClear();
     PrintStage(DisplayName(SelectedFile).c_str());
+    if (ShellLaunch) PrintStage("USB keyboard    L Stick + R Stick  On-screen input    + Close input");
     std::vector<std::string> Arguments;
+    if (ShellLaunch) Arguments = {"--noprofile", "--norc", "-i"};
     const auto ArgumentsPath = "sdmc:" + SelectedFile + ".args";
-    if (auto* File = std::fopen(ArgumentsPath.c_str(), "r")) {
+    if (auto* File = ShellLaunch ? nullptr : std::fopen(ArgumentsPath.c_str(), "r")) {
       char Line[FS_MAX_PATH + 2];
       bool Valid = true;
       while (std::fgets(Line, sizeof(Line), File)) {
@@ -574,7 +595,7 @@ private:
     const auto Program = InsideRoot ? Path.substr(sizeof(Switch2Guest::Root) - 1) : Path;
     const auto Exit = RunGuest(Interpreter.Entry ? Interpreter.Entry : Image.Entry, Segments,
                                InsideRoot ? Switch2Guest::Root : Folder, Program, Arguments,
-                               &Image, Interpreter.Base, InsideRoot ? "/" : Folder, SingleBlock);
+                               &Image, Interpreter.Base, InsideRoot ? "/" : Folder, SingleBlock, ShellLaunch);
     ShowElfResult(Exit ? "Exited with status " + std::to_string(*Exit) : "Guest did not reach exit.");
   }
 
@@ -582,10 +603,13 @@ private:
     Image = {};
     Interpreter = {};
     LastResult = std::move(Result);
-    PrintStage(LastResult.c_str());
-    std::puts("\nA Retry    B Browser    Y Home");
+    WriteLog(LastResult.c_str());
     ResultFromElf = true;
     Page = Screen::Result;
+    std::fputs("\x1b[0m", stdout);
+    Draw();
+    std::fflush(stdout);
+    consoleUpdate(nullptr);
   }
 
   void RunDiagnostic() {
@@ -600,10 +624,10 @@ private:
       Passed = RunSwitch2JitProbe();
       LastResult = Passed ? "ARM64 JIT probe passed." : "ARM64 JIT probe failed.";
     }
-    PrintStage(LastResult.c_str());
-    std::puts("\nB Diagnostics    Y Home");
+    WriteLog(LastResult.c_str());
     ResultFromElf = false;
     Page = Screen::Result;
+    Draw();
   }
 
   Screen Page {Screen::Home};
@@ -620,6 +644,7 @@ private:
   Switch2Guest::ElfImage Interpreter;
   const char* LoadError {};
   bool ResultFromElf {};
+  bool ShellLaunch {};
 };
 } // namespace Switch2Guest
 
@@ -656,7 +681,7 @@ void __libnx_exception_handler(ThreadExceptionDump* Dump) {
 int main() {
   using namespace Switch2Guest;
   const Result LogStatus = OpenLog();
-  WriteLog("--- FEX Switch 2 launcher 0.9.17 started ---");
+  WriteLog("--- FEX Switch 2 launcher 0.11.5 started ---");
   WriteLog("Initializing console...");
   consoleInit(nullptr);
   if (R_FAILED(LogStatus)) {
@@ -664,7 +689,12 @@ int main() {
   }
   WriteLog("Initializing FEXCore configuration...");
   FEXCore::Config::Initialize();
-  LogMan::Msg::InstallHandler([](LogMan::DebugLevels, const char* Message) { PrintStage(Message); });
+  LogMan::Msg::InstallHandler([](LogMan::DebugLevels Level, const char* Message) {
+    if (BufferingGuestLog && (Level == LogMan::ERROR || Level == LogMan::ASSERT)) {
+      WriteRunCheckpoint(Message);
+    }
+    PrintStage(Message);
+  });
   LogMan::Throw::InstallHandler(PrintStage);
 
   WriteLog("Initializing controller input...");

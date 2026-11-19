@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/fextl/memory_resource.h>
 
@@ -8,6 +9,7 @@ extern "C" {
 #include <switch/result.h>
 }
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -50,11 +52,31 @@ bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions Options) {
 }
 
 void VirtualFree(void* Ptr, size_t Size) {
-  if (Ptr) {
-    // Restore any guard pages before returning the region to the heap.
-    VirtualProtect(Ptr, AlignUp(Size, FEXCore::Utils::FEX_PAGE_SIZE), ProtectOptions::Read | ProtectOptions::Write);
-    std::free(Ptr);
+  if (!Ptr) return;
+
+  // Heap allocations can contain guard pages with different permissions.
+  // Restore those runs individually before handing the pages back to malloc.
+  const auto Start = reinterpret_cast<uintptr_t>(Ptr);
+  const auto End = Start + AlignUp(Size, FEXCore::Utils::FEX_PAGE_SIZE);
+  for (auto Address = Start; Address < End;) {
+    MemoryInfo Info {};
+    u32 Page {};
+    const auto Query = svcQueryMemory(&Info, &Page, Address);
+    if (R_FAILED(Query) || Address < Info.addr || Address - Info.addr >= Info.size) {
+      LogMan::Msg::EFmt("Could not query FEX heap permissions at {:#x}: {:#x}", Address, Query);
+      std::abort();
+    }
+    const auto RunEnd = std::min(End, Info.addr + Info.size);
+    if (Info.perm != Perm_Rw) {
+      const auto Restore = svcSetMemoryPermission(reinterpret_cast<void*>(Address), RunEnd - Address, Perm_Rw);
+      if (R_FAILED(Restore)) {
+        LogMan::Msg::EFmt("Could not restore FEX heap permissions at {:#x}: {:#x}", Address, Restore);
+        std::abort();
+      }
+    }
+    Address = RunEnd;
   }
+  std::free(Ptr);
 }
 
 void VirtualDontNeed(void* Ptr, size_t Size, bool) {

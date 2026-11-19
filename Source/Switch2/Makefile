@@ -205,10 +205,10 @@ DEBIAN_LIBS = $(DEBIAN_ROOT)/lib/x86_64-linux-gnu
 DEBIAN_CRT = $(DEBIAN_ROOT)/usr/lib/x86_64-linux-gnu
 
 .PHONY: debian-runtime
-debian-runtime: $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf
+debian-runtime: $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf
 	python3 LinuxRuntime/StageDebian.py "$(DEBIAN_ROOT)" "$(DEBIAN_TEST_DIR)" $^
 
-$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
+$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
 	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(DEBIAN_LIBS)" \
 		"$(DEBIAN_CRT)/Scrt1.o" "$(DEBIAN_CRT)/crti.o" $< "$(DEBIAN_LIBS)/libc.so.6" "$(DEBIAN_CRT)/crtn.o" -o $@
 
@@ -218,9 +218,19 @@ $(BUILD)/thread-ipc.o: LinuxRuntime/ThreadIpcProbe.c | $(BUILD)
 $(BUILD)/glibc-probe.o: LinuxRuntime/GlibcProbe.c | $(BUILD)
 	$(HOST_X86_CC) -m64 -march=x86-64 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
 
+$(BUILD)/process-probe.o: LinuxRuntime/ProcessProbe.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
 .PHONY: check-guest-log
 check-guest-log: $(BUILD)/guest-log-buffer-test
 	$<
 
 $(BUILD)/guest-log-buffer-test: LinuxRuntime/GuestLogBufferTest.cpp GuestLogBuffer.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-terminal
+check-guest-terminal: $(BUILD)/guest-terminal-test
+	$<
+
+$(BUILD)/guest-terminal-test: LinuxRuntime/GuestTerminalTest.cpp GuestTerminal.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@

@@ -16,6 +16,9 @@ Investigate and fix the root cause of a failure. Use diagnostic builds to
 distinguish plausible causes, and label temporary experiments clearly.
 Verify the fix against the original failure and revert experiments that
 regress behavior or lack supporting evidence.
+Do not take shortcuts that fake Linux behavior or bypass the requested path.
+Implement the required semantics, verify them through the normal entry point,
+and explicitly track any incomplete compatibility work.
 
 Use `Source/Switch2/NextMilestone.md` as the durable handoff for the active
 Switch 2 milestone. Read it after compaction or resuming the project. Update it

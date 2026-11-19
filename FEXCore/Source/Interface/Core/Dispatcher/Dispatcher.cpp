@@ -67,7 +67,12 @@ Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
 }
 
 Dispatcher::~Dispatcher() {
-#ifndef __SWITCH2__
+#ifdef __SWITCH2__
+  const auto Status = ExecutableMemory.Close();
+  if (R_FAILED(Status)) {
+    LogMan::Msg::EFmt("Failed to close Switch 2 dispatcher JIT memory: {:#x}", Status);
+  }
+#else
   auto BufferSize = GetBufferSize();
   if (BufferSize) {
     FEXCore::Allocator::VirtualFree(GetBufferBase(), BufferSize);

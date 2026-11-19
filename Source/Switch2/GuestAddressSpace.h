@@ -22,7 +22,7 @@ public:
     Regions.emplace_back(Base, RoundUp(Start - Base + Size), Flags);
   }
 
-  uint64_t Allocate(size_t Size, uint8_t Flags) {
+  uint64_t Allocate(size_t Size, uint8_t Flags, bool Shared = false) {
     if (!Size || Size > MaxMapping) {
       return 0;
     }
@@ -37,7 +37,8 @@ public:
     std::memset(Memory, 0, Rounded);
     const auto Address = reinterpret_cast<uint64_t>(Memory);
     Regions.emplace_back(Address, Rounded, Flags);
-    Regions.back().Storage.reset(Memory);
+    Regions.back().Storage = std::shared_ptr<void> {Memory, &std::free};
+    Regions.back().Shared = Shared;
     OwnedBytes += Rounded;
     return Address;
   }
@@ -109,6 +110,41 @@ public:
     return true;
   }
 
+  // Horizon guest pointers are direct host addresses. Save private bytes at
+  // process switches so fork retains virtual addresses and independent data.
+  bool SavePrivatePages(bool (*Validate)(uint64_t, size_t) = nullptr) {
+    std::vector<SavedRange> New;
+    for (const auto& Region : Regions) {
+      if (Region.Shared) continue;
+      const auto NeedsSave = [&](size_t Page) {
+        return Region.Pages[Page] != Unmapped;
+      };
+      for (size_t Page = 0; Page < Region.Pages.size();) {
+        if (!NeedsSave(Page)) {
+          ++Page;
+          continue;
+        }
+        const size_t First = Page++;
+        while (Page < Region.Pages.size() && NeedsSave(Page)) ++Page;
+        const auto Start = Region.Base + First * PageSize;
+        const size_t Size = (Page - First) * PageSize;
+        if (Validate && !Validate(Start, Size)) return false;
+        std::shared_ptr<void> Bytes {std::malloc(Size), &std::free};
+        if (!Bytes) return false;
+        std::memcpy(Bytes.get(), reinterpret_cast<const void*>(Start), Size);
+        New.push_back({Start, Size, std::move(Bytes)});
+      }
+    }
+    Saved = std::move(New);
+    return true;
+  }
+
+  void RestorePrivatePages() const {
+    for (const auto& Range : Saved) {
+      std::memcpy(reinterpret_cast<void*>(Range.Start), Range.Bytes.get(), Range.Size);
+    }
+  }
+
   static constexpr size_t RoundUp(size_t Size) { return (Size + PageSize - 1) & ~(PageSize - 1); }
 
 private:
@@ -126,9 +162,16 @@ private:
     uint64_t Base;
     size_t Size;
     std::vector<uint8_t> Pages;
-    std::unique_ptr<void, decltype(&std::free)> Storage {nullptr, &std::free};
+    std::shared_ptr<void> Storage;
+    bool Shared {};
+  };
+  struct SavedRange {
+    uint64_t Start;
+    size_t Size;
+    std::shared_ptr<void> Bytes;
   };
   std::vector<Region> Regions;
+  std::vector<SavedRange> Saved;
   size_t OwnedBytes {};
 };
 } // namespace Switch2Guest

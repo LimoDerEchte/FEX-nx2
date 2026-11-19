@@ -38,4 +38,25 @@ int main() {
   assert(Space.Query(Base + 2 * PageSize).Start == Base + 2 * PageSize);
   assert(Space.Set(Base + PageSize, PageSize, PF_R));
   assert(Space.Query(Base + PageSize).Flags == PF_R);
+
+  GuestAddressSpace Parent;
+  const auto PrivateVA = Parent.Allocate(PageSize, PF_R | PF_W);
+  const auto SharedVA = Parent.Allocate(PageSize, PF_R | PF_W, true);
+  assert(PrivateVA && SharedVA);
+  auto& PrivateByte = *reinterpret_cast<char*>(PrivateVA);
+  auto& SharedByte = *reinterpret_cast<char*>(SharedVA);
+  PrivateByte = 'p';
+  SharedByte = 's';
+  assert(Parent.SavePrivatePages());
+  auto Child = Parent;
+  PrivateByte = 'c';
+  SharedByte = 'X';
+  assert(Child.SavePrivatePages());
+  Parent.RestorePrivatePages();
+  assert(PrivateByte == 'p' && SharedByte == 'X');
+  Child.RestorePrivatePages();
+  assert(PrivateByte == 'c' && SharedByte == 'X');
+  assert(Child.Set(PrivateVA, PageSize, Child.Unmapped, true));
+  Parent.RestorePrivatePages();
+  assert(PrivateByte == 'p' && !Child.Owns(PrivateVA, PageSize));
 }

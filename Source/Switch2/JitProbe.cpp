@@ -43,13 +43,17 @@ bool EmitAndCheck(FEXCore::Switch2::JitMemory& Code, uint16_t Expected, bool Spa
 } // namespace
 
 bool RunSwitch2JitProbe() {
-  FEXCore::Switch2::JitMemory Code;
-  if (!CheckResult("jitCreate", Code.Create(0x1000))) {
-    return false;
+  for (const uint16_t Expected : {42, 43}) {
+    FEXCore::Switch2::JitMemory Code;
+    if (!CheckResult("jitCreate", Code.Create(0x1000))) {
+      return false;
+    }
+    const bool Passed = EmitAndCheck(Code, 7, false) && EmitAndCheck(Code, Expected, true);
+    if (!CheckResult("jitClose", Code.Close()) || !Passed) {
+      return false;
+    }
   }
-
-  const bool Passed = EmitAndCheck(Code, 7, false) && EmitAndCheck(Code, 42, true);
-  return CheckResult("jitClose", Code.Close()) && Passed;
+  return true;
 }
 
 #ifndef FEX_SWITCH2_LAUNCHER

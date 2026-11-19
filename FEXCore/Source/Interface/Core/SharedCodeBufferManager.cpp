@@ -61,7 +61,12 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
 }
 
 CodeBuffer::~CodeBuffer() {
-#ifndef __SWITCH2__
+#ifdef __SWITCH2__
+  const auto Status = ExecutableMemory.Close();
+  if (R_FAILED(Status)) {
+    LogMan::Msg::EFmt("Failed to close Switch 2 code cache: {:#x}", Status);
+  }
+#else
   FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
 #endif
 }
