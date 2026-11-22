@@ -1,37 +1,39 @@
 # FEX Switch 2 fork
 
-AI-assisted development is allowed in this fork. Keep Switch 2 host code under
-`Source/Switch2` where practical and preserve the existing Linux and Windows
-builds. Keep generated binaries out of commits.
+AI-assisted development is allowed. Goal: run unmodified x86-64 Linux
+software on Switch 2 through the normal launcher.
 
-Build the Switch 2 probe with `make -C Source/Switch2` using the installed
-ounce-devkit. Record build verification separately from console test results.
+## Rules
 
-Continue working through implementation, build, and verification until the
-requested outcome is delivered or concrete user action is required. Keep
-working through recoverable failures and take authorized next steps without
-waiting for another prompt.
+- **Scope.** Put Switch 2 code in `Source/Switch2`. Keep the Linux and
+  Windows builds working. Never commit generated binaries.
+- **Builds.** `make -C Source/Switch2` builds the JIT probe with the
+  installed ounce-devkit. Use one launcher tree, `Source/Switch2/build/guest`,
+  and stage the SD bundle into `build/guest/sd`. Ship one NRO per console
+  run; per-launch test behavior goes in sidecar files, not build options.
+- **Real semantics.** Implement Linux behavior properly, verified through
+  the normal entry point. No faked behavior or bypassed paths. Track any
+  incomplete compatibility explicitly.
+- **Root causes.** Fix the cause, not the symptom. Label diagnostic
+  builds as experiments and revert any that regress or lack evidence.
+- **Evidence.** Report host build, native Linux and Switch 2 console
+  results separately. Claim only what was observed.
+- **Finish the job.** Work through recoverable failures without waiting
+  for prompts. Stop only when the outcome is delivered or user action is
+  required (e.g. a console run). If work is paused, resume only when asked.
 
-Investigate and fix the root cause of a failure. Use diagnostic builds to
-distinguish plausible causes, and label temporary experiments clearly.
-Verify the fix against the original failure and revert experiments that
-regress behavior or lack supporting evidence.
-Do not take shortcuts that fake Linux behavior or bypass the requested path.
-Implement the required semantics, verify them through the normal entry point,
-and explicitly track any incomplete compatibility work.
+## Milestone workflow
 
-## Switch 2 milestone handoff
-
-Work on `nx2` and group commits at completed milestone boundaries. Start
-or resume milestone work from the [restart checkpoint](Source/Switch2/NextMilestone.md#restart-checkpoint)
-and check the branch and worktree with `git status --short --branch`.
-Inspect the relevant diffs and untracked source before editing. Preserve
-in-progress changes from the user and other milestones.
-
-For a new milestone, record the outcome and observable acceptance checks in
-`Source/Switch2/NextMilestone.md`. Refresh its restart checkpoint after each
-verified slice and whenever the next step, blocker, or hardware evidence
-changes. Include the remaining work, exact verification commands and observed
-results, and matching console artifact paths when relevant. Keep decisions
-that affect the next step in the handoff so a fresh session can resume from
-the checkout alone. Continue only when asked if work is paused.
+- Work on `nx2`; commit once per completed milestone after its console
+  acceptance passes.
+- Start from the [restart checkpoint](Source/Switch2/NextMilestone.md#restart-checkpoint):
+  run `git status --short --branch` and review diffs and untracked files
+  first. Preserve the user's in-progress changes.
+- Graphics is shelved on branch `shelf/graphics` until the kernel syscall
+  milestones are complete. Keep it out of `nx2`.
+- Keep the checkpoint current after each verified slice: status,
+  done-when checks, next step, blockers, exact verification commands
+  with results, and console artifact paths. A fresh session must be able
+  to resume from the checkout alone.
+- For a console run, hand off the artifact paths and a complete checklist
+  with expected results.

@@ -2,17 +2,1100 @@
 
 ## Restart checkpoint
 
-No next milestone is selected at this baseline. When starting one, record
-the outcome, acceptance checks, next step, and verification here.
+- **Status (2026-11-22).** Milestone 1 (filesystem) is **complete** and
+  committed on `nx2`. Console acceptance passed across 0.12.36–0.12.40:
+  combined acceptance `ABI 42, coreutils 0, suite 42` and the root suite
+  (0.12.37), the persistence and both recovery pairs (0.12.36), and the
+  FTP test, 0 failed (0.12.40). Builds 0.12.38–0.12.40 changed only the
+  FTP server. Graphics stays shelved on `shelf/graphics` (snapshot
+  `c54852c9b`) until milestones 2 and 3 are done.
+- **Next.** Milestone 2, processes and events (see
+  [Active milestone sequence](#active-milestone-sequence--linux-guest-kernel-compatibility)):
+  process and session lifecycle, signals, credentials, clocks and timers,
+  polling and watches. Start by auditing the routed handlers for those
+  groups and writing a suite like `FsSuite.c` that passes natively.
+  Known carry-overs: `clock_nanosleep` on the process CPU clock and root
+  alarm sleeps return EOPNOTSUPP, and realtime has one-second resolution
+  (see `FilesystemInventory.md`).
+- **Console 0.12.40 (2026-11-22).** The user reported that all FTP tests
+  pass on the console.
+- **Console 0.12.36 (log of 2026-11-22).** Acceptance printed `ABI 42,
+  coreutils 0, suite 1`; the root suite had 80 passed, 1 failed. The only
+  failure in both: `path/long_paths` line 1927, a 4096-byte path returned
+  EFAULT instead of ENAMETOOLONG. `path/name_too_long`,
+  `path/long_path_renames`, and the persistence and both recovery pairs
+  (42 each) passed, so the overflow store works on the SD card. The FTP
+  server failed twice with `Could not listen on port 5000: Address
+  already in use`: an always-on FTP sysmodule holds 5000. The user also
+  pointed out that the rootfs has no accounts, so `root` logins made no
+  sense. `SD result 2002-3005` in `io/positional_io_keeps_offset` is a
+  pread past EOF that the runtime turns into a 0-byte read; the test
+  passes.
+- **Fixed for 0.12.37.**
+  - `GuestString` follows `getname`/`strncpy_from_user`: EFAULT only when
+    the bytes are unreadable, otherwise the caller's error when no NUL
+    appears within the limit: ENAMETOOLONG within PATH_MAX for paths,
+    E2BIG within MAX_ARG_STRLEN (128 KiB) for exec arguments (these failed
+    with EFAULT above 4095 bytes), EINVAL within 250 bytes for memfd
+    names. Suite: a 4095-byte path is ENOENT, not ENAMETOOLONG.
+  - FTP: port 21, falling back to any free port if taken. Any user name;
+    the on-screen password is the only credential. The service acts with
+    root's access and chowns what it creates to uid 1000 (the default
+    owner of SD entries) through the real chown handler.
+- **Verification (host, 2026-11-22, 0.12.37).** Host checks including
+  `check-guest-ftp` passed; the FTP test also passed with an ownership
+  expectation. `check-fs-suite-native`: 79 passed, 0 failed, 2 skipped as
+  uid 1000 and root. Packaged bundle: `ABI 42, coreutils 0, suite 42`,
+  exit 0; root suite 42. NRO 0.12.37 built.
+- **Console 0.12.37 (2026-11-22).** Acceptance and the root suite passed
+  (the user reported the tests succeed). The FTP screen showed `Could not
+  open a listening socket: Permission denied`: Horizon refuses binding the
+  privileged port 21, and 0.12.37 only fell back on EADDRINUSE.
+- **Fixed for 0.12.38.** The FTP server tries 1337 (OunceShell's port
+  under kaiHEN), 2121, then a system-chosen port, logging each attempt as
+  `FTP server port N: ...` with the failing call. Passive data sockets
+  fall back from a system-chosen port to 50000–50999. Host FTP test
+  passes; NRO 0.12.38 built.
+- **0.12.39.** Following OunceShell's ftpd (github.com/kurumuz/ounceshell,
+  `switch2/third_party/ftpd/ftp.c`): the listener binds the console's
+  address from `nifmGetCurrentIpAddress` instead of `INADDR_ANY` (the
+  likely EACCES cause), the socket driver uses ftpd's buffer config, and
+  the screen refuses to start without a network address. Attempts log as
+  `FTP server <ip>:<port>: ...`. Host FTP test passes; NRO 0.12.39 built.
+  0.12.38 was not run on the console.
+- **Console 0.12.39 (2026-11-22).** The FTP server listened on
+  192.168.178.29:1337 (the nifm address bind fixed EACCES). `FtpTest.py`
+  passed the wrong-password check, then its reconnect got `421 Another
+  client is connected`: the server accepted new connections before
+  noticing the closed one, and served only one client.
+- **Fixed for 0.12.40.** Up to 8 sessions with per-session state; hang-ups
+  are processed before new connections are accepted. `FtpTest.py` also
+  opens two sessions at once. Host FTP test passes; NRO 0.12.40 built.
+- **Console 0.12.35 (log of 2026-11-22).** Name-limit probe, longest name
+  per depth (SD directory path bytes in parentheses): 235 (22), 194 (63),
+  153 (104), 112 (145), 71 (186), 30 (227). Name plus path is always 257
+  bytes, two-byte characters count as two bytes, and creating the depth-6
+  directory failed. The error is `SD result 2002-6003`.
+- **Implemented for 0.12.36.**
+  - Horizon 2002-6003 maps to ENAMETOOLONG; guest path limits follow
+    PATH_MAX 4096 instead of Horizon's 769-byte `FS_MAX_PATH`.
+  - Overflow store (`GuestRuntime.cpp`, `GuestInodeStore.h` flag 512).
+    Directories whose SD path would exceed 257 bytes, or whose parent is
+    an overflow directory, are `OverflowDirectory` records; files there
+    are managed objects created like `O_TMPFILE` (unlinked record, object,
+    then the name). All lookups go through `EntryType`, so a missing
+    overflow entry is ENOENT. Listing, `st_nlink`, rmdir (ENOTEMPTY from
+    store children) and the launcher's rootfs browser include them.
+  - Renames involving an overflow directory, an overflow destination, or
+    a native directory whose deepest native path would exceed the limit
+    at its new name go through `RenameThroughStore`: both sides are made
+    store-backed (files promoted, directories converted deepest first by
+    `ConvertToOverflow`), then every name below the source is moved in
+    one store save. Error order follows `do_renameat2`. A reset during
+    conversion leaves an empty native directory behind its overflow
+    record; the next load deletes it.
+  - FTP server (`GuestFtp.h`, launcher **FTP server**): port 5000, passive
+    mode, password shown on screen, `root` = uid 0, other names =
+    uid 1000. `GuestFileService` calls the guest syscall handlers (open,
+    read, write, getdents64, newfstatat, mkdirat, unlinkat, renameat,
+    utimensat, faccessat2) on its own namespace. Commands and replies are
+    logged as `FTP >` / `FTP <` lines (passwords masked).
+  - Suite: `path/long_paths`, `path/long_path_renames` (81 cases). The
+    persistence pair now also checks an overflow directory chain, a
+    255-byte name and a converted native tree.
+- **Verification (host, 2026-11-22, 0.12.36).**
+  `make -C Source/Switch2 check-guest-inode-store check-guest-file-punch check-guest-file-write check-guest-memory check-guest-log check-guest-terminal check-guest-ftp`
+  passed (FTP protocol test: 25 checks, 0 failed).
+  `make -C Source/Switch2 check-fs-suite-native`: 79 passed, 0 failed,
+  2 skipped as uid 1000 and as namespace root.
+  `make -C Source/Switch2 filesystem-runtime` staged `build/guest/sd`.
+  `LinuxRuntime/RunPackagedNative.sh build/guest/sd/fex/rootfs /bin/bash --noprofile --norc /bin/filesystem-coreutils.sh /bin/filesystem-probe.elf /bin/fs-suite.elf`
+  printed `ABI 42, coreutils 0, suite 42` and exited 0; with
+  `--root /bin/fs-suite-root.elf` it exited 42. Persist write and read
+  run natively in the bundle returned 42 each.
+  `cmake --build Source/Switch2/build/guest --target guest_nro` built
+  the 0.12.36 NRO. The overflow store and the console FTP backend have
+  only been built for the console, not run there.
+- **Console 0.12.32.** Acceptance hung because `nanosleep` and
+  `clock_nanosleep` were unrouted; fixed in 0.12.33 and confirmed.
+- **Implemented for 0.12.33.**
+  - `nanosleep` (35) and `clock_nanosleep` (230): REALTIME, MONOTONIC,
+    BOOTTIME and TAI, relative and TIMER_ABSTIME. A caught signal ends the
+    sleep with EINTR (even with SA_RESTART) and relative sleeps store the
+    time left. Error order matches host Linux 7.3: EOPNOTSUPP for thread
+    CPU, raw and coarse clocks; EINVAL for unknown clocks; alarm clocks
+    validate, then EPERM for non-root. Gaps: process CPU clock and root
+    alarm sleeps return EOPNOTSUPP.
+  - The log keeps guest stdout/stderr in a separate 512 KiB buffer and
+    repeats it after a trimmed trace.
+  - Inode metadata moved from flat `/fex/.inode-*` entries into
+    `/fex/.inode/` (`store-0`, `store-1`, `objects`, `dir-intent`,
+    `dir-backup`, `intent-stage`, `promotion`). The launcher renames
+    legacy entries on startup and refuses guest launches if an entry
+    exists at both paths or a rename fails.
+  - One NRO for everything: the recovery interruption is enabled per
+    launch by a `<program>.recovery-test` file (staged for the two recovery
+    write probes) instead of the `FEX_SWITCH2_RECOVERY_TEST` build option.
+  - Suite: `time/nanosleep_rules`, `time/sleep_interrupted_by_signal`.
+- **Verification (host, 2026-11-22, 0.12.34).** Same commands as below:
+  host checks passed, native suite 77/0/2 as uid 1000 and namespace
+  root, packaged bundle `ABI 42, coreutils 0, suite 42`, packaged root
+  suite exit 42, NRO built.
+- **Earlier in milestone 1.** memfd page tracking (hole punching frees
+  pages, `st_blocks`, `SEEK_DATA`/`SEEK_HOLE`, KEEP_SIZE, truncation),
+  `MFD_NOEXEC_SEAL`/`MFD_EXEC`/`F_SEAL_EXEC`, access mode 3, legacy `open`
+  ignoring unknown flags, regular files polling readable and writable,
+  `ustat`, `name_to_handle_at`, `open_by_handle_at` (all 102 inventory
+  entries routed; see
+  [deliberate differences](FilesystemInventory.md#deliberate-differences-from-a-stock-kernel)),
+  and `<program>.user` launch credentials.
+- **Test suite.** `LinuxRuntime/FsSuite.c` has 79 named cases, each in
+  its own scratch directory, with TAP output and exit 42.
+  `LinuxRuntime/RunPackagedNative.sh` runs a staged bundle on the host
+  kernel in user, mount and PID namespaces.
+- **Build layout.** One tree: `build/guest` (configure per README). The
+  bundle stages to `build/guest/sd` (`make -C Source/Switch2
+  filesystem-runtime`), mirroring the SD root.
+- **Verification (host, 2026-11-22, 0.12.33).**
+  `make -C Source/Switch2 check-guest-inode-store check-guest-file-punch check-guest-file-write check-guest-memory check-guest-log check-guest-terminal`
+  passed. `make -C Source/Switch2 check-fs-suite-native`: 77 passed,
+  0 failed, 2 skipped as uid 1000 and as namespace root (the skips,
+  `path/handles` and `xattr/trusted_namespace`, need init-namespace
+  capabilities). `LinuxRuntime/RunPackagedNative.sh build/guest/sd/fex/rootfs /bin/bash --noprofile --norc /bin/filesystem-coreutils.sh /bin/filesystem-probe.elf /bin/fs-suite.elf`
+  printed `ABI 42, coreutils 0, suite 42`; with `--root /bin/fs-suite-root.elf`
+  it exited 42. `cmake --build Source/Switch2/build/guest --target guest_nro`
+  built the 0.12.33 NRO.
+- **Debian sysroot.** `make -C Source/Switch2 debian-sysroot` downloads
+  and checks Debian 12 packages into `build/debian-sysroot` (default
+  `DEBIAN_ROOT`).
+
+### Last console checklist (0.12.40, passed)
+
+Artifact: `Source/Switch2/build/guest/fex-switch2-guest.nro` (the bundle
+is unchanged from 0.12.37). Acceptance and the root suite passed on
+0.12.37 and nothing they cover changed, so only FTP is checked.
+
+1. Open **FTP server** with the console on the PC's network. Expect
+   `ftp://<ip>:1337` (or 2121 / another port), `User any name` and a
+   six-digit password.
+2. On the PC run `python3 Source/Switch2/LinuxRuntime/FtpTest.py <ip>
+   <port> <password> 1000`. Expect `ftp test: 0 failed`.
+3. Press B to stop the server.
+
+On failure, copy `/fex/fex-switch2-guest.log`; the `FTP server <ip>:<port>`
+lines name the socket call that failed, and sessions appear as `FTP >`
+and `FTP <` lines.
+
+The sections below preserve the detailed acceptance scope and historical
+evidence. Use this checkpoint for current status and the next action.
 
 Interactive Bash 0.11.5 passed on Switch 2. The user confirmed the
 result screen, repeat launches in the same NRO, and consecutive external
-commands in one shell. The next milestone is pending selection.
+commands in one shell. The baseline is committed on `nx2` as `f4f9c0d13`.
 
-The shortest path to Wayland is guest Unix descriptor passing and
-file-backed shared mappings, followed by a native software compositor
-and a Debian x86-64 client. A desktop session and Steam remain later
-targets. The runtime and terminal limitations below still apply.
+## Next milestone — finish filesystem compatibility (groups 1–5)
+
+SD truncate growth now preserves an unallocated tail through the
+managed inode's logical EOF. Both pathname and descriptor truncation
+share the backing path. The probe verifies unchanged block counts,
+zero reads and hole seeking. Native acceptance returned ABI 42 and
+Debian coreutils 0, and both persistence phases returned 42.
+Extending SD writes clear the gap once and attempt to restore the old
+physical length if the gap or payload write fails. The native probe
+also checks a write into a sparse tail and the zero bytes on either
+side of it. The development NRO built and packaged native acceptance
+returned ABI 42 and Debian coreutils 0. SD write failures and rollback
+have yet to be exercised on console.
+The restart probe now also checks a truncate-grown file after hard
+linking and renaming it, including inode identity, zero allocation,
+hole seeking and EOF. The refreshed development bundle is under
+`Source/Switch2/build/filesystem-runtime-m1/fex`. The exact packaged
+ABI ELF ran with the bundled Debian loader and libc and returned 42
+in combined acceptance and both persistence phases. Debian coreutils
+returned 0 in the combined run. No console result has been recorded
+for the refreshed bundle.
+
+The last console-confirmed build is
+0.12.29. The 0.12.31 recovery checklist is recorded below.
+
+| Group | Status (2026-11-22) |
+| --- | --- |
+| 1. Descriptors and I/O | Implemented. Console: `fcntl` deadlock, `flock` interruption and restart. |
+| 2. Paths and links | Implemented, including file handles. Console: interrupted SD rename recovery at both checkpoints. |
+| 3. Metadata and permissions | Implemented. Console: cross-identity cases through `fs-suite-root.elf`. |
+| 4. Allocation and transfer | Implemented, including memfd hole punching. Console: `splice`, `tee`, `vmsplice`. |
+| 5. Extended attributes | Implemented. Console: `trusted.*` visibility through `fs-suite-root.elf`. |
+
+Reuse the combined ABI and Debian coreutils acceptance program. Add cases
+for the remaining behavior and use restart phases for persistence and
+recovery. Reconcile the syscall and flag inventory before declaring the
+milestone complete. Commit on `nx2` after hardware acceptance.
+The [current syscall inventory](FilesystemInventory.md) records ABI
+numbers and dispatcher routing. It includes three unrouted legacy
+and handle-based candidates whose milestone assignment still needs
+reconciliation with the historical baseline.
+
+## Active milestone sequence — Linux guest kernel compatibility
+
+Graphics is shelved until these milestones are complete. Work on them in
+order on `nx2`.
+
+| Milestone | Groups | Audited entries | Initially routed | Initially missing |
+| --- | --- | ---: | ---: | ---: |
+| 1 | File descriptors and I/O, paths and links, metadata and permissions, file allocation and transfer, extended attributes | 98 | 28 | 70 |
+| 2 | Processes and sessions, signals, credentials and capabilities, clocks and timers, polling and watches | 85 | 24 | 61 |
+| 3 | Virtual memory, pipes and IPC, sockets | 60 | 22 | 38 |
+
+Count each existing handler as needing a semantics review. Track syscall
+variants, flags, Linux errors, shared state and resource lifetime, and limits
+imposed by the host. Test successes and errors with the same x86-64 probe on
+native Debian and in the normal NRO launcher. Keep probe cases small and give
+failures names that identify the failing operation and errno. Record host
+build and reference results separately from console results. At each completed
+milestone, hand off the NRO and probe for joint console debugging. Commit the
+milestone after its acceptance checks pass.
+
+1. **Filesystem.** Give guest files stable identities independent of paths.
+   Support descriptor-relative access, rename and unlink with live handles,
+   access checks, links, timestamps, persistent metadata and xattrs, file
+   allocation and transfer. Verify persistence across launcher restarts,
+   error handling, and ordinary Debian `ls`, `cp -a`, `mv`, `rm`, `ln`,
+   `mkdir`, `stat`, `touch`, `chmod` and `df` against scratch data.
+2. **Processes and events.** Verify process and session lifecycle, signal
+   delivery and return, credential changes and authorization, clocks, timers,
+   and readiness and watch lifetimes. Exercise stock Bash pipelines, terminal
+   job control, traps, and Debian `sleep`, `timeout`, `kill` and
+   `inotifywait`.
+3. **Memory and communication.** Verify mapping protections and sharing,
+   futex behavior and robust lists, pipes and queues, socket options and
+   addresses, descriptor passing and peer teardown. Exercise Debian threaded
+   applications and real Unix, TCP and UDP client/server pairs.
+
+The initial inventory covers 243 of the 380 x86-64 syscall entries in this
+checkout. Track the other 137 individually (129 initially missing), including
+scheduling, mount and namespace APIs, async I/O and privileged or legacy
+interfaces. The three groups of milestones alone cannot establish full kernel
+coverage. Reconcile remaining entries and kernel-visible interfaces such as
+`procfs`, `devfs` and ioctl operations before reporting 100%. Validate
+privilege failures under the intended guest credentials.
+
+### Recovery diagnostic 0.12.31
+
+The last console-confirmed build is 0.12.29. Combined acceptance returned
+0 (ABI 42, Debian coreutils 0) and both persistence phases returned 42
+across a clean launcher restart. Since that run, work added pipe page
+slots and pinned pages, SIGPIPE and lock interruption/restart, filesystem
+credentials and ownership checks, sparse-tail persistence, and SD journal
+durability and recovery.
+
+The 0.12.31 diagnostic NRO is build-verified at
+`Source/Switch2/build/guest-filesystem-recovery/fex-switch2-guest.nro`
+and contains the 0.12.31 launcher banner. The staged bundle is at
+`Source/Switch2/build/filesystem-runtime-m1/fex`. The 0.12.31 console
+run was requested to verify recovery ordering on the SD backend.
+The 90-second response window elapsed without a console result.
+Merge the bundle into SD `/fex`,
+launch the diagnostic NRO, and use **Browse Linux rootfs**:
+
+1. Run `/bin/filesystem-acceptance.elf`. Expect ABI 42, coreutils 0,
+   and overall exit 0.
+2. Run `/bin/filesystem-recover-rollback-write.elf`, fully reopen the NRO,
+   then run `/bin/filesystem-recover-rollback-read.elf`. Expect 42 each.
+3. Run `/bin/filesystem-recover-commit-write.elf`, fully reopen the NRO,
+   then run `/bin/filesystem-recover-commit-read.elf`. Expect 42 each.
+4. Run `/bin/filesystem-persist-write.elf`, fully reopen the NRO,
+   then run `/bin/filesystem-persist-read.elf`. Expect 42 each.
+
+The recovery build uses `FEX_SWITCH2_RECOVERY_TEST=ON` and deliberately
+interrupts journal transactions at two checkpoints. Keep trace logs from
+`/fex/fex-switch2-guest.log` if a phase fails. Give the user the complete
+console checklist and the requested 90-second response window. Keep builds
+under `Source/Switch2/build/` and use the combined acceptance program for
+the final run. Work on `nx2` and commit at the completed milestone boundary.
+
+Development builds continue separately while console recovery results
+are pending. Range sync now accepts procfs files and directories and
+decodes flags as a 32-bit Linux argument. The updated Debian ELF and
+development NRO built, and native combined acceptance returned ABI 42
+and Debian coreutils 0. The newer development bundle is under
+`Source/Switch2/build/filesystem-runtime-dev/fex`.
+
+O_TMPFILE now validates the resolved directory before checking SD
+metadata availability, reports ENOTDIR for a retained final symlink
+or virtual file, and follows a directory symlink with a trailing slash.
+Temporary files on the synthetic devfs are unsupported. The
+development NRO built and native packaged acceptance returned ABI 42
+and Debian coreutils 0.
+
+Openat2 cached lookup now validates flags, the pathname buffer and
+the starting descriptor before returning EAGAIN for an uncached
+lookup. Creation and truncation requests still return EAGAIN before
+pathname lookup. Packaged native acceptance returned ABI 42 and
+Debian coreutils 0, and the development NRO built.
+
+Timestamp updates now authorize explicit timestamps by inode ownership
+and current-time requests by ownership or write permission. The ABI
+probe covers current-time updates on a read-only owned file, two
+UTIME_OMIT values on a missing name, and denial on a foreign inode on
+the native reference. Packaged native acceptance returned ABI 42 and
+Debian coreutils 0, and the development NRO built.
+
+Timestamp syscalls now copy the caller's time values before checking
+pathname flags and treat two UTIME_OMIT values as a no-op even with an
+invalid descriptor or flags. The ABI probe checks that precedence,
+fault reporting and the 32-bit flags argument. Packaged native
+acceptance returned ABI 42 and Debian coreutils 0. The development
+NRO built at the existing version.
+
+Pathname truncate now classifies the resolved virtual target, including
+aliases and trailing slash errors. The ABI probe also verifies sparse
+growth through a relative symlink while an existing descriptor retains
+the same inode. The updated development NRO built and packaged native
+acceptance returned ABI 42 and Debian coreutils 0.
+
+The packaged ABI probe now executes a copy of true after growing its
+logical EOF without increasing its allocated blocks. Native combined
+acceptance returned ABI 42 and Debian coreutils 0. The case still
+needs guest execution on Switch 2. The development launcher now merges
+managed inode entries into rootfs listings and resolves the selected ELF
+and its interpreter through the guest namespace, including logical EOF.
+The development NRO and host checks passed. Browser selection and
+execution of a managed ELF still need console verification.
+
+Memfd growth checks now return the seal error before the runtime
+allocation limit. The packaged probe covers scalar and vector writes
+across sealed EOF, unchanged data and offsets after rejection, and
+successful in-range writes. Native acceptance returned ABI 42 and
+Debian coreutils 0. The development NRO built at the existing version.
+
+### Milestone 1 feature outline and acceptance
+
+| Group | Required behavior | Combined suite coverage |
+| --- | --- | --- |
+| Descriptors and I/O | Open descriptions, descriptor sharing and inheritance, standard and positioned I/O, vectored flags, offsets, directory cookies, locks, sync and filesystem statistics | ELF ABI cases, fork and thread cases, stock Debian utilities |
+| Paths and links | Namespace traversal, descriptor-relative lookup, scoped open, symlinks, hard links, directory and special-node lifecycle, rename and unlink with open handles, crash recovery | ELF namespace cases, stock utilities, restart and interrupted transaction checks |
+| Metadata and permissions | Stable inode identity, mode, ownership, ACL authorization, timestamps, descriptor and pathname stat variants | ELF metadata and access cases, stock utilities, restart checks |
+| Allocation and transfer | Sparse extents, allocation modes, growth and truncation, cache advice, file and pipe transfers with correct offsets, errors and partial progress | ELF range and transfer cases, large and sparse copies |
+| Extended attributes | All legacy and descriptor-relative variants, namespace permissions, flags, binary values, ACL inheritance and persistence | ELF attribute cases, stock archival copy, restart checks |
+
+Use one combined acceptance run for the ELF and Debian utility checks,
+with restart phases for persistence and interruption recovery. Report
+host execution and Switch 2 execution separately. Batch console checks
+until hardware evidence is required, then allow the requested 90-second
+response window before continuing. Increase the NRO version only when
+preparing a build for a new physical Switch 2 run.
+
+### Filesystem implementation in progress
+
+Vectored I/O now imports the full descriptor array and validates signed
+lengths before checking v2 flags. Zero-length vectors return zero before
+flag validation. Read-side priority, sync and append flags follow the
+native Linux result. File vectors use the Linux maximum transfer count
+and the probe checks a 96 KiB memfd round trip in single positioned
+calls. Socket and console limits and the remaining flag and fault cases
+still need reconciliation.
+
+Vectored I/O now checks guest address ranges and offset overflow before
+dispatch, returns zero for an unmapped destination at regular-file EOF,
+and handles `/dev/null` without touching the vector buffers. The
+expanded native acceptance suite returned ABI 42 and Debian coreutils 0.
+
+Scalar and positioned I/O on the null device now check user address
+ranges without touching buffer pages. The ABI probe checks unmapped
+buffers, positioned offset overflow, and the Linux transfer cap.
+The development NRO built and packaged native acceptance returned
+ABI 42 and Debian coreutils 0.
+
+Scalar reads now share address and position checks, and use the same
+regular-file EOF handling as vectored reads when the buffer is unmapped.
+Regression cases cover both sides of EOF, offset overflow, and zero-byte
+requests with an invalid address. Packaged native acceptance returned
+ABI 42 and Debian coreutils 0. The development NRO built.
+
+Scalar and positioned writes now share guest address and offset
+validation. Regular-file writes use the Linux maximum transfer count.
+The packaged probe covers invalid-address and overflow precedence,
+single 160 KiB writes, positioned write offsets and copied content.
+Native acceptance returned ABI 42 and Debian coreutils 0. The guest
+NRO built. Large SD writes still need console verification.
+
+Regular-file scalar reads now use the Linux transfer cap. SD reads
+use bounded 64 KiB service calls and return bytes already transferred
+if a later call fails. The ABI probe checks full-size 160 KiB scalar
+and positioned reads and their offsets. The development NRO built and
+packaged native acceptance returned ABI 42 and Debian coreutils 0.
+
+SD payload writes now use bounded 64 KiB service calls. If a later
+chunk fails, offset updates and return counts reflect completed
+chunks, and cleanup attempts to keep the original backing plus
+successful extension. The native large-transfer cases passed and the
+development NRO built. SD partial-failure behavior remains unverified
+on hardware.
+
+`make -C Source/Switch2 check-guest-file-write` now exercises the same
+write loop used by the SD runtime. It injects errors during gap
+clearing and at each payload chunk, and checks the reported byte count
+and retained backing length. The new test, four existing host checks,
+and the development NRO build passed. Native packaged acceptance
+returned ABI 42 and Debian coreutils 0.
+
+Vectored I/O now honors RWF_NOWAIT for pipes, sockets and the null
+device, and RWF_NOSIGNAL suppresses SIGPIPE on pwritev2. The ABI probe
+checks blocking pipe descriptors with empty, ready and full queues,
+as well as EPIPE with a signal handler installed. Native acceptance
+returned ABI 42 and Debian coreutils 0. The guest NRO built at the
+existing version. SD and memfd RWF_NOWAIT remain unsupported.
+
+Existing-inode open and F_SETFL now enforce O_NOATIME authorization
+using guest filesystem credentials. chmod clears setgid when an
+unprivileged owner is outside the inode's group. The native suite
+checks O_NOATIME rejection and verifies that a rejected F_SETFL leaves
+other flags unchanged. Native acceptance returned ABI 42 and Debian
+coreutils 0, and the guest NRO built at the existing version.
+
+The standalone Switch 2 probe and development guest NRO built without a
+version bump. Host VMA, inode store, log and terminal tests passed.
+Native Linux combined acceptance passed with ABI 42 and staged Debian
+coreutils 0. Both native persistence phases returned 42. These checks
+add no console results.
+
+POSIX ACL xattrs now handle empty and header-only values as removals,
+apply the ACL-specific create and replace rules, distinguish unsupported
+versions from malformed entries, and enforce the inode type restrictions.
+Legacy descriptor xattrs reject O_PATH descriptors. O_TMPFILE accepts
+O_TRUNC without retaining it in F_GETFL and retains O_NOFOLLOW.
+The expanded combined suite passed on native Linux (ABI 42, Debian
+coreutils 0). The standalone probe and development guest NRO built at
+the existing version. Console validation remains pending.
+
+The path walker now detects crossings into and out of the virtual
+`/dev` and `/proc` mounts with RESOLVE_NO_XDEV, including symlink
+targets and paths that cross a mount before backtracking. Open and stat
+resolve aliases of the existing virtual files. RESOLVE_NO_SYMLINKS
+rejects traversal through `/proc/self` and `/proc/mounts`. The expanded
+native suite passed (ABI 42, Debian coreutils 0), and the development
+NRO rebuilt at the existing version. Virtual directory descriptors
+and the remaining procfs link behavior still need work.
+
+Pathname statfs now reports the mount reached by pathname resolution.
+Aliases of existing virtual files report the same filesystem type as
+direct paths, and stat and fstat agree on their device identity. The
+expanded native acceptance suite returned ABI 42 and Debian coreutils 0.
+The development guest NRO built at the existing version.
+
+The synthetic `/dev`, `/proc`, and `/proc/self` directories now
+support open, stat, enumeration, and descriptor-relative traversal of
+the existing virtual entries. The reference probe checks procfs
+directory identity, enumeration, and RESOLVE_NO_XDEV from within a
+mount. Native acceptance returned ABI 42 and Debian coreutils 0.
+The development guest NRO built at the existing version. Procfs
+symlink identity and on-console behavior still require verification.
+
+`/proc/self` and `/proc/mounts` now resolve as symlinks through the
+normal path walker. The procfs directory exposes numeric guest PIDs,
+and the acceptance probe covers link identity, readlink, O_NOFOLLOW,
+and O_PATH with empty-path readlinkat. Native acceptance returned ABI
+42 and Debian coreutils 0. The guest NRO built at the existing version.
+Full procfs contents and console behavior remain outside these checks.
+
+SD hole punching now zeroes partial blocks without dropping their
+allocation. A punch that covers the allocated tail reclaims only full
+blocks and preserves logical EOF. The ABI probe checks partial punches
+inside a file and at EOF, including SEEK_DATA after a partial punch.
+The development NRO built at the existing version. Native combined
+acceptance returned ABI 42 and Debian coreutils 0, and both persistence
+phases returned 42. Full interior block reclamation and memfd hole
+punching remain open.
+
+Memfd write seals now enforce descriptor write and hole-punch
+authorization, distinguish existing shared mappings from mappings
+created after F_SEAL_FUTURE_WRITE, and reject F_SEAL_WRITE while a
+potentially writable shared mapping exists. The combined native suite
+passed (ABI 42, Debian coreutils 0), the host address-space test covers
+mapping authorization, and the development NRO built at the existing
+version. Unsealed memfd deallocation and console checks remain open.
+
+Memfd partial-page punches zero the selected bytes in place while
+preserving EOF and the allocation. The ABI probe verifies the result
+through both an existing shared mapping and a positioned read. Full
+pages and reservations beyond EOF still need reclaimable backing.
+Native acceptance returned ABI 42 and Debian coreutils 0. The guest
+NRO built at the existing version.
+
+Partial punches also clear the requested bytes beyond logical EOF
+within the last mapped page. The ABI probe checks both sides of EOF
+through a shared mapping and confirms the logical size stays fixed.
+Packaged native acceptance returned ABI 42 and Debian coreutils 0.
+
+Copy-file-range now loads both explicit offsets before validating
+flags and ranges, and distinguishes unsigned range overflow from a
+negative offset. The expanded native suite returned ABI 42 and Debian
+coreutils 0. The guest NRO built at the existing version.
+
+File advice now distinguishes pipes from sockets for fadvise and
+accepts readahead on the already-resident synthetic proc files.
+The native probe covers these descriptor types, invalid advice and
+offsets, and confirms that readahead preserves the descriptor offset.
+Native acceptance returned ABI 42 and Debian coreutils 0. The guest
+NRO built at the existing version.
+
+SD ZERO_RANGE now zeroes the range and any newly exposed gap before
+publishing the new logical EOF. On a write error it attempts to restore
+the original backing length. KEEP_SIZE on an unnamed managed file
+uses its existing backing, and publication preserves the reservation
+and visible size. The expanded native acceptance suite returned ABI 42
+and Debian coreutils 0. The guest NRO built at the existing version.
+
+Sendfile now validates the input descriptor and position before the
+output descriptor, including overflow of the requested input range.
+The ABI probe checks EBADF and EINVAL precedence and verifies that
+rejected calls leave the explicit input offset unchanged. Native
+acceptance returned ABI 42 and Debian coreutils 0. The development
+NRO built at the existing version.
+
+Ordinary files now use Ounce SD handles for writes, positioned writes, create
+and exclusive create, append, pathname and descriptor truncation, and flush.
+The SD pathname walk checks intermediate components before handling `..`.
+Directory creation, empty-directory removal, `fchdir`, `readv` and both
+directory-record layouts are wired. `pread64` validates offsets and descriptor
+types before handling a zero-byte request. Vectored reads and writes use
+one backing operation, and the positioned variants and v2 offset `-1` are
+routed. `RWF_APPEND`, `RWF_NOAPPEND`, `RWF_DSYNC`, and `RWF_SYNC` are
+wired for writes. `O_SYNC` and `O_DSYNC` flush SD writes, and `O_NOATIME`
+preserves access times on reads. The reference checks flags, append
+override and access-time preservation.
+Other v2 flags and Linux transfer-size and fault-order parity require
+additional coverage. These changes are build-verified. The Debian probe
+checks positioned vector contents, append and offset behavior on native Linux.
+`flock` uses open-description ownership, cooperative blocking on conflict,
+and weak holder references so closing the final reference drops the lock.
+The Debian reference probe checks shared holders, nonblocking conversion,
+and lock ownership through duplicated descriptors. Console verification and
+signal interruption of blocking calls remain pending. The `fcntl` lock
+commands now handle process and open-description byte ranges, conflict
+queries, split unlocks and close-time release. The Debian probe checks
+same-inode conflicts between the two ownership models. Deadlock reporting,
+interruption, and console behavior remain pending. Pipe capacity can be
+queried and changed on either endpoint. The ioctl path now also supports
+`FIONREAD`, `FIONBIO`, `FIOCLEX` and `FIONCLEX`. The reference checks
+capacity, nonblocking writes, bytes pending and poll readiness. Linux pipe
+page-slot accounting still differs from the guest byte queue.
+
+SD inode numbers are assigned for the lifetime of a launcher run and moved
+with directory subtrees on successful native rename. Rename to an unused name
+updates open descriptor paths and working directories. Removed directory
+handles stay detached even when their former name is recreated. Directory
+iteration builds its snapshot on demand and refreshes it on rewind. The
+Debian probe checks these invariants on the reference system. Native SD
+rename with live handles is still hardware-unverified. Regular-file unlink
+uses the native SD delete operation, drops the name's inode association only
+on success, and marks the former inode unlinked for descriptor stat. The
+reference probe checks open-handle reads and writes after unlink and reuse
+of the name. Whether Ounce permits deletion with live handles still needs
+hardware evidence. Mode, timestamps, attributes and unlink state now share
+one inode record. The launcher now saves linked inode numbers and metadata
+to alternating checksummed SD snapshots under `/fex`. It loads the newest
+valid generation, saves at regular-file sync and launcher teardown, and
+keeps runtime-only and unlinked objects out of the snapshots. The host
+format tests verify binary values, shared inode numbers and recovery after
+truncation or corruption. On-device restart recovery is still unverified.
+A native namespace mutation and its metadata checkpoint are separate
+operations, so power-loss consistency across rename/unlink still needs a
+transactional namespace.
+
+Guest symlinks now live in persisted inode records and participate in lookup,
+directory listing, stat, readlink, rename to unused names, and unlink.
+Relative targets are resolved from the containing directory, absolute targets
+from the guest root, and loops return ELOOP. The Debian reference checks
+nofollow, truncated readlink, link rename, and loops. `O_PATH` now preserves
+descriptor flags, rejects I/O, and can retain a symlink for `fstat` and
+empty-path `readlinkat` after unlink. The Debian reference verifies those
+operations. Remaining work includes virtual device targets, additional path
+descriptor and symlink edge cases, and hardware verification.
+
+Hard links share an inode and one SD backing object. First link promotion
+moves an ordinary SD file into the reserved object directory and checkpoints
+the linked names, with rollback on a reported checkpoint failure. Open,
+stat, truncate and guest exec resolve the backing path independently of the
+link name. The reference probe checks write visibility through aliases.
+Native promotion while an SD handle is open and on-device persistence remain
+unverified.
+
+Object promotion now writes a checksummed recovery record before the SD move.
+Startup uses the checkpoint generation and observed file locations to retain a
+committed object or roll back an uncommitted move. Ambiguous recovery keeps
+the record and disables metadata writes. On-device write ordering and startup
+recovery still need verification. Replacement and exchange for two entries
+already in the metadata namespace now use one checkpoint. The native Linux
+reference verifies exchange and replacement of symlinks and regular files.
+Regular SD files promote under their original names before an exchange or
+replacement, so the final rename changes both names in one checkpoint.
+Directory replacement stages the empty destination under a recovery record,
+moves the source, and commits the inode namespace before removing the
+displaced backing directory. Recovery rolls back an uncommitted move or
+finishes committed cleanup. The reference checks nonempty rejection,
+detached descriptors, and stable source identity. Two-directory exchange
+uses the same intent with an exchange marker and finishes the staged native
+move only after the swapped namespace is durable. The probe verifies exchanged
+subtrees and descriptor-relative cleanup. Mixed directory and nondirectory
+exchange first promotes the nondirectory when needed, so recovery has only
+one native directory move to reconcile with the namespace checkpoint. The
+reference checks both operand orders with a symlink and retained directory
+descriptor. The recovery planner used by the launcher is tested across all
+48 combinations of transaction kind, checkpoint state, and native path
+presence. Physical SD write ordering and on-console transaction verification
+remain pending. A replaced
+managed backing object is retained for live descriptors and older snapshots.
+Managed unlink also checkpoints the name removal while retaining the backing
+file, so live handles can survive the last link. Object retirement is saved in both alternating snapshots before the launcher
+can reclaim an object on startup. Recovery keeps objects referenced by the
+fallback snapshot. Existing objects that predate recorded retirement are
+retained. The host codec tests cover retirement and fallback retention.
+On-device reclamation and crash recovery remain pending. Unlink of a live ordinary file also attempts promotion
+before removing the name. If native promotion fails with a generic SD error
+while handles are live, the runtime flushes the handles, retries the move
+with native handles closed, and reopens the same guest file descriptions
+without changing their offsets or flags. It attempts rollback if reopening
+fails and retains the recovery record if rollback cannot finish. The native
+SD rename and retry paths still require hardware verification.
+Creation uses a per-process umask inherited at fork. `chmod`, `fchmod`,
+`fchmodat` and `fchmodat2` share inode-level mode state, and the current
+fixed guest credentials are used for owner access checks on open, traverse,
+create, remove, rename and truncate. The Debian probe checks umask, mode
+updates and denied opens. The mode state is currently in memory.
+All sixteen xattr calls route to the same inode state, including the modern
+descriptor-relative ABI. User attributes support binary values, create and
+replace modes, listing, size queries, and removal. The native reference probe
+verifies legacy and modern API interoperability. POSIX ACL xattrs now
+validate their binary layout, update access-mode bits, persist with inode
+attributes and propagate default ACLs on creation. The reference checks
+inheritance, its interaction with umask, chmod mask updates and malformed
+entries. Named-user and group authorization with multiple guest credentials,
+security namespaces, and console persistence remain open.
+The inode timestamp state imports available SD times, supports `utime`,
+`utimes`, `futimesat` and `utimensat`, and is visible through both stat ABIs.
+The native probe verifies subsecond round trips and `UTIME_OMIT`. Timestamp
+state is saved with inode snapshots. Path and descriptor stat now compute
+directory link counts from native child directories. Successful namespace
+mutations update the affected parents' modification and change times. Parent
+times currently enter the next checkpoint for operations that checkpoint
+names inside the syscall. The reference checks subdirectory link counts and
+parent mtime. On-console verification remains pending.
+The chown family is routed under the current single unprivileged identity,
+including checks for forbidden changes and clearing applicable set-ID bits.
+Multiple credentials and privileged changes depend on the later credential
+group. All 98 audited group 1–5 syscall numbers now have routes. This
+is a dispatch count. Existing partial paths still need the semantics and
+acceptance work tracked above and below. `mknod` and `mknodat` create
+regular files and persistent FIFO and socket inode types. Named FIFO opens
+share live pipe endpoints and support blocking rendezvous, nonblocking
+opens and open handles after unlink. The reference verifies regular-node
+creation, FIFO I/O and writer ENXIO without a reader. FIFO state now
+retains buffered data while either direction has an open description and
+tracks writer generations for reader hangup polling. The probe checks reopen
+and poll transitions. Privileged device creation, integration with Unix
+socket binding, SIGPIPE delivery, and hardware verification remain pending. `openat2`
+parses the extensible ABI and enforces beneath, in-root and no-symlink
+constraints during traversal. Cache-only lookup reports EAGAIN because
+the SD path walk requires native service calls. The reference probe
+covers scope escapes, symlink traversal and extended argument validation.
+Additional flag and virtual mount cases remain pending. `O_TMPFILE` now
+creates a nameless backing object, records retirement before creating it,
+and allows publication with `linkat(AT_EMPTY_PATH)` unless opened with
+`O_EXCL`. The reference checks link counts, publication, identity and the
+exclusive restriction. Hardware and remaining temporary-file flag parity
+are unverified. Descriptor tables
+are now shared by guest threads, copied on fork, and retained from the
+calling thread on exec. `close_range` supports closing, close-on-exec and
+unsharing. The native test checks a private thread's flag changes and
+closure while the caller retains its descriptor and shares the file offset.
+`readahead` and `fadvise64` now use a bounded SD read cache. Writes and
+truncation invalidate the cached inode across all descriptors. Positional
+prefetch is synchronous because the current backend uses Ounce filesystem
+IPC. The reference probe checks offset preservation and read-after-write
+coherence across opens. Device coverage and console verification remain open. The runtime now routes `copy_file_range` between files of the same backing
+type and `sendfile` to writable file, pipe and socket descriptors. Transfers
+can return short counts and update offsets by the bytes actually written.
+The reference probe checks explicit and implicit offsets, overlapping-copy
+rejection, and sending file data to a pipe. Console verification and the
+remaining allocation operations are pending. `splice` and `tee` peek until
+the output accepts bytes, and `vmsplice` shares the vectored transfer path.
+The reference exercises file-to-pipe splice, nonblocking tee, duplication
+without input consumption, and vectored pipe writes. Guest page pinning
+and complete Linux pipe buffer accounting remain pending. `fallocate`
+extends backing allocations and supports SD zero-range writes. Unsupported
+hole-punch and extent operations return errors. `sync_file_range` uses the
+native whole-file flush because Ounce does not expose a range flush. The
+reference checks extension, zero fill from growth and sync. The SD error translation covers
+path-not-found and path-exists and still needs good coverage of backing
+store failures. `statfs` and `fstatfs` report native SD capacity and free
+space, and `syncfs` flushes live writable files and the metadata checkpoint
+before committing the SD filesystem. The reference probe checks path/fd
+agreement, capacity invariants, sync and an invalid descriptor. Device and
+memory filesystem statistics and the native SD commit result still need
+verification. The raw SD operations are a first backend slice, and group
+1–5 completion requires the full ABI and real application verification.
+
+`LinuxRuntime/FilesystemProbe.c` creates a unique scratch directory and
+covers positioned and vectored I/O, append, shared offsets after dup, file
+growth, both getdents layouts, relative operations after directory rename,
+link identity, open-after-unlink, mode, timestamps and xattrs. Its Debian
+ELF builds with `make -C Source/Switch2 filesystem-probe
+DEBIAN_ROOT=/path/to/debian-sysroot` and exited 42 with the Debian 12
+glibc 2.36 loader on native Linux. It advertises x86-64-baseline.
+`LinuxRuntime/CoreutilsFilesystemProbe.sh` passed on native Linux using the
+Debian 9.7-3 coreutils binaries and the staged Debian 12 coreutils 9.1-1
+binaries using the bundled Debian loader and Bash. The guest exposes the
+SD-backed root mount in `/proc/self/mountinfo` and `/proc/mounts` for `df`.
+
+Build the acceptance bundle with `make -C Source/Switch2 filesystem-runtime
+DEBIAN_ROOT=/path/to/debian-sysroot`. Provide unpacked Debian 12 coreutils,
+Bash, glibc and its startup objects, ncurses terminfo, and their library
+dependencies. The output defaults to `Source/Switch2/build/filesystem-runtime`.
+Its rootfs includes `/bin/filesystem-probe.elf`,
+`/bin/filesystem-coreutils.elf`, and the two persistence launch entries
+`/bin/filesystem-persist-write.elf` and `/bin/filesystem-persist-read.elf`.
+The persistence entries use the same probe with distinct arguments. The
+Bash entry runs the coreutils script through the normal guest exec path.
+Expand the probe matrix to remaining cases.
+
+The Ounce JIT probe and default guest launcher built. The latter used the
+configuration without optional graphics dependencies. The address-space,
+terminal, and log regression checks passed. Console results are recorded
+below.
+
+### First filesystem console run
+
+The 0.12.12 hardware log shows the coreutils suite exited 0 and both
+persistence runs exited 42, including the read after restarting the NRO.
+The full filesystem probe exited 1. Reopening a file with a live writable
+SD handle repeatedly produced native result `0x00000e02`. The same
+restriction affected path stat, attribute operations and directory rename.
+The guest also observed nonzero bytes after file growth and sparse writes.
+
+0.12.13 keeps guest open descriptions and offsets but opens native SD
+handles only for individual operations. It writes zeros explicitly for
+growth and sparse gaps. This removes the native handle conflict without
+closing the guest descriptors. The filesystem launcher is built under
+`Source/Switch2/build/guest-filesystem/`. The user confirmed that both
+the full filesystem probe and the Debian coreutils suite passed on
+0.12.13. The cross-launch persistence pass was on 0.12.12.
+
+This completes the console smoke-test gate. Full groups 1–5 sign-off
+still requires the remaining Linux-behavior audit and on-console
+transaction recovery verification.
+
+### Filesystem work after the smoke tests
+
+0.12.14 adds POSIX blocking record-lock cycle detection. Each blocked
+request retains its inode and byte range so the runtime can follow live
+conflicting owners and return `EDEADLK` when the new request closes a cycle.
+Open-file-description locks do not participate in POSIX cycle detection.
+The combined filesystem probe now forks two lock owners and requires one
+`EDEADLK` and one successful acquisition, with the successful waiter
+waking after the other owner releases its lock. The expanded Debian probe
+exited 42 on native Linux. The Ounce NRO and staged Debian bundle rebuilt,
+and host inode-store, address-space, terminal and logging checks passed.
+The new lock contention case has not been run on Switch 2. Interruption
+of the blocking calls still depends on guest signal delivery.
+
+0.12.15 extends `statfs`, `fstatfs` and `syncfs` to the existing
+synthetic proc files, device nodes, memfds, anonymous pipes and sockets.
+Device and proc path lookups match the filesystem type reported on their
+descriptors. Named FIFOs remain on the SD filesystem. `fstatfs` supports
+`O_PATH`; `syncfs` rejects it with EBADF. Synthetic filesystems report
+filesystem identity and page size without inventing storage capacity.
+The expanded probe exited 42 on native Linux and the NRO and Debian
+bundle built. Console verification is pending.
+
+0.12.16 matches Linux descriptor validation order for `fallocate`
+and `sync_file_range`, including bad and path-only descriptors, invalid
+ranges and pipe ESPIPE. The expanded Debian probe exited 42 on native
+Linux. The Ounce NRO and staged bundle rebuilt. Extent operations and
+console verification remain open.
+
+0.12.17 handles `copy_file_range` offset writeback faults after the
+transfer. The runtime reads both offsets before copying, then attempts
+both writebacks when bytes moved. The probe checks EOF, zero-length
+copies, and a read-only offset that returns EFAULT while retaining the
+copied bytes and updating the writable offset. The expanded probe
+exited 42 on native Linux. The staged bundle and NRO built. Console
+verification remains pending.
+
+0.12.18 extends offset writeback behavior to `sendfile` and
+`splice`. The probe verifies that a writeback fault leaves bytes in the
+destination pipe, and that a zero-length splice skips descriptor
+validation. The expanded probe exited 42 on native Linux. The staged
+bundle and NRO built. Console verification is pending.
+
+0.12.19 returns EISDIR for zero-length reads on directories. The Debian
+probe also checks memfd append changes through duplicated descriptors,
+including positioned writes and their effect on the shared offset.
+The expanded probe exited 42 on native Linux. The staged bundle and NRO
+built. Console verification remains pending.
+
+0.12.20 adds `SEEK_DATA` and `SEEK_HOLE` for dense files. The only
+hole is at EOF because the current backings allocate and zero-fill
+growth. The probe checks both seek origins in a written extent and
+confirms that EOF and negative offsets return ENXIO without changing
+the current offset. The expanded probe exited 42 on native Linux,
+and the Ounce NRO and staged bundle built. Console verification and
+sparse extent support remain open.
+
+0.12.21 makes both getdents variants honor the 32-bit count ABI and
+update directory access time after partial batches. The combined probe
+reads a single record, resumes from its offset cookie, and verifies EOF
+for both layouts. It exited 42 on native Linux. The staged bundle and
+NRO built. Console verification remains pending.
+
+0.12.22 supports null pathname pointers with AT_EMPTY_PATH in the shared
+stat lookup, validates statx sync flags before lookup, and copies stat
+results only after successful lookup. Descriptor stat now reports the
+same /dev/null device number as pathname stat. The expanded Debian probe
+exited 42 on native Linux and the Ounce NRO and staged bundle built.
+Console verification remains pending.
+
+0.12.23 enforces directory resolution when a symlink target ends in a
+slash. It also honors the signed 32-bit readlink buffer length and
+reports ENOENT for an empty path on a valid non-symlink descriptor.
+The expanded Debian probe exited 42 on native Linux and the NRO and
+staged bundle built. Console verification is pending.
+
+0.12.24 rejects trailing slashes on synthetic nondirectory nodes for
+stat and hard-link sources, and returns EISDIR when open with O_CREAT
+targets a pathname ending in a slash. The probe covers a named FIFO
+and a missing path. It exited 42 on native Linux, and the NRO and
+staged bundle built. Console verification is pending.
+
+0.12.25 checkpoints parent directory timestamps with hard-link creation,
+managed unlink, and transactional rename. A failed checkpoint restores
+the previous parent timestamps along with the namespace change. The NRO
+build and host inode-store checks passed. Console recovery remains open,
+as do native mutations that still lack a namespace transaction.
+
+0.12.26 checkpoints renames of managed regular files, symlinks and
+special nodes to unused names, with namespace and timestamp rollback
+on a reported checkpoint error. The persistence probe now renames a
+staged symlink and checks that only its final name survives. Both
+persistence phases exited 42 on native Linux, and the Ounce NRO,
+staged bundle and host inode-store check passed. Native SD renames
+to unused names and console recovery verification remain open.
+
+0.12.27 adds recovery intents for native file and directory moves to
+unused names. It reuses the existing single-move recovery states to
+restore an uncommitted move or retain a committed one. The Ounce NRO
+and host inode-store tests passed. Interrupted console recovery
+remains unverified.
+
+0.12.28 applies the namespace journal to ordinary native unlink and
+empty-directory removal. The runtime first moves the entry into reserved
+storage, then checkpoints removal of the name and its cached descendants.
+Recovery restores an uncommitted removal or deletes the committed backup.
+The host recovery planner exercises all 64 presence and commit states,
+and the Ounce launcher built. Physical recovery and SD write ordering
+remain unverified. Native creation durability remains open.
+
+The current development build stages new SD files and directories under a recovery intent,
+checkpoints initial mode, inherited ACLs and timestamps, then publishes
+the native entry. Recovery discards an uncommitted staging entry or
+publishes a committed one. The host planner checks all 80 states and
+the NRO builds. Interruption and physical write ordering still need
+console verification.
+
+Symlink and special-node creation now checkpoint the new inode and
+its parent timestamps using the same metadata path as native creation.
+A failed checkpoint restores the prior name and timestamps. The two
+native Linux persistence phases also check a FIFO's type and mode
+after reopening. Both exited 42. The NRO and host inode-store and
+address-space tests passed. Switch 2 persistence remains to be checked
+with the updated bundle.
+
+The staged rootfs now provides `/bin/filesystem-acceptance.elf`, a
+Bash launch entry that runs the ABI probe and Debian utility checks and
+requires statuses 42 and 0 respectively. The combined script exited 0 on native Linux
+with the Debian-linked probe and the host's coreutils. Keep the separate
+persistence entries for the relaunch boundary. The combined entry does
+not yet cover all items in the feature outline. Sparse extents, transfer
+and permission coverage, and interrupted console recovery remain open.
+
+Timestamp updates now support persistent FIFO and socket inodes.
+The probe checks FIFO timestamp round trips and distinguishes the
+descriptor-only utimensat form from explicit AT_EMPTY_PATH on an
+O_PATH descriptor. The combined native Linux suite passed, and the
+NRO built at the existing version. Console verification is pending.
+
+Unprivileged file writes, truncation and allocation now clear setuid
+and clear setgid when group execute is set. The combined suite checks
+that these operations preserve both bits under privileged guest
+filesystem credentials. The privileged branch still needs a run.
+The combined suite also checks
+positioned writes, descriptor truncation, allocation inside the current
+size, and truncation on open. It passed on native Linux, and the NRO and
+Debian bundle built at the existing version. Console verification is pending.
+
+The truncate probe now covers named FIFOs, trailing slashes, directories
+and negative lengths on invalid descriptors. Runtime validation matches
+those native Linux outcomes. The combined suite passed on native Linux
+and the NRO rebuilt at the existing version.
+
+Regular-file and memfd scalar I/O now transfers the accessible
+prefix when a buffer crosses into an inaccessible page. Positioned
+operations keep descriptor offsets unchanged. Vectored I/O can also
+walk adjacent accessible mappings. The combined native Linux suite
+passed, and the NRO rebuilt. Pipe and terminal fault behavior and
+on-console verification remain open.
+
+Memfd fallocate now reserves backing memory with KEEP_SIZE without
+changing EOF and enforces F_SEAL_GROW for reservations past EOF.
+The combined probe checks deferred growth, zero-filled gaps and seal
+errors. It passed on native Linux, and the NRO rebuilt at the existing
+version. SD reservation beyond EOF and actual hole deallocation remain
+open.
+
+SD zero-range allocation now performs size checks, growth and clearing
+through one native handle. It attempts to restore the old EOF if clearing
+fails after growth. The combined reference suite covers in-file KEEP_SIZE
+zeroing, zeroing across EOF and unchanged descriptor offsets. Native
+Linux passed and the NRO built. The Ounce SDK exposes range clearing for
+supported files and storage, but its public file API exposes no separate
+reserve-space operation. SD reservations past EOF and deallocation still
+require a backing representation with separate allocation and logical size.
+
+SD KEEP_SIZE now promotes the file into managed storage when necessary
+and checkpoints logical EOF before extending the physical backing. Guest
+stat, reads, read-ahead and exec honor logical EOF, and append uses it
+to select the write offset. The inode codec reads snapshots predating
+this field. The expanded combined reference suite checks reservation
+past EOF and passed on native Linux. The host codec check and NRO build
+passed. Physical allocation reporting, reclaim on shrink, hole punching
+and Switch 2 persistence verification remain open.
+
+Path and descriptor stat now report the managed backing length in
+512-byte blocks independently of logical EOF. A shrinking truncate
+checkpoints EOF before releasing the backing tail. Failed post-checkpoint
+reclamation is logged and can leave the allocation in place. The
+combined reference suite checks allocation visibility and release; the
+two persistence phases now check reserved space and EOF across reopen.
+All passed on native Linux, and the NRO built at the existing version.
+Physical recovery and hole punching remain open.
+
+The combined acceptance probe now verifies byte-for-byte copies over
+multiple transfer calls, including a nonzero explicit output offset,
+implicit input advancement, EOF, and the destination size. The staged
+bundle built and the combined suite passed on native Linux. The current
+memfd backing is a single allocation shared with memory mappings and the
+compositor, so releasing individual pages requires a backing change.
+
+The combined runner now prints both results even after an ABI failure.
+The ELF logs each group it enters and summarizes assertion failures.
+Native verification covered both the successful run and a deliberately
+wrong ABI exit code, which returned acceptance status 1 while still
+running coreutils. The staged bundle was rebuilt.
+
+The combined suite covers the error for an unsupported system xattr
+and an empty user xattr suffix. The persistence phases pass a binary
+xattr with embedded zero bytes through a renamed symlink and hard-link
+alias. The combined suite and both persistence phases passed on native
+Linux, and the Ounce NRO rebuilt at the existing version.
+
+Filesystem sync now tracks dirty SD data by inode after the last
+descriptor closes. It resolves the current name after rename and flushes
+live unlinked files through their backing objects. The combined suite
+checks sync after close and rename, plus fsync on a read-only reopen.
+Native Linux passed and the NRO built. SD durability needs console data.
+
+### 0.12.29 console verification
+
+The combined suite passed on native Linux, including range sync through a
+read-only reopen. The 0.12.29 NRO and updated Debian bundle built.
+The user confirmed the combined acceptance run and both persistence
+phases passed on Switch 2, including the read after restarting the NRO.
+This verifies the cases exercised by the suite, including normal
+namespace updates, reserved space and logical EOF across relaunch.
+
+Full sign-off still requires sparse extents and hole punching, remaining
+allocation and transfer semantics, permission and xattr interactions,
+and interrupted SD recovery on hardware. Blocking-lock interruption
+and SIGPIPE depend on guest signal delivery. The combined suite needs
+coverage for these remaining cases before the milestone commit.
+
+Pipe capacity now accounts for occupied buffer pages. Reading part of
+a full page does not free a slot, and splice output uses nonmergeable
+buffers. The combined acceptance probe checks partial drain on a
+single-page pipe. The development NRO and staged suite built. Exact
+splice page boundaries, vmsplice pinning, signal delivery, credentials
+and sparse extents remain open.
+
+The combined probe now checks transfer page boundaries, live shared and
+private vmsplice pages, stack-backed buffers, and fork isolation while
+a parent page remains queued. The staged bundle built. The new fork
+case still requires runtime verification.
+
+The persistence probe now checks a punched trailing SD extent across
+reopen, including preserved EOF, zero reads and hole seeking. Both
+phases passed on native Linux. The updated Switch 2 persistence case
+and interior sparse extents remain open.
+
+The recovery diagnostic build enables `FEX_SWITCH2_RECOVERY_TEST`
+and leaves a native rename intent in place before or after the inode
+checkpoint. The same filesystem probe has write and read modes for
+each boundary. The staged `filesystem-recover-rollback-*.elf` and
+`filesystem-recover-commit-*.elf` entries select these modes. Restart
+between each write and read. This exercises startup recovery on SD
+with a controlled interruption. Physical power-loss ordering still
+requires hardware evidence.
+
+SD and memfd now share a hole-punch planner that separates whole
+blocks from partial blocks on either side. The host
+`check-guest-file-punch` target covers interior, tail, unaligned and
+out-of-range requests. The planner identifies the exact interior range
+to reclaim. Moving that range to reclaimable backing remains open.
+
+The inode snapshot can now record a replacement backing object
+independently of the guest inode number. The host codec test checks
+hard-link identity, fallback to the old generation after a torn
+snapshot, and rejection of a retirement record for a live backing.
+Startup reclaims retired objects only when both snapshots record
+their retirement. The next runtime step is to construct and publish
+replacement objects for interior punches.
+
+The snapshot codec now round-trips ordered logical extents for a packed
+backing object. Host tests verify that removing an interior extent
+preserves both sides, maps them to compact backing offsets, and rejects
+overlapping ranges. Packed reads now map allocated runs, fill holes
+with zeros, and serve the same logical view to ELF loading. Hole and
+data seeks use the extent table. The host tests cover reads across
+an interior hole, seeks and backing read errors. The development NRO
+built. Packed object creation, mutation and publication remain open.
+
+The packed extent copier now streams retained ranges into consecutive
+backing offsets with bounded scratch space and can apply changes to
+the retained bytes as it copies. The host test checks the exact
+compacted payload after an interior punch, along with stopping on an
+injected write error. The development NRO built. The copier still
+needs to be connected to SD object creation and checkpointing.
+The development NRO and six host checks passed. Native packaged
+acceptance returned ABI 42 and Debian coreutils 0.
+
+## Shelved graphics milestone
+
+The Wayland compositor bridge, native Vulkan probes, static Vulkan thunks
+and their hardware history (0.12.1–0.12.12) are on branch
+`shelf/graphics`. Resume after kernel coverage is complete, using FEX's
+native Vulkan layer. Steam Big Picture remains the long-term goal.
+
+## Backlog for future milestone selection
+
+2. **Desktop IPC foundation.** Fold the subset required by Wayland into
+   milestone 3. Keep broader descriptor, file-backed shared memory, and
+   event-loop compatibility here. Prove bidirectional shared writes
+   after the original descriptor closes.
+3. **Guest session manager.** Add preemption, signal delivery, background
+   jobs, and session teardown. Verify a CPU-bound background job can run
+   alongside Bash foreground commands and be stopped or killed.
+4. **Steam networking foundation.** Add guest IPv4 TCP/UDP, DNS, socket
+   options, and readiness handling. Verify stock Debian `curl` resolves a
+   hostname and completes an HTTPS download.
 
 ## Completed milestone — interactive Bash terminal
 

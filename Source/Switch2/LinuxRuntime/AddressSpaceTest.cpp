@@ -39,6 +39,30 @@ int main() {
   assert(Space.Set(Base + PageSize, PageSize, PF_R));
   assert(Space.Query(Base + PageSize).Flags == PF_R);
 
+  GuestAddressSpace Sender, Receiver;
+  auto Backing = std::shared_ptr<void> {std::aligned_alloc(PageSize, PageSize), &std::free};
+  assert(Backing);
+  const auto SharedFile = reinterpret_cast<uint64_t>(Backing.get());
+  assert(Sender.RegisterSharedFile(SharedFile, PageSize, PF_R | PF_W, Backing));
+  assert(Sender.HasWritableFileMapping(Backing));
+  assert(Sender.AllowsFileMappingWrite(SharedFile, PageSize));
+  assert(!Sender.RegisterSharedFile(SharedFile, PageSize, PF_R, Backing));
+  assert(Sender.Owns(SharedFile, PageSize) && !Sender.Owns(SharedFile, PageSize, true));
+  assert(Receiver.RegisterSharedFile(SharedFile, PageSize, PF_R, Backing, false));
+  assert(!Receiver.HasWritableFileMapping(Backing));
+  assert(!Receiver.AllowsFileMappingWrite(SharedFile, PageSize));
+  assert(Receiver.AllowsFileMappingWrite(SharedFile + PageSize, PageSize));
+  auto& SharedFileByte = *reinterpret_cast<char*>(SharedFile);
+  SharedFileByte = 'a';
+  assert(Sender.SavePrivatePages());
+  SharedFileByte = 'b';
+  Sender.RestorePrivatePages();
+  assert(SharedFileByte == 'b');
+  Backing.reset();
+  assert(Sender.Set(SharedFile, PageSize, Sender.Unmapped, true));
+  assert(Receiver.Query(SharedFile).Size == PageSize && SharedFileByte == 'b');
+  assert(Receiver.Set(SharedFile, PageSize, Receiver.Unmapped, true));
+
   GuestAddressSpace Parent;
   const auto PrivateVA = Parent.Allocate(PageSize, PF_R | PF_W);
   const auto SharedVA = Parent.Allocate(PageSize, PF_R | PF_W, true);

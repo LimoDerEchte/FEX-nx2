@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 #include "GuestRuntime.h"
 #include "GuestRootFS.h"
+#include "GuestFileExtents.h"
 #include "GuestLogBuffer.h"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Utils/LogManager.h>
+
+#include <arpa/inet.h>
 
 #include <algorithm>
 #include <array>
@@ -29,6 +32,9 @@ bool LogOpen {};
 bool LogWriteFailed {};
 bool BufferingGuestLog {};
 alignas(GuestPageSize) GuestLogBuffer<2 * 1024 * 1024> GuestLog;
+// Guest stdout and stderr lines, kept apart so a long trace cannot push the
+// program's own results out of the log.
+alignas(GuestPageSize) GuestLogBuffer<512 * 1024> GuestOutputLog;
 LogLevel Logging {};
 constexpr const char* LogLevelLabels[] {"Logging  Standard", "Logging  Detailed", "Logging  Trace"};
 bool GraphicsActive {};
@@ -41,6 +47,38 @@ Result EnsureDirectory(FsFileSystem& SdCard, const char* Path) {
 
   FsDirEntryType Type {};
   return R_SUCCEEDED(fsFsGetEntryType(&SdCard, Path, &Type)) && Type == FsDirEntryType_Dir ? 0 : Status;
+}
+
+// Launchers before 0.12.33 kept inode metadata as flat /fex/.inode-* entries.
+// Each entry is renamed into /fex/.inode before the guest runtime reads it.
+// A launch interrupted mid-way finishes the remaining entries next time.
+// Guest launches are refused while this is set, so the runtime never starts
+// from empty metadata while the real metadata sits at a legacy path.
+std::string InodeLayoutError;
+
+void MoveLegacyInodeFiles(FsFileSystem& SdCard) {
+  for (const auto& Move : Switch2Guest::InodeFiles::LegacyMoves) {
+    char Legacy[FS_MAX_PATH], Current[FS_MAX_PATH];
+    std::snprintf(Legacy, sizeof(Legacy), "%s", Move.Legacy);
+    std::snprintf(Current, sizeof(Current), "%s", Move.Current);
+    FsDirEntryType Type {};
+    if (R_FAILED(fsFsGetEntryType(&SdCard, Legacy, &Type))) continue;
+    FsDirEntryType Existing {};
+    Result Status = 0;
+    // Never overwrite metadata already in the new layout.
+    if (R_SUCCEEDED(fsFsGetEntryType(&SdCard, Current, &Existing))) {
+      InodeLayoutError = std::string("Inode metadata exists at both ") + Legacy + " and " + Current + ". Remove one.";
+      return;
+    }
+    Status = Type == FsDirEntryType_Dir ? fsFsRenameDirectory(&SdCard, Legacy, Current) :
+                                          fsFsRenameFile(&SdCard, Legacy, Current);
+    if (R_FAILED(Status)) {
+      char Message[160];
+      std::snprintf(Message, sizeof(Message), "Could not move %s to %s (0x%08x).", Legacy, Current, Status);
+      InodeLayoutError = Message;
+      return;
+    }
+  }
 }
 
 Result OpenLog() {
@@ -61,13 +99,14 @@ Result OpenLog() {
     }
   }
 
-  for (const char* Path : {"/fex", DefaultFolder, Switch2Guest::Root}) {
+  for (const char* Path : {"/fex", DefaultFolder, Switch2Guest::Root, Switch2Guest::InodeFiles::Directory}) {
     Status = EnsureDirectory(SdCard, Path);
     if (R_FAILED(Status)) {
       fsFsClose(&SdCard);
       return Status;
     }
   }
+  MoveLegacyInodeFiles(SdCard);
 
   constexpr u32 Mode = FsOpenMode_Write | FsOpenMode_Append;
   Status = fsFsOpenFile(&SdCard, LogPath, Mode, &LogFile);
@@ -123,6 +162,11 @@ void WriteLog(const char* Text) {
   if (WriteLogBytes({Line, Length + 1})) FlushLogFile();
 }
 
+void WriteGuestOutput(const char* Text) {
+  if (BufferingGuestLog) GuestOutputLog.Append(Text);
+  WriteLog(Text);
+}
+
 void WriteRunCheckpoint(const char* Text) {
   char Line[256];
   const auto Length = std::snprintf(Line, sizeof(Line), "%s\n", Text);
@@ -132,27 +176,45 @@ void WriteRunCheckpoint(const char* Text) {
 void BeginGuestLog() {
   WriteLog("Guest run started. Runtime trace is buffered.");
   GuestLog.Clear();
+  GuestOutputLog.Clear();
   BufferingGuestLog = true;
+}
+
+template<size_t Capacity>
+void WriteLogBuffer(const GuestLogBuffer<Capacity>& Buffer) {
+  for (auto Bytes : Buffer.Contents()) {
+    constexpr size_t MaxWrite = 64 * 1024;
+    while (!Bytes.empty()) {
+      const auto Count = std::min(Bytes.size(), MaxWrite);
+      if (!WriteLogBytes(Bytes.first(Count))) return;
+      Bytes = Bytes.subspan(Count);
+    }
+  }
 }
 
 void EndGuestLog() {
   if (!BufferingGuestLog) return;
   BufferingGuestLog = false;
-  if (const auto Dropped = GuestLog.DroppedLines()) {
+  const auto Dropped = GuestLog.DroppedLines();
+  if (Dropped) {
     char Message[96];
     const auto Length = std::snprintf(Message, sizeof(Message), "Guest log omitted %zu older lines.\n", Dropped);
     WriteLogBytes({Message, static_cast<size_t>(Length)});
   }
-  for (auto Bytes : GuestLog.Contents()) {
-    constexpr size_t MaxWrite = 64 * 1024;
-    while (!Bytes.empty()) {
-      const auto Count = std::min(Bytes.size(), MaxWrite);
-      if (!WriteLogBytes(Bytes.first(Count))) break;
-      Bytes = Bytes.subspan(Count);
-    }
+  WriteLogBuffer(GuestLog);
+  // The trimmed trace lost guest output lines; repeat the program output.
+  if (Dropped && !GuestOutputLog.Empty()) {
+    char Message[128];
+    const auto Length = std::snprintf(Message, sizeof(Message), "--- Guest output for this run (%zu older lines omitted) ---\n",
+                                      GuestOutputLog.DroppedLines());
+    WriteLogBytes({Message, static_cast<size_t>(Length)});
+    WriteLogBuffer(GuestOutputLog);
+    constexpr char End[] = "--- End of guest output ---\n";
+    WriteLogBytes({End, sizeof(End) - 1});
   }
   FlushLogFile();
   GuestLog.Clear();
+  GuestOutputLog.Clear();
 }
 
 // The guest deliberately uses no external loader, libraries, or filesystem.
@@ -182,7 +244,7 @@ void PrintStage(const char* Text) {
   }
 }
 
-const char* ReadElf(const char* Path, Switch2Guest::ElfImage& Image) {
+const char* ReadElf(const char* Path, Switch2Guest::ElfImage& Image, uint64_t Limit, const PackedFileExtents* Extents) {
   FsFileSystem SdCard {};
   if (R_FAILED(fsOpenSdCardFileSystem(&SdCard))) {
     return "Could not open the SD card.";
@@ -196,6 +258,8 @@ const char* ReadElf(const char* Path, Switch2Guest::ElfImage& Image) {
 
   s64 Size {};
   Status = fsFileGetSize(&File, &Size);
+  const auto PhysicalSize = Size;
+  if (Limit != UINT64_MAX) Size = std::min<uint64_t>(Limit, Switch2Guest::MaxElfSize + 1);
   if (R_FAILED(Status) || Size <= 0 || Size > Switch2Guest::MaxElfSize) {
     fsFileClose(&File);
     return "Invalid or unreadable ELF size.";
@@ -208,15 +272,30 @@ const char* ReadElf(const char* Path, Switch2Guest::ElfImage& Image) {
   }
   constexpr u64 ReadChunkSize = 64 * 1024;
   const auto FileSize = static_cast<u64>(Size);
-  for (u64 Offset = 0; Offset < FileSize;) {
-    const u64 Chunk = std::min(FileSize - Offset, ReadChunkSize);
-    u64 Read {};
-    Status = fsFileRead(&File, Offset, Bytes.get() + Offset, Chunk, FsReadOption_None, &Read);
-    if (R_FAILED(Status) || Read != Chunk) {
+  const auto DataSize = std::min<u64>(FileSize, PhysicalSize);
+  if (Extents) {
+    const auto Received = Extents->ReadBytes(0, {reinterpret_cast<char*>(Bytes.get()), static_cast<size_t>(Size)},
+      [&](uint64_t Position, std::span<char> Chunk) -> int64_t {
+        u64 Read {};
+        const auto Result = fsFileRead(&File, Position, Chunk.data(), Chunk.size(), FsReadOption_None, &Read);
+        return R_FAILED(Result) ? -5 : static_cast<int64_t>(Read);
+      });
+    if (Received != Size) {
       fsFileClose(&File);
       return "Could not read the complete ELF.";
     }
-    Offset += Read;
+  } else {
+    for (u64 Offset = 0; Offset < DataSize;) {
+      const u64 Chunk = std::min(DataSize - Offset, ReadChunkSize);
+      u64 Read {};
+      Status = fsFileRead(&File, Offset, Bytes.get() + Offset, Chunk, FsReadOption_None, &Read);
+      if (R_FAILED(Status) || Read != Chunk) {
+        fsFileClose(&File);
+        return "Could not read the complete ELF.";
+      }
+      Offset += Read;
+    }
+    std::memset(Bytes.get() + DataSize, 0, FileSize - DataSize);
   }
   fsFileClose(&File);
 
@@ -251,6 +330,94 @@ std::string DisplayName(std::string Text) {
   return Text;
 }
 
+// Serves the guest root filesystem over FTP while this screen is open,
+// until B or + is pressed. Uses the guest's own file syscalls, so long
+// paths and metadata match what guest programs see. Any user name works;
+// the password shown on screen is the only credential.
+void RunFtpServer(PadState& Pad) {
+  // Set up like ftpd in OunceShell (kurumuz/ounceshell,
+  // switch2/third_party/ftpd/ftp.c): the address comes from nifm, the
+  // socket driver gets ftpd's buffer sizes, and the server listens on the
+  // console's own address, port 1337. 2121 and then a free port cover
+  // another server holding 1337.
+  uint16_t Port = 0;
+  std::string Address = "unknown";
+  std::string Problem;
+  std::unique_ptr<Switch2Guest::FtpFileSystem> Files;
+  u32 HostAddress = 0; // Network byte order, as nifm and in_addr hold it.
+  const bool Nifm = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
+  if (!Nifm || R_FAILED(nifmGetCurrentIpAddress(&HostAddress)) || !HostAddress) {
+    Problem = "The console is not connected to a network.";
+  } else {
+    const in_addr Host {HostAddress};
+    char Text[INET_ADDRSTRLEN] {};
+    if (inet_ntop(AF_INET, &Host, Text, sizeof(Text))) Address = Text;
+  }
+  constexpr u32 SocketBuffer = 65536;
+  static const SocketInitConfig SocketConfig = {
+    .tcp_tx_buf_size = 8 * SocketBuffer,
+    .tcp_rx_buf_size = 8 * SocketBuffer,
+    .tcp_tx_buf_max_size = 16 * SocketBuffer,
+    .tcp_rx_buf_max_size = 16 * SocketBuffer,
+    .udp_tx_buf_size = 0x2400,
+    .udp_rx_buf_size = 0xA500,
+    .sb_efficiency = 8,
+    .num_bsd_sessions = 3,
+    .bsd_service_type = BsdServiceType_User,
+  };
+  const bool Network = Problem.empty() && R_SUCCEEDED(socketInitialize(&SocketConfig));
+  if (Problem.empty() && !Network) Problem = "Could not start the network socket service.";
+  if (Problem.empty() && !InodeLayoutError.empty()) Problem = InodeLayoutError;
+  if (Problem.empty() && !(Files = Switch2Guest::OpenGuestFileSystem())) Problem = "Could not reserve transfer memory.";
+  char Password[8];
+  std::snprintf(Password, sizeof(Password), "%06u", static_cast<unsigned>(randomGet64() % 1000000));
+  std::optional<Switch2Guest::FtpServer> Server;
+  if (Problem.empty()) {
+    Server.emplace(*Files, Password);
+    Server->Trace = [](const std::string& Line) { WriteLog(Line.c_str()); };
+    int Error = 0;
+    for (const uint16_t Candidate : {uint16_t {1337}, uint16_t {2121}, uint16_t {0}}) {
+      Error = Server->Start(Candidate, HostAddress);
+      const auto Attempt = "FTP server " + Address + ":" + std::to_string(Candidate) + ": " +
+                           (Error ? std::string(Server->FailedCall) + " failed, " + std::strerror(-Error) : "listening");
+      WriteLog(Attempt.c_str());
+      if (!Error) break;
+    }
+    if (Error) Problem = std::string("Could not open a listening socket (") + Server->FailedCall + "): " + std::strerror(-Error);
+    else Port = Server->Port();
+  }
+  if (!Problem.empty()) WriteLog(("FTP server: " + Problem).c_str());
+  auto Draw = [&] {
+    consoleClear();
+    std::puts("FTP server\n");
+    if (!Problem.empty()) {
+      std::printf("%s\n", Problem.c_str());
+    } else {
+      std::printf("Address   ftp://%s:%u\n", Address.c_str(), Port);
+      std::puts("User      any name");
+      std::printf("Password  %s\n\n", Password);
+      std::puts("Serves the Linux root filesystem (/fex/rootfs) in passive");
+      std::puts("mode, including paths longer than the SD card can hold.");
+      std::puts("New files and folders belong to uid 1000.");
+      std::puts("The server runs only while this screen is open.\n");
+      std::printf("Status    %s\n", Server->Status().c_str());
+    }
+    std::puts("\nB Stop");
+    consoleUpdate(nullptr);
+  };
+  Draw();
+  while (appletMainLoop()) {
+    padUpdate(&Pad);
+    if (padGetButtonsDown(&Pad) & (HidNpadButton_B | HidNpadButton_Plus)) break;
+    if (Server ? Server->Step(50) : (svcSleepThread(50'000'000), false)) Draw();
+  }
+  Server.reset();
+  Files.reset(); // Saves the guest inode store.
+  if (Network) socketExit();
+  if (Nifm) nifmExit();
+  WriteLog("FTP server stopped.");
+}
+
 class Launcher {
 public:
   void LoadSettings() {
@@ -283,7 +450,8 @@ public:
       DrawItem(0, "Browse ELF files");
       DrawItem(1, "Browse Linux rootfs");
       DrawItem(2, "Bash shell");
-      DrawItem(3, "Settings");
+      DrawItem(3, "FTP server");
+      DrawItem(4, "Settings");
       if (!LastResult.empty()) {
         std::printf("\nLast run  %s\n", LastResult.c_str());
       }
@@ -349,12 +517,14 @@ public:
           SelectedFile = std::string {Switch2Guest::Root} + "/bin/bash";
           InspectSelectedElf();
           if (!LoadError) RunSelectedElf();
+        } else if (Selected == 3) {
+          FtpRequested = true;
         } else {
           Open(Screen::Settings);
         }
         return true;
       }
-      return Move(Buttons, 4);
+      return Move(Buttons, 5);
     case Screen::Browse:
       return UpdateBrowser(Buttons);
     case Screen::Details:
@@ -408,8 +578,12 @@ public:
     return false;
   }
 
+  // The FTP server runs its own loop from main, outside the menu.
+  bool TakeFtpRequest() { return std::exchange(FtpRequested, false); }
+
 private:
   enum class Screen { Home, Browse, Details, Settings, Diagnostics, Result };
+  bool FtpRequested {};
   static constexpr size_t VisibleRows = 12;
 
   static std::string ReadSavedFolder(FILE* File, const std::string& Fallback) {
@@ -465,7 +639,9 @@ private:
   void OpenFolder(std::string Target) {
     Open(Screen::Browse);
     Entries.clear();
-    if (R_FAILED(ReadDirectory(Target, Entries))) {
+    const auto Listing = Target == Root || Target.starts_with(std::string(Root) + "/") ?
+      ReadRootfsDirectory(Target, Entries) : ReadDirectory(Target, Entries);
+    if (R_FAILED(Listing)) {
       Entries.clear();
       if (Target != "/" && R_SUCCEEDED(ReadDirectory("/", Entries))) {
         Notice = "Folder unavailable. Showing the SD card root.";
@@ -546,14 +722,16 @@ private:
   void InspectSelectedElf() {
     Image = {};
     Interpreter = {};
-    LoadError = ReadElf(SelectedFile.c_str(), Image);
-    if (!LoadError && !Image.Interpreter.empty()) {
-      const auto Path = Switch2Guest::ResolvePath(Image.Interpreter, "/");
-      LoadError = Path ? ReadElf(Path->c_str(), Interpreter) : "Invalid interpreter path.";
-      if (!LoadError && !Interpreter.Interpreter.empty()) {
-        LoadError = "An ELF interpreter cannot have its own interpreter.";
+    if (SelectedFile.starts_with(std::string(Root) + "/")) {
+      LoadError = ReadRootfsElf(std::string_view(SelectedFile).substr(sizeof(Root) - 1), Image, Interpreter);
+    } else {
+      LoadError = ReadElf(SelectedFile.c_str(), Image);
+      if (!LoadError && !Image.Interpreter.empty()) {
+        const auto Path = Switch2Guest::ResolvePath(Image.Interpreter, "/");
+        LoadError = Path ? ReadElf(Path->c_str(), Interpreter) : "Invalid interpreter path.";
       }
     }
+    if (!LoadError && !Interpreter.Interpreter.empty()) LoadError = "An ELF interpreter cannot have its own interpreter.";
     Open(Screen::Details);
   }
 
@@ -583,6 +761,30 @@ private:
         return;
       }
     }
+    // An optional "<program>.user" file holds "uid gid" for the launch.
+    if (!InodeLayoutError.empty()) {
+      ShowElfResult(InodeLayoutError);
+      return;
+    }
+    std::optional<std::pair<uint32_t, uint32_t>> Credentials;
+    if (auto* File = ShellLaunch ? nullptr : std::fopen(("sdmc:" + SelectedFile + ".user").c_str(), "r")) {
+      unsigned long User {}, Group {};
+      char Extra {};
+      const bool Parsed = std::fscanf(File, "%lu %lu %c", &User, &Group, &Extra) == 2 && User < UINT32_MAX && Group < UINT32_MAX;
+      std::fclose(File);
+      if (!Parsed) {
+        ShowElfResult("Invalid user file. Use one line: uid gid.");
+        return;
+      }
+      Credentials.emplace(User, Group);
+      PrintStage(("Running as uid " + std::to_string(User) + ", gid " + std::to_string(Group)).c_str());
+    }
+    Switch2Guest::SetLaunchCredentials(Credentials);
+    auto* RecoveryMarker = ShellLaunch ? nullptr : std::fopen(("sdmc:" + SelectedFile + ".recovery-test").c_str(), "r");
+    const bool RecoveryTest = RecoveryMarker;
+    if (RecoveryMarker) std::fclose(RecoveryMarker);
+    if (RecoveryTest) PrintStage("Recovery test: the probe's journaled move will be interrupted.");
+    Switch2Guest::SetRecoveryTestLaunch(RecoveryTest);
     std::vector<Switch2Guest::Segment> Segments(Image.GetSegments().begin(), Image.GetSegments().end());
     const auto InterpreterSegments = Interpreter.GetSegments();
     Segments.insert(Segments.end(), InterpreterSegments.begin(), InterpreterSegments.end());
@@ -681,12 +883,13 @@ void __libnx_exception_handler(ThreadExceptionDump* Dump) {
 int main() {
   using namespace Switch2Guest;
   const Result LogStatus = OpenLog();
-  WriteLog("--- FEX Switch 2 launcher 0.11.5 started ---");
+  WriteLog("--- FEX Switch 2 launcher 0.12.40 started ---");
   WriteLog("Initializing console...");
   consoleInit(nullptr);
   if (R_FAILED(LogStatus)) {
     std::printf("Could not open SD log %s (0x%08x)\n", LogPath, LogStatus);
   }
+  if (!InodeLayoutError.empty()) PrintStage(InodeLayoutError.c_str());
   WriteLog("Initializing FEXCore configuration...");
   FEXCore::Config::Initialize();
   LogMan::Msg::InstallHandler([](LogMan::DebugLevels Level, const char* Message) {
@@ -712,6 +915,7 @@ int main() {
       break;
     }
     if (Menu.Update(Buttons)) {
+      if (Menu.TakeFtpRequest()) RunFtpServer(Pad);
       Menu.Draw();
     }
     consoleUpdate(nullptr);

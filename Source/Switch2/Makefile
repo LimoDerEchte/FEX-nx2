@@ -193,13 +193,18 @@ $(BUILD)/glibc-probe-baseline.elf: $(BUILD)/glibc-probe-baseline.o $(STOCK_CRT_D
 	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(STOCK_LIB_DIR)" \
 		"$(STOCK_CRT_DIR)/Scrt1.o" "$(STOCK_CRT_DIR)/crti.o" $< "$(STOCK_LIB_DIR)/libc.so.6" "$(STOCK_CRT_DIR)/crtn.o" -o $@
 
-check-guest-memory: $(BUILD)/guest-address-space-test
-	$<
+check-guest-memory: $(BUILD)/guest-address-space-test $(BUILD)/guest-memory-file-test
+	$(BUILD)/guest-address-space-test
+	$(BUILD)/guest-memory-file-test
+
+$(BUILD)/guest-memory-file-test: LinuxRuntime/GuestMemoryFileTest.cpp GuestMemoryFile.h GuestFilePunch.h GuestAddressSpace.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
 
 $(BUILD)/guest-address-space-test: LinuxRuntime/AddressSpaceTest.cpp GuestAddressSpace.h GuestElf.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
 
-DEBIAN_ROOT ?=
+# Populate with `make debian-sysroot` (Debian 12 amd64 packages).
+DEBIAN_ROOT ?= $(abspath $(BUILD)/debian-sysroot)
 DEBIAN_TEST_DIR ?= $(BUILD)/debian-runtime
 DEBIAN_LIBS = $(DEBIAN_ROOT)/lib/x86_64-linux-gnu
 DEBIAN_CRT = $(DEBIAN_ROOT)/usr/lib/x86_64-linux-gnu
@@ -208,7 +213,47 @@ DEBIAN_CRT = $(DEBIAN_ROOT)/usr/lib/x86_64-linux-gnu
 debian-runtime: $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf
 	python3 LinuxRuntime/StageDebian.py "$(DEBIAN_ROOT)" "$(DEBIAN_TEST_DIR)" $^
 
-$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
+.PHONY: debian-sysroot
+debian-sysroot:
+	python3 -I LinuxRuntime/FetchDebian.py "$(DEBIAN_ROOT)"
+
+FILESYSTEM_TEST_DIR ?= $(BUILD)/guest/sd
+.PHONY: filesystem-runtime
+filesystem-runtime: $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf
+	python3 LinuxRuntime/StageDebian.py "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 1,3,$^) --filesystem-probe $(word 4,$^) --fs-suite $(word 5,$^) --name-limit-probe $(word 6,$^)
+
+# Filesystem compatibility suite: the Debian guest ELF and a native reference
+# run on the host kernel, as the current user and, where user namespaces
+# with subordinate IDs are available, as namespace root.
+.PHONY: fs-suite check-fs-suite-native
+fs-suite: $(BUILD)/fs-suite-debian.elf
+
+$(BUILD)/fs-suite.o: LinuxRuntime/FsSuite.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+# Measures the backing filesystem's name and path length limits.
+$(BUILD)/name-limit.o: LinuxRuntime/NameLimitProbe.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/fs-suite-host: LinuxRuntime/FsSuite.c | $(BUILD)
+	$(HOST_X86_CC) -std=gnu11 -O2 -Wall -Wextra -Werror $< -o $@
+
+check-fs-suite-native: $(BUILD)/fs-suite-host
+	mkdir -p $(BUILD)/fs-suite-native
+	cd $(BUILD)/fs-suite-native && { ../fs-suite-host; test $$? -eq 42; }
+	if unshare --map-root-user --map-auto true 2>/dev/null; then \
+		cd $(BUILD)/fs-suite-native && { unshare --map-root-user --map-auto ../fs-suite-host; test $$? -eq 42; }; \
+	else \
+		echo "Skipping the namespace-root run: unshare --map-auto is unavailable"; \
+	fi
+
+.PHONY: filesystem-probe
+filesystem-probe: $(BUILD)/filesystem-probe-debian.elf
+
+$(BUILD)/filesystem-probe.o: LinuxRuntime/FilesystemProbe.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
 	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(DEBIAN_LIBS)" \
 		"$(DEBIAN_CRT)/Scrt1.o" "$(DEBIAN_CRT)/crti.o" $< "$(DEBIAN_LIBS)/libc.so.6" "$(DEBIAN_CRT)/crtn.o" -o $@
 
@@ -233,4 +278,32 @@ check-guest-terminal: $(BUILD)/guest-terminal-test
 	$<
 
 $(BUILD)/guest-terminal-test: LinuxRuntime/GuestTerminalTest.cpp GuestTerminal.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-ftp
+check-guest-ftp: $(BUILD)/ftp-server-host
+	python3 LinuxRuntime/FtpTest.py --server $<
+
+$(BUILD)/ftp-server-host: LinuxRuntime/FtpServerHost.cpp GuestFtp.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-inode-store
+check-guest-inode-store: $(BUILD)/guest-inode-store-test
+	$<
+
+$(BUILD)/guest-inode-store-test: LinuxRuntime/GuestInodeStoreTest.cpp GuestInodeStore.h GuestFileExtents.h GuestPosixAcl.h GuestDirectoryRecovery.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-file-write
+check-guest-file-write: $(BUILD)/guest-file-write-test
+	$<
+
+$(BUILD)/guest-file-write-test: LinuxRuntime/GuestFileWriteTest.cpp GuestFileWrite.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-file-punch
+check-guest-file-punch: $(BUILD)/guest-file-punch-test
+	$<
+
+$(BUILD)/guest-file-punch-test: LinuxRuntime/GuestFilePunchTest.cpp GuestFilePunch.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@

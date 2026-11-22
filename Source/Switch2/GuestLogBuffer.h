@@ -37,6 +37,7 @@ public:
   }
 
   size_t DroppedLines() const { return Dropped; }
+  bool Empty() const { return !Used; }
 
   void Clear() { Head = Used = Dropped = 0; }
 

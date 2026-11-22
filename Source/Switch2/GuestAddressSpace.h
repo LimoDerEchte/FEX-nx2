@@ -43,9 +43,49 @@ public:
     return Address;
   }
 
-  bool Owns(uint64_t Start, size_t Size) const {
+  bool RegisterSharedFile(uint64_t Start, size_t Size, uint8_t Flags, std::shared_ptr<void> Storage, bool MayWrite = true) {
+    if (!Storage || !Size || Start % PageSize || Size % PageSize || Size > UINT64_MAX - Start ||
+        Size > MaxTotal - OwnedBytes) return false;
     for (const auto& Region : Regions) {
-      if (Region.Storage && Region.Contains(Start, Size)) {
+      if (Start < Region.Base + Region.Size && Region.Base < Start + Size) return false;
+    }
+    Regions.emplace_back(Start, Size, Flags);
+    Regions.back().Storage = std::move(Storage);
+    Regions.back().Shared = true;
+    Regions.back().FileBacked = true;
+    Regions.back().MayWrite = MayWrite;
+    OwnedBytes += Size;
+    return true;
+  }
+
+  bool HasWritableFileMapping(const std::shared_ptr<void>& Storage) const {
+    return std::any_of(Regions.begin(), Regions.end(), [&](const auto& Region) {
+      return Region.FileBacked && Region.MayWrite && Region.Storage == Storage;
+    });
+  }
+
+  bool AllowsFileMappingWrite(uint64_t Start, size_t Size) const {
+    return std::none_of(Regions.begin(), Regions.end(), [&](const auto& Region) {
+      return Region.FileBacked && !Region.MayWrite && Start < Region.Base + Region.Size && Region.Base < Start + Size;
+    });
+  }
+
+  // Registered stack and ELF pages are owned by the process image. The
+  // process detaches their pipe references before releasing that image.
+  std::shared_ptr<const uint8_t> RetainPage(uint64_t Address, size_t Size, bool& Shared) const {
+    if (!Size || Size > PageSize - Address % PageSize) return {};
+    for (auto It = Regions.rbegin(); It != Regions.rend(); ++It) {
+      if (!It->Contains(Address, Size)) continue;
+      if (It->Pages[(Address - It->Base) / PageSize] == Unmapped) return {};
+      Shared = It->Shared;
+      return {It->Storage, reinterpret_cast<const uint8_t*>(Address)};
+    }
+    return {};
+  }
+
+  bool Owns(uint64_t Start, size_t Size, bool ForOverlay = false) const {
+    for (const auto& Region : Regions) {
+      if (Region.Storage && (!ForOverlay || !Region.FileBacked) && Region.Contains(Start, Size)) {
         return true;
       }
     }
@@ -164,6 +204,8 @@ private:
     std::vector<uint8_t> Pages;
     std::shared_ptr<void> Storage;
     bool Shared {};
+    bool FileBacked {};
+    bool MayWrite {};
   };
   struct SavedRange {
     uint64_t Start;

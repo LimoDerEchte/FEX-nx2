@@ -46,6 +46,22 @@ to select, B to go back, and Plus to exit. If only the old `/switch/fex` folder 
 `/fex/games`. The browser defaults to that folder and remembers the
 last folder while the launcher is open.
 
+**FTP server** serves the guest root filesystem in passive mode while
+its screen is open; B stops it. Like OunceShell's ftpd, it takes the
+console's address from nifm and listens on that address (Horizon refuses
+`INADDR_ANY` listeners) on port 1337, else 2121, else a free port; the
+screen shows which.
+The rootfs has no user database, so any user name is accepted and the
+six-digit password on screen is the only credential. Transfers act with
+root's access through the same file syscalls as guest programs, so paths
+longer than the SD card can hold (see below) work; new files and folders
+are owned by uid 1000, the default owner of files copied to the SD card. It supports RETR, STOR,
+APPE, REST, LIST, NLST, MLSD, MLST, SIZE, MDTM, MFMT, MKD, RMD, DELE and
+RNFR/RNTO. `make -C Source/Switch2 check-guest-ftp` runs the protocol
+test against a host build; `LinuxRuntime/FtpTest.py <address> <port>
+<password> 1000` runs the same test against the console and checks that
+new entries belong to uid 1000.
+
 **Settings** lets you select the starting folder and choose standard or
 detailed logging, or Trace for syscall and JIT compilation checkpoints. Settings are saved to `/fex/fex-switch2.cfg`. Diagnostics
 offers the embedded x86-64 guest and the ARM64 JIT publication probe.
@@ -68,7 +84,7 @@ The launcher appends checkpoints and FEXCore messages to
 in memory and writes it in batches when the guest returns. The native
 exception handler also attempts to save this buffer if Horizon calls it.
 If the software closes, inspect the latest section beginning with
-`--- FEX Switch 2 launcher 0.11.5 started ---`. A crash before `main()` or
+`--- FEX Switch 2 launcher 0.12.32 started ---`. A crash before `main()` or
 failure to open the SD card can leave the file unchanged.
 
 ## SD Maze
@@ -182,6 +198,50 @@ Bash for external commands. Test with `ls -la /bin` and `exit 42`. The
 new `process-probe.elf` checks private/shared fork mappings, inherited
 pipes, close-on-exec, and exit status. General signal delivery and job
 control remain open.
+
+## Filesystem compatibility suite
+
+`LinuxRuntime/FsSuite.c` checks common behavior and edge cases for
+descriptors and I/O, paths and links, metadata and permissions, allocation
+and transfer, and extended attributes. Each test runs in its own scratch
+directory and prints a TAP line; failures name the source line, result and
+errno. The suite exits 42 when nothing fails.
+
+```sh
+make -C Source/Switch2 debian-sysroot        # Debian 12 packages into build/debian-sysroot
+make -C Source/Switch2 check-fs-suite-native # host kernel reference, as you and as namespace root
+make -C Source/Switch2 filesystem-runtime   # stages the SD bundle in build/guest/sd
+Source/Switch2/LinuxRuntime/RunPackagedNative.sh Source/Switch2/build/guest/sd/fex/rootfs [--root] /bin/fs-suite.elf
+```
+
+Pass name prefixes to select tests (`io/`, `path/rename`) or `!prefix` to
+exclude them, and `-l` to list them. The bundle stages `/bin/fs-suite.elf`
+(default user) and `/bin/fs-suite-root.elf`, which runs as root through
+the launcher's credential file so cross-identity cases execute.
+`/bin/filesystem-acceptance.elf` runs the ABI probe, coreutils and the
+suite together.
+
+A `<program>.user` file next to an ELF holds `uid gid` for its launch,
+like starting the program from a root shell. Without it, guests run as
+uid 1000. An empty `<program>.recovery-test` file lets that launch
+interrupt the recovery probe's journaled move into `/.fex-recovery-test`,
+so the next launch must roll it back or forward; the bundle stages it for
+the two `filesystem-recover-*-write.elf` probes.
+
+Guest inode metadata (ownership, modes, links, xattrs) and its recovery
+journal live in `/fex/.inode/`. Horizon limits a whole SD path to 257
+bytes, so entries whose path is longer, and everything below them, are
+kept there as well: directories as overflow records and files as objects
+in `/fex/.inode/objects`. They do not appear under `/fex/rootfs` on the
+SD card; use the FTP server to copy them. Launchers before 0.12.33 kept them as
+`/fex/.inode-*`; the launcher moves those on startup and refuses to run
+guests if an entry exists in both places.
+
+## Graphics (shelved)
+
+The Wayland compositor bridge and Vulkan probes are shelved on branch
+`shelf/graphics` until kernel syscall coverage is complete. Resume them
+there using FEX's native Vulkan layer.
 
 ## JIT diagnostics
 

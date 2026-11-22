@@ -15,3 +15,4 @@
 #define FEX_NX2_LEFT 4
 #define FEX_NX2_RIGHT 8
 #define FEX_NX2_QUIT 16
+#define FEX_NX2_A 32

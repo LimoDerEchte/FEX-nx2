@@ -13,7 +13,8 @@ def elf_info(path, *options):
     return subprocess.check_output(["readelf", *options, path], text=True)
 
 
-def stage(source, output, probe, glibc_probe, process_probe):
+def stage(source, output, probe, glibc_probe, process_probe, filesystem_probe=None, fs_suite=None,
+          name_limit_probe=None):
     root = output / "fex/rootfs"
     library_dirs = ["lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu"]
     installed = set()
@@ -65,6 +66,57 @@ def stage(source, output, probe, glibc_probe, process_probe):
     )
 
 
+    if filesystem_probe:
+        tools = ("cat", "chmod", "cp", "df", "ln", "ls", "mkdir", "mktemp", "mv", "readlink", "rm", "stat", "touch")
+        for executable in tools:
+            candidates = (source / "bin" / executable, source / "usr/bin" / executable)
+            file = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+            install(file, root / "bin" / executable)
+
+        for name, arguments in (
+            ("filesystem-probe.elf", None),
+            ("filesystem-persist-write.elf", "--persist-write\n/.fex-persistence-01231\n"),
+            ("filesystem-persist-read.elf", "--persist-read\n/.fex-persistence-01231\n"),
+        ):
+            install(filesystem_probe, root / "bin" / name)
+            if arguments:
+                (root / "bin" / (name + ".args")).write_text(arguments, encoding="utf-8")
+
+        for phase, label in (("before-checkpoint", "rollback"), ("after-checkpoint", "commit")):
+            for action in ("write", "read"):
+                name = f"filesystem-recover-{label}-{action}.elf"
+                install(filesystem_probe, root / "bin" / name)
+                (root / "bin" / (name + ".args")).write_text(
+                    f"--recover-{action}\n{phase}\n", encoding="utf-8"
+                )
+                if action == "write":
+                    # Opts the launch into the interrupted journal move.
+                    (root / "bin" / (name + ".recovery-test")).write_text("", encoding="utf-8")
+
+        install(source / "bin/bash", root / "bin/filesystem-coreutils.elf")
+        script = Path(__file__).with_name("CoreutilsFilesystemProbe.sh")
+        shutil.copyfile(script, root / "bin/filesystem-coreutils.sh")
+        (root / "bin/filesystem-coreutils.elf.args").write_text(
+            "--noprofile\n--norc\n/bin/filesystem-coreutils.sh\n", encoding="utf-8"
+        )
+        install(source / "bin/bash", root / "bin/filesystem-acceptance.elf")
+        acceptance = "--noprofile\n--norc\n/bin/filesystem-coreutils.sh\n/bin/filesystem-probe.elf\n"
+        if fs_suite:
+            acceptance += "/bin/fs-suite.elf\n"
+        (root / "bin/filesystem-acceptance.elf.args").write_text(acceptance, encoding="utf-8")
+
+    if fs_suite:
+        # The suite runs as the default user and, through the launcher's
+        # credential file, as root so cross-identity cases execute.
+        install(fs_suite, root / "bin/fs-suite.elf")
+        install(fs_suite, root / "bin/fs-suite-root.elf")
+        (root / "bin/fs-suite-root.elf.user").write_text("0 0\n", encoding="utf-8")
+
+    if name_limit_probe:
+        install(name_limit_probe, root / "bin/name-limit-probe.elf")
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="Directory containing the unpacked Debian packages")
@@ -72,5 +124,14 @@ if __name__ == "__main__":
     parser.add_argument("probe", type=Path)
     parser.add_argument("glibc_probe", type=Path)
     parser.add_argument("process_probe", type=Path)
+    parser.add_argument("--filesystem-probe", type=Path, help="Include filesystem and coreutils tests")
+    parser.add_argument("--fs-suite", type=Path, help="Include the filesystem compatibility suite")
+    parser.add_argument("--name-limit-probe", type=Path, help="Include the name length probe")
     args = parser.parse_args()
-    stage(args.source.resolve(), args.output.resolve(), args.probe.resolve(), args.glibc_probe.resolve(), args.process_probe.resolve())
+    stage(
+        args.source.resolve(), args.output.resolve(), args.probe.resolve(),
+        args.glibc_probe.resolve(), args.process_probe.resolve(),
+        args.filesystem_probe.resolve() if args.filesystem_probe else None,
+        args.fs_suite.resolve() if args.fs_suite else None,
+        args.name_limit_probe.resolve() if args.name_limit_probe else None,
+    )
