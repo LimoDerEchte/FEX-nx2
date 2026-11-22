@@ -20,7 +20,18 @@ Do not take shortcuts that fake Linux behavior or bypass the requested path.
 Implement the required semantics, verify them through the normal entry point,
 and explicitly track any incomplete compatibility work.
 
-Use `Source/Switch2/NextMilestone.md` as the durable handoff for the active
-Switch 2 milestone. Read it after compaction or resuming the project. Update it
-when the milestone or its hardware verification changes. Work on the `nx2`
-branch and group commits at completed milestone boundaries.
+## Switch 2 milestone handoff
+
+Work on `nx2` and group commits at completed milestone boundaries. Start
+or resume milestone work from the [restart checkpoint](Source/Switch2/NextMilestone.md#restart-checkpoint)
+and check the branch and worktree with `git status --short --branch`.
+Inspect the relevant diffs and untracked source before editing. Preserve
+in-progress changes from the user and other milestones.
+
+For a new milestone, record the outcome and observable acceptance checks in
+`Source/Switch2/NextMilestone.md`. Refresh its restart checkpoint after each
+verified slice and whenever the next step, blocker, or hardware evidence
+changes. Include the remaining work, exact verification commands and observed
+results, and matching console artifact paths when relevant. Keep decisions
+that affect the next step in the handoff so a fresh session can resume from
+the checkout alone. Continue only when asked if work is paused.

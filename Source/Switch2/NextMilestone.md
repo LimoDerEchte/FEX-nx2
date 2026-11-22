@@ -1,5 +1,10 @@
 # Switch 2 milestone handoff
 
+## Restart checkpoint
+
+No next milestone is selected at this baseline. When starting one, record
+the outcome, acceptance checks, next step, and verification here.
+
 Interactive Bash 0.11.5 passed on Switch 2. The user confirmed the
 result screen, repeat launches in the same NRO, and consecutive external
 commands in one shell. The next milestone is pending selection.

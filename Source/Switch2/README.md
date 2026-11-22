@@ -1,5 +1,26 @@
 # FEX on Switch 2
 
+## Continue a milestone in Codex or Claude Code
+
+Open the other tool from the same repository root and worktree after the
+first agent stops. Both use [AGENTS.md](../../AGENTS.md) for shared project
+guidance. Claude Code imports it through [CLAUDE.md](../../CLAUDE.md).
+The worktree contains the edits and the
+[restart checkpoint](NextMilestone.md#restart-checkpoint) tracks what to do
+next. Keep that checkpoint current during implementation so it is available
+even when a usage limit interrupts the session.
+
+When you're ready to resume, use the same prompt in either tool.
+
+> Resume the Switch 2 milestone from the restart checkpoint in
+> Source/Switch2/NextMilestone.md. Check the branch and worktree, preserve
+> existing edits, and continue the next open step.
+
+If you switch machines, transfer the in-progress source changes, including
+untracked sources, and the handoff together. Rebuild local artifacts under
+`Source/Switch2/build/` as needed. Use the recorded diagnostic pair for a
+pending console run.
+
 ## x86-64 guest probe
 
 Build with Clang, devkitA64, libounce, and kaiHEN. Initialize the dependencies
