@@ -32,9 +32,6 @@ bool LogOpen {};
 bool LogWriteFailed {};
 bool BufferingGuestLog {};
 alignas(GuestPageSize) GuestLogBuffer<2 * 1024 * 1024> GuestLog;
-// Guest stdout and stderr lines, kept apart so a long trace cannot push the
-// program's own results out of the log.
-alignas(GuestPageSize) GuestLogBuffer<512 * 1024> GuestOutputLog;
 LogLevel Logging {};
 constexpr const char* LogLevelLabels[] {"Logging  Standard", "Logging  Detailed", "Logging  Trace"};
 bool GraphicsActive {};
@@ -163,7 +160,14 @@ void WriteLog(const char* Text) {
 }
 
 void WriteGuestOutput(const char* Text) {
-  if (BufferingGuestLog) GuestOutputLog.Append(Text);
+  if (BufferingGuestLog && LogOpen && !LogWriteFailed) {
+    // Program output goes to the file at once, marked "[out]", so it
+    // survives a launcher crash that loses the buffered trace.
+    constexpr size_t MaxLine = 1023;
+    char Line[MaxLine + 8];
+    const auto Length = std::snprintf(Line, sizeof(Line), "[out] %.*s\n", static_cast<int>(MaxLine), Text);
+    if (Length > 0 && WriteLogBytes({Line, std::min<size_t>(Length, sizeof(Line) - 1)})) FlushLogFile();
+  }
   WriteLog(Text);
 }
 
@@ -176,7 +180,6 @@ void WriteRunCheckpoint(const char* Text) {
 void BeginGuestLog() {
   WriteLog("Guest run started. Runtime trace is buffered.");
   GuestLog.Clear();
-  GuestOutputLog.Clear();
   BufferingGuestLog = true;
 }
 
@@ -202,19 +205,8 @@ void EndGuestLog() {
     WriteLogBytes({Message, static_cast<size_t>(Length)});
   }
   WriteLogBuffer(GuestLog);
-  // The trimmed trace lost guest output lines; repeat the program output.
-  if (Dropped && !GuestOutputLog.Empty()) {
-    char Message[128];
-    const auto Length = std::snprintf(Message, sizeof(Message), "--- Guest output for this run (%zu older lines omitted) ---\n",
-                                      GuestOutputLog.DroppedLines());
-    WriteLogBytes({Message, static_cast<size_t>(Length)});
-    WriteLogBuffer(GuestOutputLog);
-    constexpr char End[] = "--- End of guest output ---\n";
-    WriteLogBytes({End, sizeof(End) - 1});
-  }
   FlushLogFile();
   GuestLog.Clear();
-  GuestOutputLog.Clear();
 }
 
 // The guest deliberately uses no external loader, libraries, or filesystem.
@@ -242,6 +234,37 @@ void PrintStage(const char* Text) {
     std::puts(Text);
     consoleUpdate(nullptr);
   }
+}
+
+int64_t ReadFileHead(const char* Path, std::span<char> Buffer, uint64_t Size, const PackedFileExtents* Extents) {
+  FsFileSystem SdCard {};
+  if (R_FAILED(fsOpenSdCardFileSystem(&SdCard))) return -5;
+  FsFile File {};
+  const Result Status = fsFsOpenFile(&SdCard, Path, FsOpenMode_Read, &File);
+  fsFsClose(&SdCard);
+  if (R_FAILED(Status)) return -5;
+  const auto Wanted = static_cast<size_t>(std::min<uint64_t>(Size, Buffer.size()));
+  const auto Read = [&](uint64_t Position, std::span<char> Chunk) -> int64_t {
+    u64 Count {};
+    const auto Result = fsFileRead(&File, Position, Chunk.data(), Chunk.size(), FsReadOption_None, &Count);
+    return R_FAILED(Result) ? -5 : static_cast<int64_t>(Count);
+  };
+  int64_t Received {};
+  if (Extents) {
+    Received = Extents->ReadBytes(0, Buffer.first(Wanted), Read);
+  } else {
+    // Bytes past the stored data of a file extended by truncate read as zeros.
+    s64 Physical {};
+    if (R_FAILED(fsFileGetSize(&File, &Physical))) Physical = 0;
+    const auto Stored = std::min<size_t>(Wanted, static_cast<size_t>(std::max<s64>(Physical, 0)));
+    Received = Stored ? Read(0, Buffer.first(Stored)) : 0;
+    if (Received == static_cast<int64_t>(Stored)) {
+      std::memset(Buffer.data() + Stored, 0, Wanted - Stored);
+      Received = Wanted;
+    }
+  }
+  fsFileClose(&File);
+  return Received < 0 ? Received : Received == static_cast<int64_t>(Wanted) ? Received : -5;
 }
 
 const char* ReadElf(const char* Path, Switch2Guest::ElfImage& Image, uint64_t Limit, const PackedFileExtents* Extents) {
@@ -450,8 +473,10 @@ public:
       DrawItem(0, "Browse ELF files");
       DrawItem(1, "Browse Linux rootfs");
       DrawItem(2, "Bash shell");
-      DrawItem(3, "FTP server");
-      DrawItem(4, "Settings");
+      DrawItem(3, "Root shell");
+      DrawItem(4, "FTP server");
+      DrawItem(5, "Setup Debian rootfs");
+      DrawItem(6, "Settings");
       if (!LastResult.empty()) {
         std::printf("\nLast run  %s\n", LastResult.c_str());
       }
@@ -475,7 +500,7 @@ public:
       break;
     }
     case Screen::Details:
-      std::printf("%s\n\n%s\n\n", ShellLaunch ? "Bash shell" : "Launch ELF", DisplayName(SelectedFile).c_str());
+      std::printf("%s\n\n%s\n\n", ShellLaunch ? (RootShell ? "Root shell" : "Bash shell") : "Launch ELF", DisplayName(SelectedFile).c_str());
       std::puts(LoadError ? LoadError : Image.Interpreter.empty() ? "x86-64 Linux static PIE" : "x86-64 Linux PIE with an ELF interpreter");
       if (ShellLaunch && !LoadError) std::puts("USB keyboard   L Stick + R Stick  On-screen input");
       std::puts(LoadError ? "\nB Back" : "\nA Run    X Run single-block    B Back");
@@ -512,19 +537,24 @@ public:
           OpenFolder(LastFolder.empty() ? StartFolder : LastFolder);
         } else if (Selected == 1) {
           OpenFolder(Switch2Guest::Root);
-        } else if (Selected == 2) {
+        } else if (Selected == 2 || Selected == 3) {
           ShellLaunch = true;
+          // The console has one user; the root shell logs in as uid 0, as a
+          // root login would, for administration such as dpkg.
+          RootShell = Selected == 3;
           SelectedFile = std::string {Switch2Guest::Root} + "/bin/bash";
           InspectSelectedElf();
           if (!LoadError) RunSelectedElf();
-        } else if (Selected == 3) {
+        } else if (Selected == 4) {
           FtpRequested = true;
+        } else if (Selected == 5) {
+          RootfsRequested = true;
         } else {
           Open(Screen::Settings);
         }
         return true;
       }
-      return Move(Buttons, 5);
+      return Move(Buttons, 7);
     case Screen::Browse:
       return UpdateBrowser(Buttons);
     case Screen::Details:
@@ -580,10 +610,13 @@ public:
 
   // The FTP server runs its own loop from main, outside the menu.
   bool TakeFtpRequest() { return std::exchange(FtpRequested, false); }
+  bool TakeRootfsRequest() { return std::exchange(RootfsRequested, false); }
 
 private:
   enum class Screen { Home, Browse, Details, Settings, Diagnostics, Result };
   bool FtpRequested {};
+  bool RootShell {};
+  bool RootfsRequested {};
   static constexpr size_t VisibleRows = 12;
 
   static std::string ReadSavedFolder(FILE* File, const std::string& Fallback) {
@@ -767,6 +800,10 @@ private:
       return;
     }
     std::optional<std::pair<uint32_t, uint32_t>> Credentials;
+    if (ShellLaunch && RootShell) {
+      Credentials.emplace(0, 0);
+      PrintStage("Running as uid 0, gid 0");
+    }
     if (auto* File = ShellLaunch ? nullptr : std::fopen(("sdmc:" + SelectedFile + ".user").c_str(), "r")) {
       unsigned long User {}, Group {};
       char Extra {};
@@ -883,7 +920,7 @@ void __libnx_exception_handler(ThreadExceptionDump* Dump) {
 int main() {
   using namespace Switch2Guest;
   const Result LogStatus = OpenLog();
-  WriteLog("--- FEX Switch 2 launcher 0.12.40 started ---");
+  WriteLog("--- FEX Switch 2 launcher 0.13.18 started ---");
   WriteLog("Initializing console...");
   consoleInit(nullptr);
   if (R_FAILED(LogStatus)) {
@@ -916,6 +953,7 @@ int main() {
     }
     if (Menu.Update(Buttons)) {
       if (Menu.TakeFtpRequest()) RunFtpServer(Pad);
+      if (Menu.TakeRootfsRequest()) Switch2Guest::RunRootfsSetup(Pad, InodeLayoutError);
       Menu.Draw();
     }
     consoleUpdate(nullptr);

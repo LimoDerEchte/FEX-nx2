@@ -66,7 +66,15 @@ target_link_libraries(fex_switch2_host PRIVATE FEXCore_Base)
 # Use the devkit driver for its startup objects, newlib, libstdc++ and Switch specs.
 set(CMAKE_CXX_LINK_EXECUTABLE
   "${CMAKE_COMMAND} -E env DEVKITPRO=${DKP} ${DKP_CXX} ${DKP_CPU} -mtp=soft -fPIE -specs=${DKP}/libounce/switch.specs <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
-add_executable(fex-switch2-guest GuestProbe.cpp GuestRuntime.cpp GuestElf.cpp JitProbe.cpp)
+# XZ Embedded (0BSD) decodes Debian package members for the rootfs setup.
+set(XZ_EMBEDDED "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/xz-embedded")
+add_library(xz_embedded OBJECT "${XZ_EMBEDDED}/xz_crc32.c" "${XZ_EMBEDDED}/xz_crc64.c" "${XZ_EMBEDDED}/xz_sha256.c"
+  "${XZ_EMBEDDED}/xz_dec_stream.c" "${XZ_EMBEDDED}/xz_dec_lzma2.c" "${XZ_EMBEDDED}/xz_dec_bcj.c")
+target_include_directories(xz_embedded PRIVATE "${XZ_EMBEDDED}")
+target_compile_definitions(xz_embedded PUBLIC XZ_USE_CRC64 XZ_USE_SHA256 XZ_DEC_X86 XZ_DEC_CONCATENATED)
+add_executable(fex-switch2-guest GuestProbe.cpp GuestRuntime.cpp GuestElf.cpp JitProbe.cpp RootfsSetupHost.cpp
+  $<TARGET_OBJECTS:xz_embedded>)
+target_compile_definitions(fex-switch2-guest PRIVATE XZ_USE_CRC64 XZ_USE_SHA256 XZ_DEC_X86 XZ_DEC_CONCATENATED)
 target_compile_definitions(fex-switch2-guest PRIVATE FEX_SWITCH2_LAUNCHER=1)
 target_include_directories(fex-switch2-guest PRIVATE "${CMAKE_BINARY_DIR}/include")
 target_link_directories(fex-switch2-guest PRIVATE "${DKP}/portlibs/switch2/lib" "${DKP}/libounce/lib")
@@ -77,7 +85,7 @@ set(GUEST_NACP "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nacp")
 set(GUEST_NRO "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nro")
 set(GUEST_ICON "${CMAKE_CURRENT_SOURCE_DIR}/FexIcon.jpg")
 add_custom_command(OUTPUT "${GUEST_NACP}"
-  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Team, Limo (nx2)" "0.12.40" "${GUEST_NACP}"
+  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Team, Limo (nx2)" "0.13.18" "${GUEST_NACP}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   VERBATIM)
 add_custom_command(OUTPUT "${GUEST_NRO}"

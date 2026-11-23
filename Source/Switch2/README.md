@@ -221,6 +221,19 @@ the launcher's credential file so cross-identity cases execute.
 `/bin/filesystem-acceptance.elf` runs the ABI probe, coreutils and the
 suite together.
 
+`LinuxRuntime/ProcSuite.c` is the process and event suite of milestone 2
+(groups `proc/`, `signal/`, `session/`, `cred/`, `clock/`, `timer/`,
+`event/`, `poll/`, `epoll/`, `inotify/`), with the same selection options
+and exit code. `/bin/process-acceptance.elf` runs it, then
+`/bin/process-tools.sh` (pipelines, `timeout`, `kill`, traps, jobs and
+`inotifywait` from Debian), and prints `suite 42, tools 42` on success;
+`/bin/proc-suite-root.elf` runs the suite as root.
+
+```sh
+make -C Source/Switch2 check-proc-suite-native
+Source/Switch2/LinuxRuntime/RunPackagedNative.sh Source/Switch2/build/guest/sd/fex/rootfs /bin/process-acceptance.elf
+```
+
 A `<program>.user` file next to an ELF holds `uid gid` for its launch,
 like starting the program from a root shell. Without it, guests run as
 uid 1000. An empty `<program>.recovery-test` file lets that launch

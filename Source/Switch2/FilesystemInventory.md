@@ -32,10 +32,11 @@ Console acceptance is tracked in the handoff.
 | File handles | SD inodes only, tmpfs layout, not connectable; handles are valid while the inode is linked. Other filesystems encode `AT_HANDLE_FID` only |
 | Mount IDs | Every mount reports ID 1 |
 | memfd mappings | A shared mapping allocates its whole range when mapped, not per fault |
+| SD file shared mappings | Only read-only descriptors (no PROT_WRITE, PROT_EXEC or MAP_FIXED); writable descriptors return ENODEV. The view is refreshed after every data change to stay coherent; access past EOF reads zero instead of raising SIGBUS |
 | procfs | No `/proc/<pid>/fd` magic links yet (procfs is reconciled after milestone 3) |
-| Name and path length | Linux limits: NAME_MAX 255, PATH_MAX 4096. Horizon caps the whole SD path at 257 bytes (console 0.12.35, 2002-6003), so longer entries live in the inode store: directories as overflow records, files as managed objects. Moving a native directory where its tree would not fit converts the tree first; the conversion is per entry and each step survives a reset, but a reset can leave a tree partly converted at its old name. Such renames read the source tree once to measure it |
-| `RLIMIT_NOFILE` | Fixed at 1024 (soft and hard); `setrlimit` returns EPERM |
-| `clock_nanosleep` (outside the inventory; probes need it) | `CLOCK_PROCESS_CPUTIME_ID`, and alarm clocks as root, return EOPNOTSUPP. Absolute REALTIME/TAI deadlines are converted to monotonic once. Realtime has one-second resolution until the time milestone |
+| Name and path length | Linux limits: NAME_MAX 255, PATH_MAX 4096. Horizon caps the whole SD path at 257 bytes (console 0.12.35, 2002-6003), so longer entries live in the inode store: directories as overflow records, files as managed objects. Names with characters FAT or Horizon reject (control characters and `" * : < > ? \ |`) live in the store the same way (0.13.4; before, they returned EINVAL). Moving a native directory where its tree would not fit converts the tree first; the conversion is per entry and each step survives a reset, but a reset can leave a tree partly converted at its old name. Such renames read the source tree once to measure it |
+| `RLIMIT_NOFILE` | Settable and enforced since milestone 2; the hard limit is capped at 1024. See [ProcessInventory.md](ProcessInventory.md#deliberate-differences-from-a-stock-kernel) |
+| Clocks and `clock_nanosleep` | Realtime has sub-second resolution from one guest base (RTC second at launch plus elapsed time), which file timestamps share; process CPU clock sleeps and alarm sleeps are implemented. Differences are tracked in [ProcessInventory.md](ProcessInventory.md#clocks-deliberate-differences) |
 
 | Group | Routed | Unrouted |
 | --- | ---: | ---: |

@@ -785,7 +785,36 @@ void Arm64JITCore::EmitTFCheck() {
   (void)Bind(&l_TFUnset);
 }
 
-void Arm64JITCore::EmitSuspendInterruptCheck() {
+void Arm64JITCore::EmitSuspendInterruptCheck(const ARMEmitter::BackwardLabel* ResumeTarget) {
+  if (CTX->Config.PollPendingInterrupt && ResumeTarget) {
+    // Preemption poll. TMP1 is free here: at an entry point no guest
+    // instruction has run yet, and before a backward branch the guest state
+    // is the state at the start of the branch target. ResumeTarget is the
+    // host address whose RIP entry names the guest instruction to resume at
+    // (GenerateIR records one for every instruction when polling is on).
+    constexpr size_t PageOffset =
+      offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
+    static_assert(PageOffset + FEXCore::Core::InterruptPollTargetOffset <= 32760, "Poll words out of ldr/str range");
+    ARMEmitter::ForwardLabel l_NoRequest;
+    ldr(TMP1, STATE, PageOffset + FEXCore::Core::InterruptPollRequestOffset);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_NoRequest);
+    if (RequiresFarARM64Jumps) {
+      if (LongAddressGen(TMP1, ResumeTarget) == ARMEmitter::BranchEncodeSucceeded::Failure) {
+        ERROR_AND_DIE_FMT("Unable to encode long ADR.");
+      }
+    } else if (adr(TMP1, ResumeTarget) != ARMEmitter::BranchEncodeSucceeded::Success) {
+      FEXCore::UncheckedLongJump::LongJump(ThreadState->RestartJump, FEXCore::ToUnderlying(RestartOptions::Control::EnableFarARM64Jumps));
+    }
+    str(TMP1, STATE, PageOffset + FEXCore::Core::InterruptPollTargetOffset);
+    // Leave like the dispatcher's HLT exit: restore the dispatcher's stack,
+    // then the stop handler spills SRA/NZCV and returns from ExecuteThread.
+    ldr(TMP1, STATE_PTR(CpuStateFrame, ReturningStackLocation));
+    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, TMP1, 0);
+    ldr(TMP1, STATE_PTR(CpuStateFrame, Pointers.ThreadStopHandlerSpillSRA));
+    br(TMP1);
+    (void)Bind(&l_NoRequest);
+  }
+
   if (CTX->Config.NeedsPendingInterruptFaultCheck) {
     // Trigger a fault if there are any pending interrupts
     // Used only for gdbserver at the moment
@@ -812,6 +841,10 @@ void Arm64JITCore::EmitSuspendInterruptCheck() {
 }
 
 void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF) {
+  // The entry's RIP entry is recorded at this address.
+  ARMEmitter::BackwardLabel EntryLabel;
+  (void)Bind(&EntryLabel);
+
   // Get the address of the JITCodeHeader and store in to the core state.
   // Two instruction cost, each 1 cycle.
   adr_OrRestart(TMP1, &HeaderLabel);
@@ -832,7 +865,7 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
     }
   }
 
-  EmitSuspendInterruptCheck();
+  EmitSuspendInterruptCheck(&EntryLabel);
 }
 
 
@@ -963,7 +996,7 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
       // if there's a pending branch, and it is not fall-through
       if (PendingTargetLabel && PendingTargetLabel != Target) {
         if (PendingTargetLabel->Backward.Location) {
-          EmitSuspendInterruptCheck();
+          EmitSuspendInterruptCheck(&PendingTargetLabel->Backward);
         }
         b_OrRestart(PendingTargetLabel);
         PendingTargetLabel = nullptr;
@@ -1019,7 +1052,7 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
   // Make sure last branch is generated. It certainly can't be eliminated here.
   if (PendingTargetLabel) {
     if (PendingTargetLabel->Backward.Location) {
-      EmitSuspendInterruptCheck();
+      EmitSuspendInterruptCheck(&PendingTargetLabel->Backward);
     }
     b_OrRestart(PendingTargetLabel);
   }

@@ -28,9 +28,10 @@ for entry in proc dev scratch; do
     [[ -e $rootfs/$entry ]] || created+=("$rootfs/$entry")
 done
 cleanup() {
-    for entry in "${created[@]}"; do
-        rm -rf -- "$entry"
-    done
+    # Files the program created belong to namespace-mapped ids, so remove
+    # them from inside a namespace with the same mapping.
+    (( ${#created[@]} )) || return 0
+    unshare --map-root-user --map-auto rm -rf -- "${created[@]}"
 }
 trap cleanup EXIT
 unshare --map-root-user --map-auto --mount --pid --fork --kill-child -- \
@@ -46,6 +47,9 @@ unshare --map-root-user --map-auto --mount --pid --fork --kill-child -- \
         mkdir -p "$rootfs/scratch"
         chown "$user:$user" "$rootfs/scratch"
         cd "$rootfs"
-        exec chroot --userspec="$user:$user" --groups="$user" "$rootfs" \
+        # The program leads its own session, as the launcher starts it, and
+        # is not the namespace init: orphaned children are reparented to
+        # this shell, outside the program'"'"'s session.
+        setsid --wait chroot --userspec="$user:$user" --groups="$user" "$rootfs" \
             /bin/bash --noprofile --norc -c "cd /scratch && exec \"\$@\"" bash "$@"
     ' bash "$rootfs" "$user" "$@"

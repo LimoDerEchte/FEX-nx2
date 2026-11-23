@@ -138,6 +138,9 @@ class ContextImpl final : public FEXCore::Context::Context, public CPU::SharedCo
 public:
   // Context base class implementation.
   bool InitCore() override;
+  void SetPollPendingInterrupt(bool Enabled) override {
+    Config.PollPendingInterrupt = Enabled;
+  }
 
   void ExecuteThread(FEXCore::Core::InternalThreadState* Thread) override;
 
@@ -353,6 +356,8 @@ public:
 
     // Used if the JIT needs to have its interrupt fault code emitted.
     bool NeedsPendingInterruptFaultCheck {false};
+    // Generated code polls InterruptFaultPage for preemption requests.
+    bool PollPendingInterrupt {false};
 
     FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
     FEX_CONFIG_OPT(SingleStepConfig, SINGLESTEP);

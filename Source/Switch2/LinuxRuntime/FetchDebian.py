@@ -13,6 +13,7 @@ import hashlib
 import io
 import lzma
 from pathlib import Path
+import shutil
 import tarfile
 import urllib.request
 
@@ -24,6 +25,8 @@ ARCHIVES = (
 PACKAGES = (
     "libc6", "libc6-dev", "libgcc-s1", "bash", "coreutils", "libtinfo6", "ncurses-base",
     "libacl1", "libattr1", "libselinux1", "libpcre2-8-0", "libgmp10", "libcap2",
+    # Milestone 2 tool acceptance: grep, /bin/kill (procps) and inotifywait.
+    "grep", "procps", "libproc2-0", "inotify-tools", "libinotifytools0",
 )
 
 
@@ -69,19 +72,26 @@ def compare_versions(left, right):
     return (a[0] - b[0]) or _compare_part(a[1], b[1]) or _compare_part(a[2], b[2])
 
 
-def index(cache):
-    found = {}
+def stanzas(cache):
+    """Yield (base, suite, fields) for every package stanza in the archive indexes."""
     for base, suite in ARCHIVES:
         name = cache / f"{suite}.Packages.xz"
         if not name.is_file():
             name.write_bytes(fetch(f"{base}/dists/{suite}/main/binary-amd64/Packages.xz"))
         for stanza in lzma.decompress(name.read_bytes()).decode().split("\n\n"):
             fields = dict(line.split(": ", 1) for line in stanza.splitlines() if ": " in line and not line.startswith(" "))
-            package = fields.get("Package")
-            if package in PACKAGES:
-                current = found.get(package)
-                if not current or compare_versions(fields["Version"], current[3]) > 0:
-                    found[package] = (base, fields["Filename"], fields["SHA256"], fields["Version"])
+            if "Package" in fields:
+                yield base, suite, fields
+
+
+def index(cache):
+    found = {}
+    for base, _, fields in stanzas(cache):
+        package = fields.get("Package")
+        if package in PACKAGES:
+            current = found.get(package)
+            if not current or compare_versions(fields["Version"], current[3]) > 0:
+                found[package] = (base, fields["Filename"], fields["SHA256"], fields["Version"])
     missing = set(PACKAGES) - set(found)
     if missing:
         raise SystemExit(f"Packages not found in the bookworm indexes: {sorted(missing)}")
@@ -113,7 +123,12 @@ def main():
     cache = (args.cache or args.output.with_name(args.output.name + "-cache")).resolve()
     cache.mkdir(parents=True, exist_ok=True)
     root = args.output.resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    # Unpack into a fresh directory and replace the sysroot at the end: the
+    # tar filter refuses to extract through the absolute symlinks a previous
+    # unpack left (lib64/ld-linux-x86-64.so.2).
+    staging = root.with_name(root.name + ".staging")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
     for package, (base, filename, digest, _) in sorted(index(cache).items()):
         local = cache / Path(filename).name
         if not local.is_file() or hashlib.sha256(local.read_bytes()).hexdigest() != digest:
@@ -121,8 +136,10 @@ def main():
         deb = local.read_bytes()
         if hashlib.sha256(deb).hexdigest() != digest:
             raise SystemExit(f"Checksum mismatch for {filename}")
-        unpack(deb, root)
+        unpack(deb, staging)
         print(f"Unpacked {Path(filename).name}")
+    shutil.rmtree(root, ignore_errors=True)
+    staging.rename(root)
 
 
 if __name__ == "__main__":

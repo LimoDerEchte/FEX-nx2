@@ -259,6 +259,39 @@ DEF_OP(CondJump) {
 
   auto TrueTargetLabel = JumpTarget(Op->TrueBlock);
 
+  // A conditional backward branch closes a loop too. With preemption polls
+  // enabled, branch around the taken path when the condition fails, then
+  // poll and take the backward branch.
+  ARMEmitter::ForwardLabel l_NotTaken;
+  const bool PollBackEdge = CTX->Config.PollPendingInterrupt && TrueTargetLabel->Backward.Location;
+  if (PollBackEdge) {
+    if (Op->FromNZCV) {
+      (void)b(InvertCondition(MapCC(Op->Cond)), &l_NotTaken);
+    } else {
+      uint64_t Const;
+      [[maybe_unused]] const bool isConst = IsInlineConstant(Op->Cmp2, &Const);
+      auto Reg = GetReg(Op->Cmp1);
+      const auto Size = Op->CompareSize == IR::OpSize::i32Bit ? ARMEmitter::Size::i32Bit : ARMEmitter::Size::i64Bit;
+      LOGMAN_THROW_A_FMT(IsGPR(Op->Cmp1) && isConst, "CondJump: Expected GPR and constant source");
+      if (Op->Cond == IR::CondClass::EQ) {
+        (void)cbnz(Size, Reg, &l_NotTaken);
+      } else if (Op->Cond == IR::CondClass::NEQ) {
+        (void)cbz(Size, Reg, &l_NotTaken);
+      } else if (Op->Cond == IR::CondClass::TSTZ) {
+        (void)tbnz(Reg, Const, &l_NotTaken);
+      } else if (Op->Cond == IR::CondClass::TSTNZ) {
+        (void)tbz(Reg, Const, &l_NotTaken);
+      } else {
+        LOGMAN_THROW_A_FMT(false, "CondJump expected simple condition");
+      }
+    }
+    EmitSuspendInterruptCheck(&TrueTargetLabel->Backward);
+    b_OrRestart(TrueTargetLabel);
+    (void)Bind(&l_NotTaken);
+    PendingTargetLabel = JumpTarget(Op->FalseBlock);
+    return;
+  }
+
   if (Op->FromNZCV) {
     b_OrRestart(MapCC(Op->Cond), TrueTargetLabel);
   } else {

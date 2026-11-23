@@ -16,6 +16,8 @@ public:
 
   std::weak_ptr<StreamSocket> Peer;
   std::deque<uint8_t> Input;
+  // Counts changes to Input, for edge-triggered epoll.
+  uint64_t Changes {};
   size_t InputCapacity {Capacity};
   static constexpr size_t PipePage = 4096;
   struct PinnedPage {
@@ -59,6 +61,7 @@ public:
   }
 
   void Consume(size_t Bytes) {
+    if (Bytes) ++Changes;
     Input.erase(Input.begin(), Input.begin() + Bytes);
     for (size_t Remaining = Bytes; Pipe && Remaining;) {
       auto& Front = PipeBuffers.front();
@@ -87,6 +90,7 @@ public:
     if (!Other || !Other->Pipe || Count > PipePage || !WriteSpace(false)) return 0;
     Other->PipeBuffers.push_back({Start, Start + Count, false, std::move(Pin)});
     Other->Input.insert(Other->Input.end(), Count, 0);
+    ++Other->Changes;
     return Count;
   }
 
@@ -124,6 +128,7 @@ public:
     }
     if (!Files.empty()) Other->Rights.push_back({Other->Input.size(), std::move(Files)});
     Other->Input.insert(Other->Input.end(), Bytes.begin(), Bytes.begin() + Count);
+    ++Other->Changes;
     return Count;
   }
 

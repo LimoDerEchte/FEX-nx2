@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: MIT
 #include "GuestRuntime.h"
 #include "GuestAddressSpace.h"
+#include "GuestClocks.h"
+#include "GuestCredentials.h"
 #include "GuestDirectoryRecovery.h"
+#include "GuestEpoll.h"
+#include "GuestEventFd.h"
 #include "GuestFileWrite.h"
 #include "GuestFilePunch.h"
 #include "GuestInodeStore.h"
+#include "GuestInotify.h"
+#include "GuestJobControl.h"
 #include "GuestMemoryFile.h"
+#include "GuestPreempt.h"
+#include "GuestScript.h"
+#include "GuestSignals.h"
 #include "GuestPosixAcl.h"
 #include "GuestRootFS.h"
 #include "GuestSocket.h"
 #include "GuestTerminal.h"
+#include "GuestTimers.h"
 #include "GuestVideo.h"
 
 #include <FEXCore/Config/Config.h>
@@ -24,6 +34,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <variant>
 #include <bit>
 #include <charconv>
 #include <csetjmp>
@@ -40,10 +52,80 @@ namespace {
 std::optional<std::pair<uint32_t, uint32_t>> LaunchCredentials;
 // Interrupt the next launch's journaled move into /.fex-recovery-test.
 bool RecoveryTestLaunch {};
+// Capability numbers (linux/capability.h) beyond those in GuestCredentials.h.
+constexpr uint32_t CapDacReadSearch = 2, CapFowner = 3, CapFsetid = 4, CapSysPtrace = 19, CapSysAdmin = 21,
+                   CapSysResource = 24, CapCheckpointRestore = 40;
 constexpr size_t GuestPageSize = PageSize;
+
+// SD calls sometimes fail with kernel InvalidMemoryState (2001-0106,
+// 0xd401) before the filesystem service acts: seen in console runs 0.13.5
+// (rootfs setup) and 0.13.11 (fs-suite), with no cause found. The call had
+// no effect, so it is retried up to two more times; each retry is logged.
+template<typename Function, typename... Arguments>
+Result SdRetry(Function Call, Arguments... Values) {
+  constexpr Result InvalidMemoryState = MAKERESULT(Module_Kernel, KernelError_InvalidMemoryState);
+  Result Status = Call(Values...);
+  for (int Retry = 1; Retry <= 2 && Status == InvalidMemoryState; ++Retry) {
+    char Message[96];
+    std::snprintf(Message, sizeof(Message), "SD result 2001-0106, retry %d of 2.", Retry);
+    WriteLog(Message);
+    Status = Call(Values...);
+  }
+  return Status;
+}
 constexpr size_t MainStackSize = 1024 * 1024;
 constexpr uint64_t LinuxWriteSyscall = 1;
 constexpr uint64_t LinuxExitSyscall = 60;
+
+// Timed preemption (GuestPreempt.h). The scheduler publishes the running
+// guest thread; a watchdog thread sets the poll request word in its FEXCore
+// interrupt page when it must yield. Generated code polls that word at block
+// entries and backward branches and returns from ExecuteThread.
+struct PreemptControl {
+  Mutex Lock {};
+  // Guarded by Lock. Running changes only on the scheduler thread.
+  FEXCore::Core::InternalThreadState* Running {};
+  uint64_t RunningSince {};
+  uint64_t NextDeadline {};
+  PreemptInputs Hints {};
+  bool Armed {};
+  std::atomic<bool> StopWatchdog {};
+  uint64_t Switches {}, Unresolved {};
+  Thread Watchdog {};
+  bool WatchdogStarted {};
+};
+PreemptControl Preempt;
+
+// Descriptions of watchable files that were destroyed (Linux __fput calls
+// fsnotify_close); the runtime turns them into inotify close events.
+struct ClosedFile {
+  uint64_t Inode;
+  std::string Path;
+  bool Write, Directory;
+};
+std::vector<ClosedFile> ClosedFiles;
+
+std::atomic_ref<uint64_t> PollWord(FEXCore::Core::InternalThreadState* Thread, size_t Offset) {
+  return std::atomic_ref<uint64_t>(*reinterpret_cast<uint64_t*>(Thread->InterruptFaultPage + Offset));
+}
+
+void PreemptWatchdog(void*) {
+  while (!Preempt.StopWatchdog.load()) {
+    svcSleepThread(PreemptQuantumNs / 2);
+    mutexLock(&Preempt.Lock);
+    if (Preempt.Running && !Preempt.Armed) {
+      auto Inputs = Preempt.Hints;
+      Inputs.Now = armTicksToNs(armGetSystemTick());
+      Inputs.RunningSince = Preempt.RunningSince;
+      Inputs.TimerDue = Inputs.TimerDue || (Preempt.NextDeadline && Inputs.Now >= Preempt.NextDeadline);
+      if (ShouldPreempt(Inputs)) {
+        PollWord(Preempt.Running, FEXCore::Core::InterruptPollRequestOffset).store(1, std::memory_order_release);
+        Preempt.Armed = true;
+      }
+    }
+    mutexUnlock(&Preempt.Lock);
+  }
+}
 
 struct TraceMapping {
   uint64_t Start;
@@ -138,8 +220,9 @@ public:
     LoadInodeStore();
     Task = &Processes.try_emplace(ProcessID).first->second;
     if (LaunchCredentials) {
-      Task->UserIDs.fill(LaunchCredentials->first);
-      Task->GroupIDs.fill(LaunchCredentials->second);
+      Task->Creds = LaunchCredentials->first == 0 ? Switch2Guest::RootCredentials() : Switch2Guest::Credentials {};
+      Task->Creds.Uid.fill(LaunchCredentials->first);
+      Task->Creds.Gid.fill(LaunchCredentials->second);
     }
     Task->HasDispatched = true;
     Task->Folder = std::move(Folder);
@@ -157,6 +240,7 @@ public:
     }
     padInitializeDefault(&Input);
     padUpdate(&Input);
+    StartPreemptWatchdog();
     if (Interactive) {
       hidInitializeKeyboard();
       hidGetKeyboardStates(&LastKeyboard, 1);
@@ -198,7 +282,36 @@ public:
     }
   }
 
+  void StartPreemptWatchdog() {
+    if (Preempt.WatchdogStarted) return;
+    Preempt.Switches = Preempt.Unresolved = 0;
+    Preempt.StopWatchdog = false;
+    s32 Priority {};
+    svcGetThreadPriority(&Priority, CUR_THREAD_HANDLE);
+    // A higher priority on the guest's core lets the watchdog run while the
+    // guest computes; it sleeps between checks.
+    const auto Status = threadCreate(&Preempt.Watchdog, PreemptWatchdog, nullptr, nullptr, 0x4000, Priority - 1, -2);
+    Preempt.WatchdogStarted = R_SUCCEEDED(Status) && R_SUCCEEDED(threadStart(&Preempt.Watchdog));
+    StartedWatchdog = Preempt.WatchdogStarted;
+    if (!Preempt.WatchdogStarted) {
+      if (R_SUCCEEDED(Status)) threadClose(&Preempt.Watchdog);
+      WriteLog("Could not start the guest preemption watchdog.");
+    }
+  }
+
+  void StopPreemptWatchdog() {
+    // Inspect-only instances never start the watchdog and must not stop the
+    // running guest's.
+    if (!StartedWatchdog) return;
+    StartedWatchdog = false;
+    Preempt.StopWatchdog = true;
+    threadWaitForExit(&Preempt.Watchdog);
+    threadClose(&Preempt.Watchdog);
+    Preempt.WatchdogStarted = false;
+  }
+
   ~GuestSyscalls() override {
+    StopPreemptWatchdog();
     if (SaveInodeStore() < 0) WriteLog("Failed to save guest inode metadata.");
     CloseVideo();
     // Queued socket descriptors can refer back to their receive socket.
@@ -220,6 +333,11 @@ public:
   std::optional<uint64_t> RunThreads() {
     while (!ProcessExited) {
       bool Ran = false;
+      // Preemption can return a busy thread every quantum; keep the
+      // terminal responsive while guests compute.
+      if (Interactive) PollTerminalInput();
+      FireTimers();
+      if (!ClosedFiles.empty()) DrainClosedFiles();
       for (size_t Index = 0; Index < Threads.size() && !ProcessExited; ++Index) {
         auto& Thread = Threads[Index];
         if (!Thread.Core) continue;
@@ -240,27 +358,23 @@ public:
           Current->SetTidOnStart = 0;
         }
         const auto Before = CurrentThreadTicks();
+        QuantumStart = Before;
+        InDispatch = true;
         if (Task->TraceFirstDispatch && Logging == LogLevel::Trace) {
           LogFirstDispatch(*Thread.Core->CurrentFrame);
           FirstDispatchCompileCheckpoints = 11;
         }
         Task->TraceFirstDispatch = false;
-        const auto Signal = PendingCaughtSignal(Thread, *Task);
-        if (Signal) {
-          constexpr uint64_t Restart = 0x10000000;
-          if (Thread.Waiting == WaitKind::Lock && !(Task->SignalActions[Signal - 1][1] & Restart)) {
-            auto& State = Thread.Core->CurrentFrame->State;
-            State.gregs[FEXCore::X86State::REG_RAX] = -4; // EINTR
-            State.rip += 2;
-          }
-          if (Thread.Waiting == WaitKind::Sleep) InterruptSleep(Thread);
-          Thread.Waiting = WaitKind::None;
-          Thread.PendingRecordLock.reset();
-          if (!EnterSignalHandler(Thread.Core->CurrentFrame, Signal)) TerminateForSignal(11);
-        }
-        if (!Thread.Exited) Dispatch(*Thread.Core->CTX);
+        // Also drops unblocked ignored signals, as Linux get_signal does.
+        if (Thread.RerunBeforeSignals) Thread.RerunBeforeSignals = false;
+        else if (DeliverableSignals(Thread)) DeliverSignals(Thread);
+        // A dropped stop signal can leave a sleep or futex wait unfinished.
+        if (!Thread.Exited && !Task->Stopped && Thread.Waiting == WaitKind::None) Dispatch(*Thread.Core->CTX);
         FirstDispatchCompileCheckpoints = 0;
-        Task->CpuTicks += CurrentThreadTicks() - Before;
+        const auto Used = CurrentThreadTicks() - Before;
+        InDispatch = false;
+        Task->CpuTicks += Used;
+        Thread.CpuTicks += Used;
         if (Task->StartupSyscallCheckpoints && Task->LastStartupSyscall) {
           char Message[112];
           std::snprintf(Message, sizeof(Message), "%s syscall %llu completed",
@@ -274,6 +388,7 @@ public:
         if (Task->Exited && Task->PID != ProcessID) {
           ProcessCheckpoint("Child exit, retiring process");
           RetireProcess(Task->PID);
+          if (Task->AutoReap) Task->Reaped = true;
           ProcessCheckpoint("Child exit, process retired");
         } else if (Task->PendingExec) {
           ProcessCheckpoint("Exec request, replacing guest image");
@@ -285,14 +400,21 @@ public:
       if (!Ran && !ProcessExited) {
         if (!std::any_of(Threads.begin(), Threads.end(), [](const auto& Thread) { return Thread.Core; })) break;
         if (!appletMainLoop()) break;
-        if (std::none_of(Threads.begin(), Threads.end(), [](const auto& Thread) {
+        const auto TimerDue = NextTimerDeadline(false);
+        if (!TimerDue && std::none_of(Threads.begin(), Threads.end(), [](const auto& Thread) {
               return Thread.Deadline || Thread.Waiting == WaitKind::Terminal;
             })) {
           PrintStage("Guest threads are blocked with no remaining producer.");
           break;
         }
         if (Interactive) PollTerminalInput();
-        svcSleepThread(8'000'000);
+        // Sleep until the next deadline, at most 8 ms.
+        uint64_t Wake = TimerDue;
+        for (const auto& Thread : Threads) {
+          if (Thread.Core && !Thread.Exited && Thread.Deadline) Wake = Wake ? std::min(Wake, Thread.Deadline) : Thread.Deadline;
+        }
+        const auto Now = MonotonicNs();
+        svcSleepThread(Wake ? std::clamp<int64_t>(static_cast<int64_t>(Wake - std::min(Wake, Now)), 0, 8'000'000) : 8'000'000);
       }
       if (DispatchFailed) break;
     }
@@ -302,10 +424,16 @@ public:
     }
     Current = nullptr;
     FlushGuestOutput();
+    char Summary[96];
+    std::snprintf(Summary, sizeof(Summary), "Guest preemption: %llu switches, %llu unresolved",
+                  static_cast<unsigned long long>(Preempt.Switches), static_cast<unsigned long long>(Preempt.Unresolved));
+    WriteLog(Summary);
     return ProcessExited ? std::optional {ExitStatus} : std::nullopt;
   }
 
   uint64_t Number {};
+  bool YieldRequested {};
+  bool StartedWatchdog {};
 
   void CloseVideo() {
     if (GraphicsActive) {
@@ -328,22 +456,22 @@ public:
       WriteLog(Message);
     }
     if (Registers[REG_RAX] == LinuxExitSyscall || Registers[REG_RAX] == 231) {
-      const auto ExitCall = Registers[REG_RAX];
-      ExitThread();
-      Task->Exited = ExitCall == 231 || std::none_of(Threads.begin(), Threads.end(), [&](const auto& Thread) {
-        return Thread.Core && Thread.PID == Task->PID && !Thread.Exited;
-      });
-      if (Task->Exited) Task->Status = Registers[REG_RDI] & 0xff;
-      if (Task->Exited && Task->PID == ProcessID) {
-        Number = ExitCall;
-        ExitStatus = Task->Status;
-        ProcessExited = true;
+      // exit ends the thread and, with the last thread, the process;
+      // exit_group ends the process.
+      if (Registers[REG_RAX] == LinuxExitSyscall) ExitThread();
+      if (Registers[REG_RAX] == 231 || std::none_of(Threads.begin(), Threads.end(), [&](const auto& Thread) {
+            return Thread.Core && Thread.PID == Task->PID && !Thread.Exited;
+          })) {
+        ExitProcess(Registers[REG_RDI] & 0xff, 0);
       }
       std::longjmp(ReturnToHost, 1);
     }
 
     constexpr int64_t LinuxEnosys = -38;
     const auto A = Registers[REG_RDI], B = Registers[REG_RSI], C = Registers[REG_RDX];
+    const uint64_t Arguments[] {A, B, C, Registers[REG_R10], Registers[REG_R8], Registers[REG_R9]};
+    std::optional<FsHook> Hook;
+    if (InotifyWatching()) Hook = BeforeFs(Registers[REG_RAX], Arguments);
     int64_t Result = LinuxEnosys;
     switch (Registers[REG_RAX]) {
     case 0: Result = ReadGuest(A, B, C); break;
@@ -373,7 +501,15 @@ public:
       if (ReturnGuestSignal(Frame)) std::longjmp(ReturnToHost, 1);
       Result = Fault;
       break;
-    case 127: Result = B == 8 ? CopyOut(A, Current->PendingSignals & Current->SignalMask) : Invalid; break;
+    case 127: Result = PendingSignalsGuest(A, B); break;
+    case 34: Result = PauseGuest(); break;
+    case 128: Result = TimedWaitSignal(A, B, C, Registers[REG_R10]); break;
+    case 129: Result = QueueSignalInfo(A, A, B, C, false); break;
+    case 130: Result = SuspendGuest(A, B); break;
+    case 200: Result = static_cast<int32_t>(A) > 0 ? SignalThread(-1, static_cast<uint32_t>(A), B, MakeSigInfo(B, SiTkill, Task->PID, Task->Creds.Uid[0])) : Invalid; break;
+    case 219: Result = -4; break; // restart_syscall: no restart block without stopped sleeps (Task 6).
+    case 234: Result = TkillGuest(A, B, C); break;
+    case 297: Result = QueueSignalInfo(A, B, C, Registers[REG_R10], true); break;
     case 16: Result = TerminalIoctl(A, B, C); break;
     case 17: Result = ReadGuest(A, B, C, Registers[REG_R10]); break;
     case 18: Result = WriteGuest(A, B, C, Registers[REG_R10]); break;
@@ -381,12 +517,14 @@ public:
     case 20: Result = VectorIO(static_cast<uint32_t>(A), B, static_cast<uint32_t>(C), true); break;
     case 21: Result = AccessGuest(CurrentDirectory, A, B, 0); break;
     case 22: Result = CreatePipe(A, 0); break;
-    case 24: Result = 0; break;
+    case 24: Result = 0; YieldRequested = true; break;
     case 28: Result = AdviseGuest(A, B, C); break;
     case 32: Result = FileControl(A, 0, 0); break;
     case 33: Result = DuplicateDescriptor(A, B, false); break;
     case 40: Result = SendFile(A, B, C, Registers[REG_R10]); break;
-    case 39: case 124: Result = Task->PID; break;
+    case 39: Result = Task->PID; break;
+    case 124: Result = GetSession(A); break;
+    case 112: Result = SetSession(); break;
     case 111: Result = Task->Group; break;
     case 110: Result = Task->ParentPID; break;
     case 121: Result = GetProcessGroup(A); break;
@@ -400,11 +538,23 @@ public:
     case 49: Result = BindSocket(A, B, C); break;
     case 50: Result = ListenSocket(A, B); break;
     case 53: Result = SocketPair(A, B, C, Registers[REG_R10]); break;
-    case 56: Result = A & 0x10000 ? CloneThread(Frame, A, B, C, Registers[REG_R10], Registers[REG_R8]) :
-                                     B == 0 ? RequestFork(A, Registers[REG_R10]) : -38; break;
-    case 57: Result = RequestFork(17, 0); break;
-    case 59: Result = ExecGuest(A, B, C); break;
-    case 61: Result = WaitChild(A, B, C, Registers[REG_R10]); break;
+    case 56: Result = CloneGuest(Frame, A, B, C, Registers[REG_R10], Registers[REG_R8]); break;
+    case 57: Result = RequestClone({SigChld}); break;
+    case 58: Result = RequestClone({CloneVm | CloneVfork | SigChld}); break;
+    case 435: Result = Clone3(Frame, A, B); break;
+    case 59: Result = ExecGuest(CurrentDirectory, A, B, C, 0); break;
+    case 322: Result = ExecGuest(A, B, C, Registers[REG_R10], Registers[REG_R8]); break;
+    case 434: Result = PidfdOpen(A, B); break;
+    case 424: Result = PidfdSendSignal(A, B, C, Registers[REG_R10]); break;
+    case 438: Result = PidfdGetFd(A, B, C); break;
+    case 61: Result = Wait4(A, B, C, Registers[REG_R10]); break;
+    case 247: Result = WaitId(A, B, C, Registers[REG_R10], Registers[REG_R8]); break;
+    case 98: Result = ResourceUsage(A, B); break;
+    case 100: Result = ProcessTimes(A); break;
+    case 135: Result = SetPersonality(A); break;
+    case 140: Result = GetPriority(A, B); break;
+    case 141: Result = SetPriority(A, B, C); break;
+    case 309: Result = (A && CopyOut(A, uint32_t {})) || (B && CopyOut(B, uint32_t {})) ? Fault : 0; break; // getcpu: CPU 0, node 0
     case 63: Result = UnameGuest(A); break;
     case 72: Result = FileControl(A, B, C); break;
     case 62: Result = SignalProcess(A, B); break;
@@ -433,21 +583,28 @@ public:
     case 94: Result = ChangeOwner(CurrentDirectory, A, B, C, 0x100); break;
     case 260: Result = ChangeOwner(A, B, C, Registers[REG_R10], Registers[REG_R8]); break;
     case 95: Result = std::exchange(Task->CreationMask, A & 0777); break;
-    case 97: Result = LimitGuest(A, B, 0); break;
+    case 97: Result = PrLimit(0, A, 0, B); break;
+    case 160: Result = PrLimit(0, A, B, 0); break;
     case 99: Result = SystemInfo(A); break;
-    case 102: Result = Task->UserIDs[0]; break;
-    case 104: Result = Task->GroupIDs[0]; break;
-    case 107: Result = Task->UserIDs[1]; break;
-    case 108: Result = Task->GroupIDs[1]; break;
+    case 102: Result = Task->Creds.Uid[0]; break;
+    case 104: Result = Task->Creds.Gid[0]; break;
+    case 107: Result = Task->Creds.Uid[1]; break;
+    case 108: Result = Task->Creds.Gid[1]; break;
     case 115: Result = GuestGroups(false, A, B); break;
     case 116: Result = GuestGroups(true, A, B); break;
-    case 117: Result = SetGuestIDs(Task->UserIDs, A, B, C); break;
-    case 118: Result = GetGuestIDs(Task->UserIDs, A, B, C); break;
-    case 119: Result = SetGuestIDs(Task->GroupIDs, A, B, C); break;
-    case 120: Result = GetGuestIDs(Task->GroupIDs, A, B, C); break;
+    case 105: Result = Switch2Guest::SetUid(Task->Creds, static_cast<uint32_t>(A)); break;
+    case 106: Result = Switch2Guest::SetGid(Task->Creds, static_cast<uint32_t>(A)); break;
+    case 113: Result = Switch2Guest::SetReUid(Task->Creds, static_cast<uint32_t>(A), static_cast<uint32_t>(B)); break;
+    case 114: Result = Switch2Guest::SetReGid(Task->Creds, static_cast<uint32_t>(A), static_cast<uint32_t>(B)); break;
+    case 125: Result = GetCapabilities(A, B); break;
+    case 126: Result = SetCapabilities(A, B); break;
+    case 117: Result = Switch2Guest::SetResUid(Task->Creds, static_cast<uint32_t>(A), static_cast<uint32_t>(B), static_cast<uint32_t>(C)); break;
+    case 118: Result = GetGuestIDs(Task->Creds.Uid, A, B, C); break;
+    case 119: Result = Switch2Guest::SetResGid(Task->Creds, static_cast<uint32_t>(A), static_cast<uint32_t>(B), static_cast<uint32_t>(C)); break;
+    case 120: Result = GetGuestIDs(Task->Creds.Gid, A, B, C); break;
     case 157: Result = GuestPrivilegeControl(A, B, C, Registers[REG_R10], Registers[REG_R8]); break;
-    case 122: Result = SetFilesystemID(Task->UserIDs, A); break;
-    case 123: Result = SetFilesystemID(Task->GroupIDs, A); break;
+    case 122: Result = Switch2Guest::SetFsUid(Task->Creds, static_cast<uint32_t>(A)); break;
+    case 123: Result = Switch2Guest::SetFsGid(Task->Creds, static_cast<uint32_t>(A)); break;
     case 109: Result = SetProcessGroup(A, B); break;
     case 133: Result = MakeNode(CurrentDirectory, A, B); break;
     case 259: Result = MakeNode(A, B, C); break;
@@ -482,7 +639,29 @@ public:
     case 217: Result = ReadDirents(A, B, C, true); break;
     case 218: Result = SetTidAddress(A); break;
     case 228: Result = ClockGuest(A, B); break;
+    case 229: Result = ClockResolution(A, B); break;
+    case 227: Result = ClockSetTime(A, B); break;
+    case 96: Result = GetTimeOfDay(A, B); break;
+    case 164: Result = SetTimeOfDay(A, B); break;
+    case 201: Result = TimeGuest(A); break;
+    case 159: Result = AdjustTime(A); break;
+    case 305: Result = ClockAdjustTime(A, B); break;
     case 35: Result = SleepGuest(1, 0, A, B); break;
+    case 36: Result = GetITimer(A, B); break;
+    case 37: Result = AlarmGuest(static_cast<uint32_t>(A)); break;
+    case 38: Result = SetITimer(A, B, C); break;
+    case 222: Result = TimerCreate(A, B, C); break;
+    case 223: Result = TimerSetTime(A, B, C, Registers[REG_R10]); break;
+    case 224: Result = TimerGetTime(A, B); break;
+    case 225: Result = TimerGetOverrun(A); break;
+    case 226: Result = TimerDelete(A); break;
+    case 283: Result = TimerFdCreate(A, B); break;
+    case 286: Result = TimerFdSetTime(A, B, C, Registers[REG_R10]); break;
+    case 287: Result = TimerFdGetTime(A, B); break;
+    case 284: Result = EventFdCreate(A, 0); break;
+    case 290: Result = EventFdCreate(A, B); break;
+    case 282: Result = SignalFdCreate(A, B, C, 0); break;
+    case 289: Result = SignalFdCreate(A, B, C, Registers[REG_R10]); break;
     case 230: Result = SleepGuest(A, B, C, Registers[REG_R10]); break;
     case 258: Result = CreateDirectoryGuest(A, B, C); break;
     case 263: Result = C == 0x200 ? RemoveDirectoryGuest(A, B) : C ? Invalid : UnlinkGuest(A, B); break;
@@ -492,6 +671,17 @@ public:
     case 268: Result = ChangeModeAt(A, B, C, 0); break;
     case 452: Result = ChangeModeAt(A, B, C, Registers[REG_R10]); break;
     case 269: Result = AccessGuest(A, B, C, 0); break;
+    case 253: Result = InotifyInit(0); break;
+    case 294: Result = InotifyInit(A); break;
+    case 254: Result = InotifyAddWatch(A, B, static_cast<uint32_t>(C)); break;
+    case 255: Result = InotifyRemoveWatch(A, B); break;
+    case 23: Result = SelectTimeval(A, B, C, Registers[REG_R10], Registers[REG_R8]); break;
+    case 213: Result = static_cast<int32_t>(A) <= 0 ? Invalid : EpollCreate(0); break;
+    case 291: Result = EpollCreate(A); break;
+    case 233: Result = EpollCtl(A, B, C, Registers[REG_R10]); break;
+    case 232: Result = EpollWait(A, B, C, static_cast<int32_t>(Registers[REG_R10])); break;
+    case 281: Result = EpollPwait(A, B, C, static_cast<int32_t>(Registers[REG_R10]), Registers[REG_R8], Registers[REG_R9]); break;
+    case 441: Result = EpollPwait2(A, B, C, Registers[REG_R10], Registers[REG_R8], Registers[REG_R9]); break;
     case 270: Result = SelectGuest(A, B, C, Registers[REG_R10], Registers[REG_R8], Registers[REG_R9]); break;
     case 271: Result = PollGuestWithTimespec(A, B, C, Registers[REG_R10], Registers[REG_R8]); break;
     case 275: Result = SpliceGuest(A, B, C, Registers[REG_R10], Registers[REG_R8], Registers[REG_R9]); break;
@@ -514,7 +704,7 @@ public:
                         Offset == UINT64_MAX ? std::nullopt : std::optional {Offset}, Registers[REG_R9]);
       break;
     }
-    case 302: Result = A == 0 || A == Task->PID ? LimitGuest(B, Registers[REG_R10], C) : -3; break;
+    case 302: Result = PrLimit(A, B, C, Registers[REG_R10]); break;
     case 318: Result = RandomGuest(A, B, C); break;
     case 332: Result = StatxGuest(A, B, C, Registers[REG_R10], Registers[REG_R8]); break;
     case 436: Result = CloseRange(A, B, C); break;
@@ -531,23 +721,33 @@ public:
       Result = OpenGuest(static_cast<uint32_t>(A), B, static_cast<uint32_t>(C), Registers[REG_R10]);
       break;
     }
+    if (Result >= 0 && Result != RetrySyscall) AfterFs(Hook, Registers[REG_RAX], Arguments, Result);
+    if (!ClosedFiles.empty()) DrainClosedFiles();
     if (Result == RetrySyscall || Task->PendingExec) {
       std::longjmp(ReturnToHost, 1);
+    }
+    if (Current->SuspendMask && MaskedWait(Registers[REG_RAX]) && Result != -4) {
+      Current->SignalMask = *std::exchange(Current->SuspendMask, std::nullopt);
     }
     constexpr uint64_t NoSignal = 0x4000;
     const auto Call = Registers[REG_RAX];
     const bool SuppressPipeSignal = (Call == 44 && (Registers[REG_R10] & NoSignal)) ||
                                     (Call == 46 && (C & NoSignal)) ||
                                     (Call == 328 && (Registers[REG_R9] & VectorNoSignal));
-    if (Result == -32 && !SuppressPipeSignal) QueueGuestSignal(*Current, PipeSignal, Task->PID);
-    if (const auto Signal = PendingCaughtSignal(*Current, *Task)) {
+    // Linux send_sig(SIGPIPE, current, 0): SI_USER from the writer itself.
+    if (Result == -32 && !SuppressPipeSignal) {
+      SendSignal(*Task, Current, MakeSigInfo(SigPipe, SiUser, Task->PID, Task->Creds.Uid[0]));
+    }
+    Current->Deadline = 0;
+    Current->WaitSignals = 0;
+    if (const auto Due = NextTimerDeadline(); Due && MonotonicNs() >= Due) FireTimers();
+    if (HasActionableSignal(*Current)) {
       Registers[REG_RAX] = Result;
       Frame->State.rip += 2;
-      if (!EnterSignalHandler(Frame, Signal)) TerminateForSignal(11);
+      DeliverSignals(*Current);
       std::longjmp(ReturnToHost, 1);
     }
-    if (DeliverDefaultPipeSignal()) std::longjmp(ReturnToHost, 1);
-    Current->Deadline = 0;
+    if (DeliverableSignals(*Current)) DeliverSignals(*Current); // only ignored ones: dropped
     if (Logging == LogLevel::Trace || (Logging == LogLevel::Detailed && Result < 0 && Result >= -4095)) {
       char Message[128];
       std::snprintf(Message, sizeof(Message), "Guest syscall %llu at %#llx returned %lld",
@@ -563,12 +763,13 @@ public:
     }
     Registers[REG_RAX] = Result;
     Frame->State.rip += 2;
-    if (std::any_of(Threads.begin(), Threads.end(), [&](auto& Thread) {
+    if (std::exchange(YieldRequested, false) || std::any_of(Threads.begin(), Threads.end(), [&](auto& Thread) {
           return &Thread != Current && Thread.Core && !Thread.Exited &&
                  Thread.PID == Current->PID && Ready(Thread);
         })) {
       std::longjmp(ReturnToHost, 1);
     }
+    RefreshPreemptHints();
   }
 
   void PreCompile() override {
@@ -594,8 +795,13 @@ private:
   static constexpr int64_t RetrySyscall = INT64_MIN;
   using ContextType = FEXCore::Context::Context;
   using CoreFrame = FEXCore::Core::CpuStateFrame;
-  enum class WaitKind { None, Futex, IO, Terminal, Lock, Sleep };
+  enum class WaitKind { None, Futex, IO, Terminal, Lock, Sleep, Signal, Vfork };
   static constexpr size_t DescriptorCount = 1024; // Linux default RLIMIT_NOFILE and FD_SETSIZE
+  // The thread table; also the RLIMIT_NPROC default. Slots allocate their
+  // state on use. A shell pipeline under command substitution and timeout
+  // needs about ten processes; 8 was too few for the Debian tool checks.
+  static constexpr size_t GuestThreadCount = 32;
+  static constexpr uint64_t SignalPendingDefault = 4096; // RLIMIT_SIGPENDING default
   struct OpenFile;
   struct DescriptorState {
     std::array<std::shared_ptr<OpenFile>, DescriptorCount> Files {};
@@ -609,6 +815,52 @@ private:
     uint64_t FrameAddress;
     std::array<__uint128_t, 16> YMM;
   };
+  // The clock a timer counts in. Deadlines are kept in the clock's own
+  // domain, so setting the realtime clock moves realtime timers, as Linux
+  // hrtimers on the realtime base move. CPU clocks name a process or thread.
+  enum class TimerDomain : uint8_t { Monotonic, Realtime, Tai, ProcessCpu, ThreadCpu };
+  struct TimerClock {
+    TimerDomain Domain {};
+    uint32_t Owner {}; // pid or tid of a CPU clock
+  };
+
+  // timerfd_create: expirations accumulate in Ticks until read.
+  struct TimerFdState {
+    TimerClock Clock;
+    Switch2Guest::ArmedTimer Timer;
+    uint64_t Ticks {};
+    uint64_t Changes {}; // counts changes to Ticks, for edge-triggered epoll
+    bool CancelOnSet {}; // TFD_TIMER_CANCEL_ON_SET on an absolute realtime timer
+    bool Canceled {};    // the realtime clock was set since; read reports ECANCELED once
+  };
+
+  // timer_create. Notify is sigev_notify (SIGEV_SIGNAL 0, SIGEV_NONE 1,
+  // SIGEV_THREAD 2 which the kernel treats as SIGEV_SIGNAL, SIGEV_THREAD_ID 4).
+  struct PosixTimer {
+    int32_t Id {};
+    TimerClock Clock;
+    Switch2Guest::ArmedTimer Timer;
+    int32_t Notify {};
+    uint32_t Signal {};
+    uint64_t Value {};
+    uint32_t Tid {};
+    int32_t OverrunLast {}; // si_overrun of the last delivered signal
+    uint32_t Sequence {};   // bumped by timer_settime; older queued signals are stale
+  };
+
+  // An epoll interest: Linux keys items on the (file description, fd) pair.
+  // The item goes away when the description is destroyed, not when one of
+  // its descriptors closes.
+  struct EpollKey {
+    std::weak_ptr<OpenFile> File;
+    const OpenFile* Raw {};
+    int32_t Fd {};
+    bool operator==(const EpollKey& Other) const { return Raw == Other.Raw && Fd == Other.Fd; }
+  };
+  struct EpollState {
+    Switch2Guest::EpollSet<EpollKey> Set;
+  };
+
   struct GuestThread {
     FEXCore::Core::InternalThreadState* Core {};
     std::shared_ptr<DescriptorState> Descriptors;
@@ -618,12 +870,27 @@ private:
     uint64_t ReturnStackTop {};
     uint64_t ClearTid {};
     uint64_t SignalMask {};
-    uint64_t PendingSignals {};
-    std::array<uint32_t, 64> SignalSenders {};
+    SignalQueue Pending;
+    // rt_sigsuspend's saved mask, restored through the first handler frame.
+    std::optional<uint64_t> SuspendMask;
+    // rt_sigtimedwait's set while it waits (Linux real_blocked).
+    uint64_t WaitSignals {};
+    uint64_t CpuTicks {};
+    bool RerunBeforeSignals {}; // see Ready()
+    // Bytes a blocking stream write already queued before it waited for
+    // space; the rerun continues after them (Linux pipe_write and
+    // unix_stream_sendmsg loop inside one call).
+    uint64_t StreamProgress {};
     std::vector<SavedGuestSignal> SignalFrames;
     std::array<uint64_t, 3> AltStack {0, 2, 0};
     uint64_t Deadline {};
     uint64_t SleepRemaining {}; // Guest timespec for the unslept time, or 0.
+    // A CPU-clock sleep ends when process CpuClockPid has used CpuDeadline ns of CPU time.
+    uint64_t CpuDeadline {};
+    uint32_t CpuClockPid {};
+    // An absolute REALTIME/TAI sleep keeps its target so a clock set re-arms Deadline.
+    uint64_t RealtimeTarget {};
+    bool RealtimeTai {};
     uint64_t WaitAddress {};
     uint32_t WaitMask {};
     uint32_t TID {};
@@ -659,11 +926,81 @@ private:
     // cache is dispensable and may contain entries invalidated by another guest thread.
     Frame->State.callret_sp = Current->ReturnStackTop;
     Frame->InSyscallInfo = 0;
+    OpenPreemptWindow();
     if (setjmp(ReturnToHost) == 0) {
       Context.ExecuteThread(Current->Core);
-      DispatchFailed = true;
-      PrintStage("Dispatcher returned before the guest reached its syscall.");
+      if (!ResumeAfterPreemption()) {
+        DispatchFailed = true;
+        PrintStage("Dispatcher returned before the guest reached its syscall.");
+      }
     }
+    ClosePreemptWindow();
+  }
+
+  // ExecuteThread returned through a preemption poll: the stop handler has
+  // spilled the guest registers, and the poll stored the host address of the
+  // entry point or backward-branch target it stopped at. OpenPreemptWindow
+  // clears that word, so any other stop leaves it 0. Rebuild the guest RIP.
+  bool ResumeAfterPreemption() {
+    auto* Thread = Current->Core;
+    const auto Target = PollWord(Thread, FEXCore::Core::InterruptPollTargetOffset).load(std::memory_order_relaxed);
+    if (!Target) return false;
+    const auto RIP = Thread->CTX->RestoreRIPFromHostPC(Thread, Target);
+    if (!RIP) {
+      ++Preempt.Unresolved;
+      return false;
+    }
+    Thread->CurrentFrame->State.rip = RIP;
+    ++Preempt.Switches;
+    if (Logging == LogLevel::Trace) {
+      char Message[96];
+      std::snprintf(Message, sizeof(Message), "Preempted tid=%u at rip=%#llx", Current->TID, static_cast<unsigned long long>(RIP));
+      WriteRunCheckpoint(Message);
+    }
+    return true;
+  }
+
+  // Publishes the thread about to run and what the watchdog needs to decide
+  // whether it must yield.
+  void OpenPreemptWindow() {
+    PollWord(Current->Core, FEXCore::Core::InterruptPollTargetOffset).store(0, std::memory_order_relaxed);
+    mutexLock(&Preempt.Lock);
+    Preempt.Running = Current->Core;
+    Preempt.RunningSince = MonotonicNs();
+    mutexUnlock(&Preempt.Lock);
+    RefreshPreemptHints();
+  }
+
+  // Ready() may complete another thread's wait; that thread runs on the next
+  // scheduler pass anyway. Called again after every syscall, since a syscall
+  // can make another thread or process ready.
+  void RefreshPreemptHints() {
+    bool Other {};
+    uint64_t NextDeadline {};
+    for (auto& Thread : Threads) {
+      if (&Thread == Current || !Thread.Core || Thread.Exited) continue;
+      if (Ready(Thread)) Other = true;
+      if (Thread.Deadline) NextDeadline = NextDeadline ? std::min(NextDeadline, Thread.Deadline) : Thread.Deadline;
+    }
+    if (const auto Timer = NextTimerDeadline()) NextDeadline = NextDeadline ? std::min(NextDeadline, Timer) : Timer;
+    mutexLock(&Preempt.Lock);
+    Preempt.NextDeadline = NextDeadline;
+    Preempt.Hints = {};
+    Preempt.Hints.OtherRunnable = Other;
+    // The console's line discipline turns Ctrl+C, Ctrl+Z and Ctrl+\ into
+    // signals whether or not a thread reads the terminal, so a busy loop
+    // with no reader (a shell's own `while :; do :; done`) must still return
+    // to the scheduler to poll the keyboard.
+    Preempt.Hints.TerminalInput = Interactive;
+    mutexUnlock(&Preempt.Lock);
+  }
+
+  void ClosePreemptWindow() {
+    mutexLock(&Preempt.Lock);
+    if (Preempt.Running) PollWord(Preempt.Running, FEXCore::Core::InterruptPollRequestOffset).store(0, std::memory_order_relaxed);
+    Preempt.Armed = false;
+    Preempt.Running = nullptr;
+    mutexUnlock(&Preempt.Lock);
   }
 
   static uint64_t MonotonicNs() { return armTicksToNs(armGetSystemTick()); }
@@ -674,14 +1011,58 @@ private:
     return Ticks;
   }
 
+  struct GuestProcess;
+  // CPU time the running thread has used in its current quantum; the scheduler only adds it to
+  // the stored ticks once the guest returns.
+  uint64_t LiveTicks() const { return InDispatch ? CurrentThreadTicks() - QuantumStart : 0; }
+  uint64_t ProcessTicks(const GuestProcess& Process) const { return Process.CpuTicks + (&Process == Task ? LiveTicks() : 0); }
+  uint64_t ThreadTicks(const GuestThread& Thread) const { return Thread.CpuTicks + (&Thread == Current ? LiveTicks() : 0); }
+  uint64_t ProcessCpuNs(const GuestProcess& Process) const { return armTicksToNs(ProcessTicks(Process)); }
+  uint64_t ThreadCpuNs(const GuestThread& Thread) const { return armTicksToNs(ThreadTicks(Thread)); }
+
   bool Ready(GuestThread& Thread) {
+    // A stopped process runs again on SIGCONT; SIGKILL still ends it.
+    const auto& Owner = Processes.at(Thread.PID);
+    const bool Killed = (Thread.Pending.Set() | Owner.SharedPending.Set()) & SignalBit(SigKill);
+    if (Owner.Stopped) return Killed;
+    if (Thread.Waiting == WaitKind::Vfork) {
+      // Only SIGKILL ends the wait early (TASK_KILLABLE).
+      const auto* Child = FindProcess(Thread.WaitAddress);
+      if (Child && !Child->Exited && !Child->Image && !Killed) return false;
+      Thread.Waiting = WaitKind::None;
+      return true;
+    }
     if (Thread.Waiting == WaitKind::None) return true;
-    if (Thread.Waiting == WaitKind::Lock && PendingCaughtSignal(Thread, Processes.at(Thread.PID))) return true;
     const bool Expired = Thread.Deadline && MonotonicNs() >= Thread.Deadline;
+    // Like Linux do_wait or pipe_read, a woken blocking call rescans before
+    // it checks for signals: the syscall reruns first and a pending signal
+    // is delivered when it completes or blocks again.
+    if ((Thread.Waiting == WaitKind::IO || Thread.Waiting == WaitKind::Terminal || Thread.Waiting == WaitKind::Lock) &&
+        Thread.WaitAddress != IOEpoch && HasActionableSignal(Thread)) {
+      Thread.Waiting = WaitKind::None;
+      Thread.RerunBeforeSignals = true;
+      return true;
+    }
+    if (HasActionableSignal(Thread)) return true;
+    if (Thread.Waiting == WaitKind::Signal) {
+      // rt_sigtimedwait reruns to take a signal from its set or time out.
+      const auto& Process = Processes.at(Thread.PID);
+      if (!Expired && !((Thread.Pending.Set() | Process.SharedPending.Set()) & Thread.WaitSignals)) return false;
+      Thread.Waiting = WaitKind::None;
+      return true;
+    }
     if (Thread.Waiting == WaitKind::Sleep) {
-      if (!Expired) return PendingCaughtSignal(Thread, Processes.at(Thread.PID)) != 0;
+      // A CPU-clock sleep ends when the clock's process has used enough CPU time. A process that
+      // is gone ends it too: its clock can no longer advance.
+      const bool CpuDone = Thread.CpuDeadline && [&] {
+        const auto* Target = FindProcess(Thread.CpuClockPid);
+        return !Target || ProcessCpuNs(*Target) >= Thread.CpuDeadline;
+      }();
+      if (!Expired && !CpuDone) return false;
       Thread.Core->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX] = 0;
       Thread.Deadline = 0;
+      Thread.CpuDeadline = 0;
+      Thread.RealtimeTarget = 0;
       Thread.Waiting = WaitKind::None;
       return true;
     }
@@ -721,34 +1102,147 @@ private:
     return true;
   }
 
-  static uint64_t RealTimeNs() { return time(nullptr) * 1'000'000'000ULL; }
+  // Guest CLOCK_REALTIME: the Horizon RTC second sampled once at startup plus real elapsed time
+  // (see Switch2Guest::RealtimeBase). Everything that reads wall time goes through here.
+  uint64_t RealTimeNs() const {
+    const auto Now = Realtime.Now(MonotonicNs());
+    return Now > 0 ? static_cast<uint64_t>(Now) : 0;
+  }
+  uint64_t TaiNs() const {
+    const auto Now = Realtime.TaiNow(MonotonicNs());
+    return Now > 0 ? static_cast<uint64_t>(Now) : 0;
+  }
+
+  // The guest realtime clock was set (clock_settime, settimeofday, adjtimex ADJ_SETOFFSET).
+  // Absolute REALTIME/TAI sleeps are re-armed against the new time, as Linux does when the clock is set.
+  // Realtime timers keep realtime deadlines and need no re-arming; TFD_TIMER_CANCEL_ON_SET timerfds
+  // become readable and report ECANCELED once (timerfd_clock_was_set).
+  void RealtimeClockSet() {
+    const auto Mono = MonotonicNs();
+    for (auto& Thread : Threads) {
+      if (!Thread.Core || Thread.Exited || Thread.Waiting != WaitKind::Sleep || !Thread.RealtimeTarget) continue;
+      const auto ClockNow = Thread.RealtimeTai ? TaiNs() : RealTimeNs();
+      Thread.Deadline = Thread.RealtimeTarget <= ClockNow ? Mono : AddDeadline(Mono, Thread.RealtimeTarget - ClockNow);
+    }
+    for (const auto& Weak : TimerFds) {
+      const auto State = Weak.lock();
+      if (!State || !State->CancelOnSet || State->Canceled) continue;
+      State->Canceled = true;
+      ++State->Ticks;
+      ++State->Changes;
+      ++IOEpoch;
+    }
+  }
+
+
+  // The process or thread a CPU clock id names, or null (EINVAL). Linux pid_for_clock: pid 0 is the
+  // caller; a per-thread clock must name a thread of the caller's process; a process clock must name a
+  // process, and clock_gettime also accepts the caller's own thread id.
+  GuestProcess* CpuClockProcess(const Switch2Guest::DecodedClock& Clock, bool Reading) {
+    if (!Clock.Pid || Clock.Pid == Task->PID) return Task;
+    if (Reading && Clock.Pid == Current->TID) return Task;
+    return FindProcess(Clock.Pid);
+  }
+  const GuestThread* CpuClockThread(const Switch2Guest::DecodedClock& Clock) const {
+    if (!Clock.Pid) return Current;
+    for (const auto& Thread : Threads) {
+      if (Thread.Core && !Thread.Exited && Thread.TID == Clock.Pid && Thread.PID == Task->PID) return &Thread;
+    }
+    return nullptr;
+  }
+  bool CpuClockValid(const Switch2Guest::DecodedClock& Clock) {
+    return Clock.PerThread ? CpuClockThread(Clock) != nullptr : CpuClockProcess(Clock, false) != nullptr;
+  }
+
+  // Reads any readable clock in nanoseconds; returns 0 or a negative errno.
+  int64_t ReadClock(const Switch2Guest::DecodedClock& Clock, uint64_t& Ns) {
+    using Switch2Guest::ClockKind;
+    switch (Clock.Kind) {
+    case ClockKind::Realtime: case ClockKind::RealtimeAlarm: Ns = RealTimeNs(); return 0;
+    case ClockKind::RealtimeCoarse: Ns = Switch2Guest::RoundCoarse(RealTimeNs()); return 0;
+    case ClockKind::Tai: Ns = TaiNs(); return 0;
+    // Horizon has no suspend to count, so BOOTTIME is MONOTONIC.
+    case ClockKind::Monotonic: case ClockKind::MonotonicRaw: case ClockKind::Boottime: case ClockKind::BoottimeAlarm:
+      Ns = MonotonicNs();
+      return 0;
+    case ClockKind::MonotonicCoarse: Ns = Switch2Guest::RoundCoarse(MonotonicNs()); return 0;
+    case ClockKind::ProcessCpu: {
+      const auto* Process = CpuClockProcess(Clock, true);
+      if (!Process) return Invalid;
+      Ns = ProcessCpuNs(*Process);
+      return 0;
+    }
+    case ClockKind::ThreadCpu: {
+      const auto* Thread = CpuClockThread(Clock);
+      if (!Thread) return Invalid;
+      Ns = ThreadCpuNs(*Thread);
+      return 0;
+    }
+    case ClockKind::Invalid: break;
+    }
+    return Invalid;
+  }
 
   // nanosleep and clock_nanosleep. The thread waits for a monotonic deadline
   // and the syscall completes from the scheduler. Absolute CLOCK_REALTIME and
-  // CLOCK_TAI deadlines are converted once, so later clock changes do not
-  // move them.
-  int64_t SleepGuest(uint64_t Clock, uint64_t Flags, uint64_t Request, uint64_t Remaining) {
+  // CLOCK_TAI deadlines remember their target, so RealtimeClockSet re-arms them.
+  // CLOCK_PROCESS_CPUTIME_ID sleeps wait until the process's CPU time reaches the target.
+  int64_t SleepGuest(uint64_t ClockId, uint64_t Flags, uint64_t Request, uint64_t Remaining) {
+    using Switch2Guest::ClockKind;
     constexpr uint64_t AbsoluteTime = 1; // TIMER_ABSTIME; Linux ignores other flag bits.
-    // Error order follows Linux: unsupported clocks fail before the request
-    // is read, alarm clocks after it is validated.
-    const bool Alarm = Clock == 8 || Clock == 9; // REALTIME_ALARM, BOOTTIME_ALARM
-    switch (Clock) {
-      case 0: case 1: case 7: case 11: case 8: case 9: break; // REALTIME, MONOTONIC, BOOTTIME, TAI, alarms
-      case 3: case 4: case 5: case 6: return -95; // THREAD_CPUTIME, MONOTONIC_RAW, coarse clocks
-      case 2: return -95; // PROCESS_CPUTIME: not implemented, see FilesystemInventory.md.
-      default: return Invalid;
+    const auto Clock = Switch2Guest::DecodeClock(static_cast<int32_t>(ClockId));
+    // Error order follows Linux: clocks without a sleep fail before the request is read; the
+    // alarm capability and CPU clock targets are checked after the request is validated.
+    switch (Clock.Kind) {
+      case ClockKind::Realtime: case ClockKind::Monotonic: case ClockKind::Boottime: case ClockKind::Tai:
+      case ClockKind::RealtimeAlarm: case ClockKind::BoottimeAlarm: case ClockKind::ProcessCpu: break;
+      // Static THREAD_CPUTIME, MONOTONIC_RAW and the coarse clocks have no nsleep. Dynamic
+      // per-thread CPU clocks do, and fail after the request is read.
+      case ClockKind::ThreadCpu:
+        if (static_cast<int32_t>(ClockId) >= 0) return -95;
+        break;
+      case ClockKind::MonotonicRaw: case ClockKind::RealtimeCoarse: case ClockKind::MonotonicCoarse: return -95;
+      case ClockKind::Invalid: return Invalid;
     }
     if (Available(Request, PF_R) < 16) return Fault;
     uint64_t Duration {};
     if (!ReadTimespec(Request, Duration)) return Invalid;
-    // CAP_WAKE_ALARM is root-only here; Horizon offers no RTC wakeup source.
-    if (Alarm) return Task->UserIDs[1] ? -1 : -95;
+    // CAP_WAKE_ALARM gates the alarm clocks. Horizon has no RTC wakeup source and never suspends a
+    // running application, so a permitted alarm sleep is the matching non-alarm sleep.
+    if ((Clock.Kind == ClockKind::RealtimeAlarm || Clock.Kind == ClockKind::BoottimeAlarm) &&
+        !Task->Creds.Capable(Switch2Guest::CapWakeAlarm)) return -1;
     const auto Now = MonotonicNs();
     uint64_t Deadline {};
+    if (Clock.Kind == ClockKind::ProcessCpu || Clock.Kind == ClockKind::ThreadCpu) {
+      // Per-thread CPU clocks cannot be slept on here (Linux allows other threads' clocks; not tracked).
+      if (Clock.PerThread) return Invalid;
+      const auto* Target = CpuClockProcess(Clock, false);
+      if (!Target) return Invalid;
+      const auto CpuNow = ProcessCpuNs(*Target);
+      uint64_t CpuDeadline {};
+      if (Flags & AbsoluteTime) {
+        if (Duration <= CpuNow) return 0;
+        CpuDeadline = Duration;
+        Remaining = 0;
+      } else {
+        if (!Duration) return 0;
+        CpuDeadline = AddDeadline(CpuNow, Duration);
+      }
+      Current->CpuDeadline = CpuDeadline;
+      Current->CpuClockPid = Target->PID;
+      Current->SleepRemaining = Remaining;
+      Current->Waiting = WaitKind::Sleep;
+      Current->Core->CurrentFrame->State.rip += 2;
+      return RetrySyscall;
+    }
     if (Flags & AbsoluteTime) {
-      const auto ClockNow = Clock == 0 || Clock == 11 ? RealTimeNs() : Now;
+      const bool OnRealtime = Clock.Kind == ClockKind::Realtime || Clock.Kind == ClockKind::RealtimeAlarm;
+      const bool OnTai = Clock.Kind == ClockKind::Tai;
+      const auto ClockNow = OnRealtime ? RealTimeNs() : OnTai ? TaiNs() : Now;
       if (Duration <= ClockNow) return 0;
       Deadline = AddDeadline(Now, Duration - ClockNow);
+      Current->RealtimeTarget = OnRealtime || OnTai ? Duration : 0;
+      Current->RealtimeTai = OnTai;
       Remaining = 0; // Absolute sleeps never report the unslept time.
     } else {
       if (!Duration) return 0;
@@ -767,19 +1261,31 @@ private:
     auto& Result = Thread.Core->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX];
     Result = -4;
     if (Thread.SleepRemaining) {
-      const auto Now = MonotonicNs();
-      const auto Left = Thread.Deadline > Now ? Thread.Deadline - Now : 0;
+      uint64_t Left {};
+      if (Thread.CpuDeadline) {
+        // The unslept CPU time of a CPU-clock sleep.
+        const auto* Target = FindProcess(Thread.CpuClockPid);
+        const auto CpuNow = Target ? ProcessCpuNs(*Target) : Thread.CpuDeadline;
+        Left = Thread.CpuDeadline > CpuNow ? Thread.CpuDeadline - CpuNow : 0;
+      } else {
+        const auto Now = MonotonicNs();
+        Left = Thread.Deadline > Now ? Thread.Deadline - Now : 0;
+      }
       const int64_t Time[] {static_cast<int64_t>(Left / 1'000'000'000), static_cast<int64_t>(Left % 1'000'000'000)};
       if (CopyOut(Thread.SleepRemaining, Time)) Result = Fault;
     }
     Thread.SleepRemaining = 0;
     Thread.Deadline = 0;
+    Thread.CpuDeadline = 0;
+    Thread.RealtimeTarget = 0;
   }
 
   int64_t CloneThread(CoreFrame* Frame, uint64_t Flags, uint64_t Stack, uint64_t ParentTid, uint64_t ChildTid, uint64_t TLS) {
     constexpr uint64_t Shared = 0x10f00; // VM, FS, FILES, SIGHAND, THREAD
     constexpr uint64_t SetTLS = 0x80000, ParentSetTid = 0x100000, ChildClearTid = 0x200000, ChildSetTid = 0x1000000;
-    if ((Flags & Shared) != Shared || Flags & ~(Shared | SetTLS | ParentSetTid | ChildClearTid | ChildSetTid | 0x40000ULL)) return -38;
+    // Threads must share memory, filesystem state, descriptors and handlers.
+    if ((Flags & Shared) != Shared || Flags & ~(Shared | SetTLS | ParentSetTid | ChildClearTid | ChildSetTid | 0x40000ULL)) return Invalid;
+    if (NprocExceeded()) return -11;
     if (Stack < 16 || Available(Stack - 16, PF_W) < 16 ||
         ((Flags & ParentSetTid) && Available(ParentTid, PF_W) < 4) ||
         ((Flags & (ChildClearTid | ChildSetTid)) && Available(ChildTid, PF_W) < 4)) return Fault;
@@ -844,7 +1350,7 @@ private:
       const auto Now = MonotonicNs();
       if (Command == 0) Time = AddDeadline(Now, Time);
       if (Command == 9 && (Operation & 0x100)) {
-        const uint64_t RealTime = time(nullptr) * 1'000'000'000ULL;
+        const uint64_t RealTime = RealTimeNs();
         if (Time <= RealTime) return -110;
         Time = AddDeadline(Now, Time - RealTime);
       }
@@ -889,8 +1395,13 @@ private:
   static constexpr bool ReadAccess(uint64_t Flags) { return (Flags & 3) == 0 || (Flags & 3) == 2; }
   static constexpr bool WriteAccess(uint64_t Flags) { return (Flags & 3) == 1 || (Flags & 3) == 2; }
 
+  struct InotifyState {
+    Switch2Guest::InotifyInstance Instance;
+  };
+
   struct OpenFile {
     ~OpenFile() {
+      if (NotifyClose) ClosedFiles.push_back({Inode, Path, WriteAccess(StatusFlags), Directory.has_value()});
       if (Fifo) {
         if (ReadAccess(StatusFlags) && --Fifo->Readers == 0) Fifo->Reader->ShutRead = true;
         if (WriteAccess(StatusFlags) && --Fifo->Writers == 0) Fifo->Writer->ShutWrite = true;
@@ -914,11 +1425,20 @@ private:
     std::optional<std::vector<DirectoryEntry>> Directory;
     std::shared_ptr<StreamSocket> Socket;
     std::shared_ptr<FifoState> Fifo;
+    uint32_t PidfdTarget {}; // pidfd_open / CLONE_PIDFD: the process it refers to.
     bool FifoPartnerSeen {};
     uint64_t InitialWriterGeneration {};
     StreamSocket& WriteEndpoint() const { return *(Fifo ? Fifo->Writer : Socket); }
     bool Nonblocking() const { return StatusFlags & 04000; }
     std::shared_ptr<GuestMemoryFile> Memory;
+    // Descriptors on Linux's shared anonymous inode (anon_inode:[name]).
+    const char* AnonName {};
+    std::shared_ptr<TimerFdState> TimerFd;
+    std::shared_ptr<Switch2Guest::EventCounter> Event;
+    std::optional<uint64_t> SignalFdMask; // signalfd: the signals it reads
+    std::shared_ptr<EpollState> Epoll;
+    std::shared_ptr<InotifyState> Inotify;
+    bool NotifyClose {}; // an open regular file or directory: closing it is an inotify event
   };
   using SignalTable = std::array<std::array<uint64_t, 4>, 64>;
   struct ExecImage {
@@ -926,10 +1446,33 @@ private:
     std::optional<uint32_t> EffectiveUID, EffectiveGID;
     ElfImage Program;
     ElfImage Interpreter;
-    std::string Path;
+    std::string Path;        // the name execve was given (comm, AT_EXECFN)
+    std::string ProgramPath; // the ELF that runs; differs for interpreter scripts
     std::vector<std::string> Arguments;
     std::vector<std::string> Environment;
   };
+
+  static constexpr size_t ResourceCount = 16; // RLIM_NLIMITS
+  static constexpr uint64_t Infinity = UINT64_MAX;
+  static constexpr size_t ResourceCpu = 0, ResourceStack = 3, ResourceCore = 4, ResourceNproc = 6, ResourceNofile = 7,
+                          ResourceMemlock = 8, ResourceSigpending = 11, ResourceMsgqueue = 12, ResourceNice = 13,
+                          ResourceRtprio = 14;
+  // The limits of the launched program: Linux's INIT_RLIMITS with the
+  // runtime's capacities (descriptor table, thread table, signal queue).
+  static std::array<std::array<uint64_t, 2>, ResourceCount> DefaultLimits() {
+    std::array<std::array<uint64_t, 2>, ResourceCount> Limits;
+    Limits.fill({Infinity, Infinity});
+    Limits[ResourceStack] = {MainStackSize, Infinity};
+    Limits[ResourceCore] = {0, Infinity};
+    Limits[ResourceNproc] = {GuestThreadCount, GuestThreadCount};
+    Limits[ResourceNofile] = {DescriptorCount, DescriptorCount};
+    Limits[ResourceMemlock] = {8 << 20, 8 << 20};
+    Limits[ResourceSigpending] = {SignalPendingDefault, SignalPendingDefault};
+    Limits[ResourceMsgqueue] = {819200, 819200};
+    Limits[ResourceNice] = {0, 0};
+    Limits[ResourceRtprio] = {0, 0};
+    return Limits;
+  }
 
   struct GuestProcess {
     GuestAddressSpace Memory;
@@ -944,11 +1487,12 @@ private:
     uint32_t CreationMask {0022};
     bool NoNewPrivileges {};
     // Real, effective, saved and filesystem identities.
-    std::array<uint32_t, 4> UserIDs {1000, 1000, 1000, 1000};
-    std::array<uint32_t, 4> GroupIDs {1000, 1000, 1000, 1000};
+    // Capability sets and securebits ride along with the identities (Switch2Guest::Credentials).
+    Switch2Guest::Credentials Creds;
     std::vector<uint32_t> SupplementaryGroups;
     std::shared_ptr<DescriptorState> PendingDescriptors {std::make_shared<DescriptorState>()};
     SignalTable SignalActions {};
+    SignalQueue SharedPending;
     uint64_t HeapStart {};
     uint64_t HeapEnd {};
     uint64_t CpuTicks {};
@@ -956,6 +1500,35 @@ private:
     uint32_t PID {ProcessID};
     uint32_t ParentPID {1};
     uint32_t Group {ProcessID};
+    // The launched program leads its own session and holds the console as
+    // its controlling terminal, like a login shell.
+    uint32_t Session {ProcessID};
+    bool HasTerminal {true};
+    uint32_t ExitSignal {17}; // Sent to the parent on exit (clone's CSIGNAL).
+    uint32_t ParentDeathSignal {};
+    bool ChildSubreaper {};
+    bool Dumpable {true};
+    int32_t Nice {};
+    uint32_t Personality {};
+    std::array<char, 16> Name {};
+    uint64_t ChildTicks {}; // CPU ticks of reaped descendants.
+    // ITIMER_REAL (monotonic ns), ITIMER_VIRTUAL and ITIMER_PROF (process
+    // CPU ns). Kept across exec, not inherited by fork.
+    std::array<Switch2Guest::ArmedTimer, 3> ITimers {};
+    // POSIX timers (timer_create); deleted by exec, not inherited by fork.
+    std::vector<PosixTimer> Timers;
+    int32_t NextTimerId {};
+    // Soft and hard resource limits (RLIMIT_*), inherited by fork and kept by exec.
+    std::array<std::array<uint64_t, 2>, ResourceCount> Limits {DefaultLimits()};
+    // Job control: a stopped process does not run; the parent may collect
+    // one stop or continue report through wait.
+    bool Stopped {};
+    uint32_t StopSignal {};
+    bool ReportStop {};
+    bool ReportContinue {};
+    // Exited with no parent left to wait: retired then dropped (Reaped).
+    bool AutoReap {};
+    bool Reaped {};
     bool Exited {};
     bool HasDispatched {};
     bool RestorePending {};
@@ -989,6 +1562,8 @@ private:
     Process.Context = ContextType::CreateNewContext(Features);
     Process.Context->SetSignalDelegator(&Process.Signals);
     Process.Context->SetSyscallHandler(this);
+    // Interrupt-page checks let the watchdog preempt CPU-bound guest code.
+    Process.Context->SetPollPendingInterrupt(true);
     return Process.Context->InitCore();
   }
 
@@ -1037,6 +1612,7 @@ private:
       for (const auto& Weak : Task->PrivatePipePages) {
         if (const auto Pin = Weak.lock()) Pin->Suspended = false;
       }
+      std::erase_if(Processes, [&](const auto& Item) { return Item.second.Reaped && &Item.second != Task; });
     }
     if (!Task->HasDispatched) {
       if (Task->Image) ProcessCheckpoint("Replacement image entering dispatch");
@@ -1062,6 +1638,7 @@ private:
     }
     SuspendPipePages(Process, 0, UINT64_MAX, true);
     Process.Memory = {};
+    if (!SharedFileViews.empty()) PruneSharedFileViews();
     Process.ForkView.reset();
     Process.InheritedImages.clear();
     Process.Image.reset();
@@ -1069,30 +1646,53 @@ private:
     ++IOEpoch;
   }
 
-  int64_t GetProcessGroup(uint32_t PID) const {
-    if (!PID) return Task->Group;
+  GuestProcess* FindProcess(uint32_t PID) {
     const auto It = Processes.find(PID);
-    return It == Processes.end() ? -3 : It->second.Group;
+    return It == Processes.end() || It->second.Reaped ? nullptr : &It->second;
   }
 
-  int64_t SetProcessGroup(uint32_t PID, uint32_t Group) {
-    if (!PID) PID = Task->PID;
-    if (!Group) Group = PID;
-    const auto It = Processes.find(PID);
-    if (It == Processes.end() || (PID != Task->PID && It->second.ParentPID != Task->PID)) return -3;
-    if (PID != Task->PID && It->second.Image) return -13;
-    if (Group != PID && std::none_of(Processes.begin(), Processes.end(),
-                                     [&](const auto& Item) { return Item.second.Group == Group; })) return -1;
-    It->second.Group = Group;
+  int64_t GetProcessGroup(uint32_t PID) {
+    if (!PID) return Task->Group;
+    const auto* Process = FindProcess(PID);
+    return Process ? static_cast<int64_t>(Process->Group) : -3;
+  }
+
+  int64_t GetSession(uint32_t PID) {
+    if (!PID) return Task->Session;
+    const auto* Process = FindProcess(PID);
+    return Process ? static_cast<int64_t>(Process->Session) : -3;
+  }
+
+  bool GroupInSession(uint32_t Group, uint32_t Session) const {
+    return std::any_of(Processes.begin(), Processes.end(), [&](const auto& Item) {
+      return !Item.second.Reaped && Item.second.Group == Group && Item.second.Session == Session;
+    });
+  }
+
+  int64_t SetProcessGroup(uint64_t PIDArgument, uint64_t GroupArgument) {
+    if (static_cast<int32_t>(GroupArgument) < 0) return Invalid;
+    const uint32_t PID = PIDArgument ? static_cast<uint32_t>(PIDArgument) : Task->PID;
+    const uint32_t Group = GroupArgument ? static_cast<uint32_t>(GroupArgument) : PID;
+    auto* Target = FindProcess(PID);
+    if (!Target) return -3;
+    const SessionView Caller {Task->PID, Task->Group, Task->Session, false, false};
+    const SessionView View {Target->PID, Target->Group, Target->Session, Target->ParentPID == Task->PID, Target->Image != nullptr};
+    if (const auto Error = CheckSetpgid(Caller, View, GroupInSession(Group, Task->Session), Group)) return Error;
+    Target->Group = Group;
     return 0;
   }
 
-  struct ForkRequest {
-    uint64_t Flags;
-    uint64_t ChildTid;
-  };
+  // setsid: a new session and group led by the caller, without a
+  // controlling terminal.
+  int64_t SetSession() {
+    const bool InUse = std::any_of(Processes.begin(), Processes.end(),
+                                   [&](const auto& Item) { return !Item.second.Reaped && Item.second.Group == Task->PID; });
+    if (const auto Error = CheckSetsid({Task->PID, Task->Group, Task->Session, false, false}, InUse)) return Error;
+    Task->Session = Task->Group = Task->PID;
+    Task->HasTerminal = false;
+    return Task->PID;
+  }
 
-  std::optional<ForkRequest> PendingFork;
 
   void ProcessCheckpoint(const char* Name) const {
     if (Logging != LogLevel::Trace) return;
@@ -1117,25 +1717,118 @@ private:
     ProcessCheckpoint(Message);
   }
 
-  int64_t RequestFork(uint64_t Flags, uint64_t ChildTid) {
-    constexpr uint64_t ChildSetTid = 0x1000000, ChildClearTid = 0x200000;
-    if ((Flags & 0xff) != 17 || (Flags & ~(ChildSetTid | ChildClearTid | 0xffULL))) return -38;
-    if ((Flags & (ChildSetTid | ChildClearTid)) && Available(ChildTid, PF_W) < sizeof(uint32_t)) return Fault;
+  static constexpr uint64_t CloneVm = 0x100, CloneFs = 0x200, CloneFiles = 0x400, CloneSighand = 0x800, ClonePidfd = 0x1000,
+                            ClonePtrace = 0x2000, CloneVfork = 0x4000, CloneParent = 0x8000, CloneThread_ = 0x10000,
+                            CloneSysvsem = 0x40000, CloneSettls = 0x80000, CloneParentSettid = 0x100000,
+                            CloneChildCleartid = 0x200000, CloneDetached = 0x400000, CloneUntraced = 0x800000,
+                            CloneChildSettid = 0x1000000, CloneIo = 0x80000000ULL, CloneClearSighand = 0x100000000ULL,
+                            CloneIntoCgroup = 0x200000000ULL;
+  static constexpr uint64_t CloneNamespaces = 0x20000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000;
+
+  // A process clone (fork, vfork, clone or clone3 without CLONE_THREAD).
+  // Flags may carry the exit signal in the low byte (clone, fork, vfork).
+  struct ForkRequest {
+    uint64_t Flags;
+    uint64_t ChildTid {};
+    uint64_t ParentTid {};
+    uint64_t PidfdAddress {};
+    uint64_t Stack {};
+    uint64_t TLS {};
+    uint32_t ExitSignal {SigChld};
+  };
+  std::optional<ForkRequest> PendingFork;
+
+  int64_t CloneGuest(CoreFrame* Frame, uint64_t Flags, uint64_t Stack, uint64_t ParentTid, uint64_t ChildTid, uint64_t TLS) {
+    if ((Flags & ClonePidfd) && (Flags & CloneThread_)) return Invalid;
+    if (Flags & CloneThread_) {
+      if (!(Flags & CloneSighand)) return Invalid;
+      return CloneThread(Frame, Flags, Stack, ParentTid, ChildTid, TLS);
+    }
+    // clone(2) passes the pidfd slot in parent_tid; it excludes PARENT_SETTID
+    // and CLONE_DETACHED.
+    if ((Flags & ClonePidfd) && (Flags & (CloneParentSettid | CloneDetached))) return Invalid;
+    return RequestClone({Flags & ~0xffULL, ChildTid, ParentTid, Flags & ClonePidfd ? ParentTid : 0, Stack, TLS,
+                         static_cast<uint32_t>(Flags & 0xff)});
+  }
+
+  // struct clone_args, CLONE_ARGS_SIZE_VER2.
+  struct CloneArgs {
+    uint64_t Flags, Pidfd, ChildTid, ParentTid, ExitSignal, Stack, StackSize, TLS, SetTid, SetTidSize, Cgroup;
+  };
+  static_assert(sizeof(CloneArgs) == 88);
+
+  int64_t Clone3(CoreFrame* Frame, uint64_t Address, uint64_t Size) {
+    if (Size < 64) return Invalid;
+    if (Size > 4096) return -7; // E2BIG
+    CloneArgs Args {};
+    if (Available(Address, PF_R) < Size) return Fault;
+    std::memcpy(&Args, reinterpret_cast<const void*>(Address), std::min<uint64_t>(Size, sizeof(Args)));
+    for (uint64_t Offset = sizeof(Args); Offset < Size; ++Offset) {
+      if (reinterpret_cast<const uint8_t*>(Address)[Offset]) return -7;
+    }
+    if ((Args.ExitSignal & ~0xffULL) || Args.ExitSignal > SigMax) return Invalid;
+    if (Args.Flags & ~(~0xffULL & (0xffffffffULL | CloneClearSighand | CloneIntoCgroup))) return Invalid;
+    if (Args.Flags & 0xff) return Invalid; // the exit signal has its own field
+    if ((Args.Flags & CloneDetached) || ((Args.Flags & CloneClearSighand) && (Args.Flags & CloneSighand))) return Invalid;
+    // No cgroups; set_tid needs PID namespaces, which the runtime lacks.
+    if (Args.Flags & CloneIntoCgroup) return Invalid;
+    if (Args.SetTidSize > 32 || (Args.SetTid && !Args.SetTidSize) || (!Args.SetTid && Args.SetTidSize)) return Invalid;
+    if (Args.SetTidSize) {
+      return Task->Creds.Capable(CapSysAdmin) || Task->Creds.Capable(CapCheckpointRestore) ? Invalid : -1;
+    }
+    if (!Args.Stack != !Args.StackSize) return Invalid;
+    const auto Top = Args.Stack ? Args.Stack + Args.StackSize : 0;
+    if ((Args.Flags & ClonePidfd) && (Args.Flags & CloneThread_)) return Invalid;
+    if (Args.Flags & CloneThread_) {
+      if (!(Args.Flags & CloneSighand)) return Invalid;
+      return CloneThread(Frame, Args.Flags, Top, Args.ParentTid, Args.ChildTid, Args.TLS);
+    }
+    return RequestClone({Args.Flags, Args.ChildTid, Args.ParentTid, Args.Flags & ClonePidfd ? Args.Pidfd : 0, Top, Args.TLS,
+                         static_cast<uint32_t>(Args.ExitSignal)});
+  }
+
+  // Linux copy_process checks for a process clone. Processes cannot share
+  // memory (except through vfork, which copies), filesystem state or
+  // descriptor tables here, and there are no namespaces: those return EINVAL
+  // (namespaces EPERM without privilege). See ProcessInventory.md.
+  int64_t RequestClone(ForkRequest Request) {
+    auto& Flags = Request.Flags;
+    if (Flags & 0xff) {
+      Request.ExitSignal = Flags & 0xff;
+      Flags &= ~0xffULL;
+    }
+    if (Request.ExitSignal > SigMax) return Invalid;
+    if ((Flags & CloneSighand) && !(Flags & CloneVm)) return Invalid;
+    if (Flags & CloneNamespaces) return Task->Creds.Capable(CapSysAdmin) ? Invalid : -1;
+    if ((Flags & CloneVm) && !(Flags & CloneVfork)) return Invalid;
+    if (Flags & (CloneFs | CloneFiles | CloneSighand)) return Invalid;
+    if ((Flags & CloneParentSettid) && Available(Request.ParentTid, PF_W) < sizeof(uint32_t)) return Fault;
+    if ((Flags & (CloneChildSettid | CloneChildCleartid)) && Available(Request.ChildTid, PF_W) < sizeof(uint32_t)) return Fault;
+    if ((Flags & ClonePidfd) && Available(Request.PidfdAddress, PF_W) < sizeof(int32_t)) return Fault;
+    if ((Flags & CloneSettls) && !IsGuestUserRange(Request.TLS, 1)) return -1;
+    if (NprocExceeded()) return -11;
     if (Processes.size() >= Threads.size()) return -11;
-    PendingFork = ForkRequest {Flags, ChildTid};
+    PendingFork = Request;
     return RetrySyscall;
   }
 
   void CompleteFork() {
-    const auto [Flags, ChildTid] = *PendingFork;
+    const auto Request = *PendingFork;
     PendingFork.reset();
     auto* Frame = Current->Core->CurrentFrame;
-    Frame->State.gregs[FEXCore::X86State::REG_RAX] = ForkGuest(Frame, Flags, ChildTid);
+    const auto Result = ForkGuest(Frame, Request);
+    Frame->State.gregs[FEXCore::X86State::REG_RAX] = Result;
     Frame->State.rip += 2;
+    if (Result > 0 && (Request.Flags & CloneVfork)) {
+      // The parent sleeps until the child execs or exits (vfork_done).
+      Current->Waiting = WaitKind::Vfork;
+      Current->WaitAddress = Result;
+    }
   }
 
-  int64_t ForkGuest(CoreFrame* Frame, uint64_t Flags, uint64_t ChildTid) {
-    constexpr uint64_t ChildSetTid = 0x1000000, ChildClearTid = 0x200000;
+  int64_t ForkGuest(CoreFrame* Frame, const ForkRequest& Request) {
+    const auto Flags = Request.Flags, ChildTid = Request.ChildTid;
+    constexpr uint64_t ChildSetTid = CloneChildSettid, ChildClearTid = CloneChildCleartid;
     ProcessCheckpoint("Fork request, saving parent memory");
     if (!Task->Memory.SavePrivatePages(ValidateSnapshotRange)) return -11;
     ProcessCheckpoint("Fork request, parent memory saved");
@@ -1143,13 +1836,20 @@ private:
     const auto PID = NextTid++;
     auto& Child = Processes.try_emplace(PID).first->second;
     Child.PID = PID;
-    Child.ParentPID = Task->PID;
+    Child.ParentPID = Flags & CloneParent ? Task->ParentPID : Task->PID;
     Child.Group = Task->Group;
+    Child.Session = Task->Session;
+    Child.HasTerminal = Task->HasTerminal;
+    Child.ExitSignal = Flags & CloneParent ? Task->ExitSignal : Request.ExitSignal;
+    Child.Dumpable = Task->Dumpable;
+    Child.Nice = Task->Nice;
+    Child.Personality = Task->Personality;
+    Child.Name = Task->Name;
     Child.Folder = Task->Folder;
     Child.CreationMask = Task->CreationMask;
     Child.NoNewPrivileges = Task->NoNewPrivileges;
-    Child.UserIDs = Task->UserIDs;
-    Child.GroupIDs = Task->GroupIDs;
+    Child.Limits = Task->Limits;
+    Child.Creds = Task->Creds;
     Child.SupplementaryGroups = Task->SupplementaryGroups;
     Child.RemovedWorkingDirectory = Task->RemovedWorkingDirectory;
     Child.WorkingDirectory = Task->WorkingDirectory;
@@ -1159,6 +1859,11 @@ private:
     Child.RestorePending = true;
     *Child.PendingDescriptors = Descriptors();
     Child.SignalActions = Task->SignalActions;
+    if (Flags & CloneClearSighand) {
+      for (auto& Action : Child.SignalActions) {
+        if (Action[0] != SigIgnore) Action = {};
+      }
+    }
     Child.HeapStart = Task->HeapStart;
     Child.HeapEnd = Task->HeapEnd;
     // Keep the source process's ELF backing alive even if it execs or exits.
@@ -1171,6 +1876,8 @@ private:
     State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = Child.GDT.data();
     State.rip += 2;
     State.gregs[FEXCore::X86State::REG_RAX] = 0;
+    if (Request.Stack) State.gregs[FEXCore::X86State::REG_RSP] = Request.Stack;
+    if (Flags & CloneSettls) State.fs_cached = Request.TLS;
     ProcessCheckpoint("Fork request, creating child FEX context");
     if (!InitializeProcessContext(Child) ||
         !AddThread(*Child.Context, State, PID, Flags & ChildClearTid ? ChildTid : 0, PID)) {
@@ -1179,40 +1886,420 @@ private:
     }
     const auto Thread = std::find_if(Threads.begin(), Threads.end(), [PID](const auto& Entry) { return Entry.TID == PID; });
     if (Flags & ChildSetTid) Thread->SetTidOnStart = ChildTid;
+    Thread->AltStack = Current->AltStack; // fork keeps sigaltstack; new threads do not
+    if (Flags & CloneParentSettid) CopyOut(Request.ParentTid, static_cast<uint32_t>(PID));
+    if (Flags & ClonePidfd) {
+      // Installed after the child copied the descriptor table, as in Linux.
+      const auto Pidfd = OpenPidfd(PID, 0);
+      if (Pidfd < 0) {
+        Thread->Core->CTX->DestroyThread(Thread->Core);
+        *Thread = {};
+        Processes.erase(PID); // owns the context the thread used
+        return Pidfd;
+      }
+      CopyOut(Request.PidfdAddress, static_cast<int32_t>(Pidfd));
+    }
     Child.TraceFirstDispatch = true;
     Child.StartupSyscallCheckpoints = Logging == LogLevel::Trace ? 6 : 0;
     ProcessCheckpoint("Fork request, child ready");
     return PID;
   }
 
-  int64_t WaitChild(int32_t PID, uint64_t Status, uint32_t Flags, uint64_t Usage) {
-    if (Flags & ~(1u | 2u | 8u)) return Invalid;
-    if (Status && Available(Status, PF_W) < 4) return Fault;
-    if (Usage && Available(Usage, PF_W) < 144) return Fault;
+  static uint64_t TicksToMicroseconds(uint64_t Ticks) { return armTicksToNs(Ticks) / 1000; }
+
+  // struct rusage: only ru_utime is measured (guest CPU time); the
+  // cooperative runtime has no system time, page faults or context switches.
+  int64_t CopyUsage(uint64_t Address, uint64_t Ticks) {
+    std::array<uint64_t, 18> Usage {};
+    const auto Microseconds = TicksToMicroseconds(Ticks);
+    Usage[0] = Microseconds / 1'000'000;
+    Usage[1] = Microseconds % 1'000'000;
+    return CopyOut(Address, Usage);
+  }
+
+  struct WaitReport {
+    uint32_t PID, Uid, Status;
+    int32_t Code, Value; // si_code and si_status
+    uint64_t Ticks;      // the child's CPU time plus its waited children's
+  };
+
+  // Linux do_wait for wait4 and waitid. Reports one exited, stopped or
+  // continued child matching Selector; reaps exited children unless WNOWAIT.
+  std::variant<int64_t, WaitReport> WaitGeneric(WaitSelector Selector, uint32_t Options, bool IsWaitId) {
     bool HasChild {};
     for (auto It = Processes.begin(); It != Processes.end(); ++It) {
-      const auto& Child = It->second;
-      if (Child.ParentPID != Task->PID) continue;
-      if (PID > 0 && Child.PID != static_cast<uint32_t>(PID)) continue;
-      if (PID == 0 && Child.Group != Task->Group) continue;
-      if (PID < -1 && Child.Group != static_cast<uint32_t>(-static_cast<int64_t>(PID))) continue;
+      auto& Child = It->second;
+      if (Child.Reaped || Child.ParentPID != Task->PID) continue;
+      if (Selector.Type == WaitIdType::Pid && Child.PID != Selector.Id) continue;
+      if (Selector.Type == WaitIdType::Pgid && Child.Group != Selector.Id) continue;
+      // __WCLONE selects children whose exit signal is not SIGCHLD; __WALL both.
+      if (!(Options & WAll) && ((Options & WClone) != 0) != (Child.ExitSignal != SigChld)) continue;
       HasChild = true;
-      if (!Child.Exited) continue;
-      if (Status) CopyOut(Status, Child.TerminatingSignal ? Child.TerminatingSignal : Child.Status << 8);
-      if (Usage) {
-        std::array<uint64_t, 18> Accounting {};
-        const auto Microseconds = armTicksToNs(Child.CpuTicks) / 1000;
-        Accounting[0] = Microseconds / 1'000'000;
-        Accounting[1] = Microseconds % 1'000'000;
-        CopyOut(Usage, Accounting);
+      const bool Keep = Options & WNoWait;
+      if (Child.Exited && (!IsWaitId || (Options & WExited))) {
+        const WaitReport Report {Child.PID, Child.Creds.Uid[0],
+                                 Child.TerminatingSignal ? WaitSignaledStatus(Child.TerminatingSignal) : WaitExitedStatus(Child.Status),
+                                 Child.TerminatingSignal ? CldKilled : CldExited,
+                                 static_cast<int32_t>(Child.TerminatingSignal ? Child.TerminatingSignal : Child.Status),
+                                 Child.CpuTicks + Child.ChildTicks};
+        if (!Keep) {
+          Task->ChildTicks += Child.CpuTicks + Child.ChildTicks;
+          Processes.erase(It);
+        }
+        return Report;
       }
-      const auto Reaped = Child.PID;
-      Processes.erase(It);
-      return Reaped;
+      if (Child.Stopped && Child.ReportStop && (Options & WUntraced)) {
+        if (!Keep) Child.ReportStop = false;
+        return WaitReport {Child.PID, Child.Creds.Uid[0], WaitStoppedStatus(Child.StopSignal), CldStopped,
+                           static_cast<int32_t>(Child.StopSignal), Child.CpuTicks + Child.ChildTicks};
+      }
+      if (Child.ReportContinue && (Options & WContinued)) {
+        if (!Keep) Child.ReportContinue = false;
+        return WaitReport {Child.PID, Child.Creds.Uid[0], WaitContinuedStatus, CldContinued, static_cast<int32_t>(SigCont),
+                           Child.CpuTicks + Child.ChildTicks};
+      }
     }
-    if (!HasChild) return -10;
-    if (Flags & 1) return 0;
+    if (!HasChild) return int64_t {-10};
+    if (Options & WNoHang) return int64_t {0};
     return WaitForIO();
+  }
+
+  int64_t Wait4(uint64_t PID, uint64_t Status, uint64_t Options, uint64_t Usage) {
+    if (const auto Error = ValidateWait4Options(Options)) return Error;
+    if (static_cast<int32_t>(PID) == INT32_MIN) return -3;
+    if (Status && Available(Status, PF_W) < 4) return Fault;
+    if (Usage && Available(Usage, PF_W) < 144) return Fault;
+    // wait4 always reports exited children.
+    const auto Result = WaitGeneric(SelectorFromWait4(static_cast<int32_t>(PID), Task->Group), Options | WExited, false);
+    if (const auto* Error = std::get_if<int64_t>(&Result)) return *Error;
+    const auto& Report = std::get<WaitReport>(Result);
+    if (Status) CopyOut(Status, Report.Status);
+    if (Usage) CopyUsage(Usage, Report.Ticks);
+    return Report.PID;
+  }
+
+  // waitid writes si_signo, si_errno, si_code, si_pid, si_uid and si_status.
+  static constexpr size_t WaitIdInfoBytes = offsetof(SigInfo, Child) + 12;
+  int64_t WaitId(uint64_t Type, uint64_t ID, uint64_t InfoAddress, uint64_t Options, uint64_t Usage) {
+    if (const auto Error = ValidateWaitIdOptions(Options)) return Error;
+    WaitSelector Selector {};
+    switch (Type) {
+    case 0: Selector = {WaitIdType::All, 0}; break;
+    case 1:
+      if (static_cast<int32_t>(ID) <= 0) return Invalid;
+      Selector = {WaitIdType::Pid, static_cast<uint32_t>(ID)};
+      break;
+    case 2:
+      if (static_cast<int32_t>(ID) < 0) return Invalid;
+      Selector = {WaitIdType::Pgid, ID ? static_cast<uint32_t>(ID) : Task->Group};
+      break;
+    case 3: {
+      const auto* File = GetFile(ID);
+      if (!File || !File->PidfdTarget) return BadFile;
+      Selector = {WaitIdType::Pid, File->PidfdTarget};
+      break;
+    }
+    default: return Invalid;
+    }
+    if (InfoAddress && Available(InfoAddress, PF_W) < sizeof(SigInfo)) return Fault;
+    if (Usage && Available(Usage, PF_W) < 144) return Fault;
+    const auto Result = WaitGeneric(Selector, Options, true);
+    if (const auto* Error = std::get_if<int64_t>(&Result)) {
+      // WNOHANG with nothing to report clears the reported fields.
+      if (*Error == 0 && InfoAddress) std::memset(reinterpret_cast<void*>(InfoAddress), 0, WaitIdInfoBytes);
+      return *Error;
+    }
+    const auto& Report = std::get<WaitReport>(Result);
+    if (InfoAddress) {
+      SigInfo Info = MakeSigInfo(SigChld, Report.Code, Report.PID, Report.Uid);
+      Info.Child.Status = Report.Value;
+      std::memcpy(reinterpret_cast<void*>(InfoAddress), &Info, WaitIdInfoBytes);
+    }
+    if (Usage) CopyUsage(Usage, Report.Ticks);
+    return 0;
+  }
+
+  // Linux do_notify_parent / do_notify_parent_cldstop. Returns true when the
+  // exited child must be reaped at once (SIGCHLD ignored or SA_NOCLDWAIT).
+  bool NotifyParent(GuestProcess& Child, int32_t Code, int32_t Value) {
+    auto* Parent = FindProcess(Child.ParentPID);
+    if (!Parent || Parent->Exited) return Code == CldExited || Code == CldKilled;
+    const auto& Action = Parent->SignalActions[SigChld - 1];
+    uint32_t Signal = SigChld;
+    bool AutoReap {};
+    if (Code == CldStopped || Code == CldContinued) {
+      if (Action[1] & SaNoCldStop) return false;
+    } else {
+      Signal = Child.ExitSignal;
+      if (Signal == SigChld && (Action[0] == SigIgnore || (Action[1] & SaNoCldWait))) {
+        AutoReap = true;
+        if (Action[0] == SigIgnore) Signal = 0;
+      }
+    }
+    if (Signal && Signal <= SigMax) {
+      auto Info = MakeSigInfo(Signal, Code, Child.PID, Child.Creds.Uid[0]);
+      Info.Child.Status = Value;
+      Info.Child.Utime = static_cast<int64_t>(TicksToMicroseconds(Child.CpuTicks) / 10'000); // clock ticks
+      SendSignal(*Parent, nullptr, Info);
+    }
+    ++IOEpoch;
+    return AutoReap;
+  }
+
+  // The nearest living ancestor marked as child subreaper, else the
+  // runtime's virtual init (pid 1), which reaps at once.
+  uint32_t ReaperFor(const GuestProcess& Process) {
+    for (auto PID = Process.ParentPID; PID > 1;) {
+      const auto* Ancestor = FindProcess(PID);
+      if (!Ancestor) break;
+      if (Ancestor->ChildSubreaper && !Ancestor->Exited) return PID;
+      PID = Ancestor->ParentPID;
+    }
+    return 1;
+  }
+
+  // Linux will_become_orphaned_pgrp: no living member has a living parent
+  // in another group of the same session.
+  bool IsOrphanedGroup(uint32_t Group) {
+    for (const auto& [ID, Member] : Processes) {
+      if (Member.Reaped || Member.Exited || Member.Group != Group) continue;
+      const auto* Parent = FindProcess(Member.ParentPID);
+      if (Parent && !Parent->Exited && Parent->Group != Group && Parent->Session == Member.Session) return false;
+    }
+    return true;
+  }
+
+  bool GroupHasStopped(uint32_t Group) const {
+    return std::any_of(Processes.begin(), Processes.end(), [&](const auto& Item) {
+      return !Item.second.Reaped && !Item.second.Exited && Item.second.Group == Group && Item.second.Stopped;
+    });
+  }
+
+  // kill_pgrp with kernel privilege.
+  void SignalGroup(uint32_t Group, uint32_t Signal) {
+    for (auto& [ID, Member] : Processes) {
+      if (!Member.Reaped && !Member.Exited && Member.Group == Group) SendSignal(Member, nullptr, MakeSigInfo(Signal, SiKernel));
+    }
+  }
+
+  // kill_orphaned_pgrp: a group that just became orphaned and has stopped
+  // members gets SIGHUP then SIGCONT.
+  void HangUpOrphanedGroup(uint32_t Group) {
+    if (!IsOrphanedGroup(Group) || !GroupHasStopped(Group)) return;
+    SignalGroup(Group, SigHup);
+    SignalGroup(Group, SigCont);
+  }
+
+  // Linux do_exit/exit_notify for the current process: ends every thread,
+  // reparents children, hangs up newly orphaned stopped groups, gives up a
+  // controlling terminal it leads and notifies the parent.
+  void ExitProcess(uint32_t Status, uint32_t Signal) {
+    auto& Process = *Task;
+    Process.Status = Status & 0xff;
+    Process.TerminatingSignal = Signal;
+    Process.Exited = true;
+    Process.Stopped = false;
+    if (!Current->Exited) ExitThread();
+    for (auto& Thread : Threads) {
+      if (!Thread.Core || Thread.Exited || Thread.PID != Process.PID) continue;
+      Thread.Exited = true;
+      Thread.Descriptors.reset();
+      Thread.PendingFifo.reset();
+    }
+    if (Process.Session == Process.PID && TerminalSession == Process.Session) {
+      if (ForegroundGroup) SignalGroup(ForegroundGroup, SigHup);
+      for (auto& [ID, Member] : Processes) {
+        if (Member.Session == Process.Session) Member.HasTerminal = false;
+      }
+      TerminalSession = 0;
+      ForegroundGroup = 0;
+    }
+    const auto Reaper = ReaperFor(Process);
+    for (auto& [ID, Child] : Processes) {
+      if (Child.Reaped || Child.ParentPID != Process.PID) continue;
+      Child.ParentPID = Reaper;
+      Child.ExitSignal = SigChld; // reparent_leader: the new parent gets SIGCHLD
+      if (Child.ParentDeathSignal && !Child.Exited) {
+        SendSignal(Child, nullptr, MakeSigInfo(Child.ParentDeathSignal, SiUser, Process.PID, Process.Creds.Uid[0]));
+      }
+      if (Child.Exited) {
+        if (Reaper == 1 || NotifyParent(Child, Child.TerminatingSignal ? CldKilled : CldExited,
+                                        Child.TerminatingSignal ? Child.TerminatingSignal : Child.Status)) {
+          Child.Reaped = true; // Zombies were retired when they exited.
+        }
+      } else if (Child.Group != Process.Group && Child.Session == Process.Session) {
+        HangUpOrphanedGroup(Child.Group);
+      }
+    }
+    if (const auto* Parent = FindProcess(Process.ParentPID);
+        Parent && Parent->Group != Process.Group && Parent->Session == Process.Session) {
+      HangUpOrphanedGroup(Process.Group);
+    }
+    if (Process.PID == ProcessID) {
+      Number = LinuxExitSyscall;
+      ExitStatus = Signal ? 128 + Signal : Process.Status;
+      ProcessExited = true;
+    } else {
+      Process.AutoReap = Process.ParentPID == 1 ||
+        NotifyParent(Process, Signal ? CldKilled : CldExited, static_cast<int32_t>(Signal ? Signal : Process.Status));
+    }
+    ++IOEpoch;
+  }
+
+  // Default stop action (do_signal_stop) for the current process.
+  void StopProcess(GuestProcess& Process, uint32_t Signal) {
+    Process.Stopped = true;
+    Process.StopSignal = Signal;
+    Process.ReportStop = true;
+    Process.ReportContinue = false;
+    NotifyParent(Process, CldStopped, static_cast<int32_t>(Signal));
+    ++IOEpoch;
+  }
+
+  // SIGCONT generation resumes a stopped process (prepare_signal).
+  void ContinueProcess(GuestProcess& Process) {
+    if (!Process.Stopped) return;
+    Process.Stopped = false;
+    Process.ReportStop = false;
+    Process.ReportContinue = true;
+    NotifyParent(Process, CldContinued, static_cast<int32_t>(SigCont));
+    ++IOEpoch;
+  }
+
+  int64_t OpenPidfd(uint32_t PID, uint32_t Flags) {
+    const auto FD = FreeDescriptor();
+    if (FD == NoDescriptor) return -24;
+    auto File = std::make_shared<OpenFile>();
+    File->PidfdTarget = PID;
+    File->StatusFlags = 2 | (Flags & 04000);
+    File->Path = "anon_inode:[pidfd]";
+    File->Inode = NextAnonymousInode++;
+    Descriptors().Files[FD] = std::move(File);
+    Descriptors().Flags[FD] = 1; // pidfds are always close-on-exec
+    return FD;
+  }
+
+  int64_t PidfdOpen(uint64_t PID, uint64_t Flags) {
+    if (Flags & ~uint64_t {04000} || static_cast<int32_t>(PID) <= 0) return Invalid;
+    if (!FindProcess(PID)) return ProcessOfId(PID) ? Invalid : -3; // a non-leader thread: EINVAL
+    return OpenPidfd(PID, Flags);
+  }
+
+  // Flags: PIDFD_SIGNAL_THREAD 1, PIDFD_SIGNAL_THREAD_GROUP 2,
+  // PIDFD_SIGNAL_PROCESS_GROUP 4; at most one.
+  int64_t PidfdSendSignal(uint64_t FD, uint64_t Signal, uint64_t InfoAddress, uint64_t Flags) {
+    if ((Flags & ~uint64_t {7}) || std::popcount(Flags) > 1) return Invalid;
+    const auto* File = GetFile(FD);
+    if (!File) return BadFile;
+    if (!File->PidfdTarget) return Invalid;
+    auto* Target = FindProcess(File->PidfdTarget);
+    if (!Target) return -3;
+    SigInfo Info = MakeSigInfo(Signal, SiUser, Task->PID, Task->Creds.Uid[0]);
+    if (InfoAddress) {
+      if (Available(InfoAddress, PF_R) < sizeof(Info)) return Fault;
+      std::memcpy(&Info, reinterpret_cast<const void*>(InfoAddress), sizeof(Info));
+      if (static_cast<uint32_t>(Info.Signo) != Signal) return Invalid;
+      if (Target != Task && (Info.Code >= 0 || Info.Code == SiTkill)) return -1;
+    }
+    if (Flags == 1) {
+      // A process pidfd names its leader thread.
+      auto* Leader = LeaderThread(Target->PID);
+      return Leader ? SignalOne(*Target, Leader, Signal, Info) : -3;
+    }
+    if (Flags == 4) return SignalProcessGroup(Target->Group, Signal, Info);
+    return SignalOne(*Target, nullptr, Signal, Info);
+  }
+
+  // pidfd_getfd. Linux requires PTRACE_MODE_ATTACH_REALCREDS; without ptrace
+  // this is "same real and effective uid as the target, or root".
+  int64_t PidfdGetFd(uint64_t FD, uint64_t TargetFD, uint64_t Flags) {
+    if (Flags) return Invalid;
+    const auto* File = GetFile(FD);
+    if (!File) return BadFile;
+    if (!File->PidfdTarget) return BadFile;
+    const auto* Target = FindProcess(File->PidfdTarget);
+    if (!Target || Target->Exited) return -3;
+    const auto& Mine = Task->Creds.Uid;
+    if (!Task->Creds.Capable(CapSysPtrace) && (Target->Creds.Uid[0] != Mine[0] || Target->Creds.Uid[1] != Mine[0])) return -1;
+    const GuestThread* Owner = LeaderThread(Target->PID);
+    if (!Owner || !Owner->Descriptors || TargetFD >= Owner->Descriptors->Files.size()) return BadFile;
+    auto Shared = Owner->Descriptors->Files[TargetFD];
+    if (!Shared) return BadFile;
+    const auto New = FreeDescriptor();
+    if (New == NoDescriptor) return -24;
+    Descriptors().Files[New] = std::move(Shared);
+    Descriptors().Flags[New] = 1;
+    return New;
+  }
+
+  int64_t ResourceUsage(uint64_t Who, uint64_t Address) {
+    uint64_t Ticks {};
+    switch (static_cast<int32_t>(Who)) {
+    case 0: Ticks = ProcessTicks(*Task); break;  // RUSAGE_SELF
+    case -1: Ticks = Task->ChildTicks; break;    // RUSAGE_CHILDREN
+    case 1: Ticks = ThreadTicks(*Current); break; // RUSAGE_THREAD
+    default: return Invalid;
+    }
+    return CopyUsage(Address, Ticks) ? Fault : 0;
+  }
+
+  // times(2): clock ticks at USER_HZ 100; the result counts ticks since boot.
+  int64_t ProcessTimes(uint64_t Address) {
+    const auto Ticks = [](uint64_t CpuTicks) { return static_cast<int64_t>(armTicksToNs(CpuTicks) / 10'000'000); };
+    const int64_t Times[4] {Ticks(ProcessTicks(*Task)), 0, Ticks(Task->ChildTicks), 0};
+    if (Address && CopyOut(Address, Times)) return Fault;
+    return static_cast<int64_t>(MonotonicNs() / 10'000'000);
+  }
+
+  // personality(2): the value is stored and reported; ADDR_NO_RANDOMIZE and
+  // the other flags change nothing because the runtime has no ASLR.
+  int64_t SetPersonality(uint64_t Value) {
+    const auto Old = Task->Personality;
+    if (static_cast<uint32_t>(Value) != UINT32_MAX) Task->Personality = static_cast<uint32_t>(Value);
+    return Old;
+  }
+
+  // getpriority/setpriority. Nice values are stored and reported; the
+  // cooperative scheduler does not weight threads by them.
+  template<typename F>
+  int64_t ForPriorityTargets(uint64_t Which, uint64_t Who, F&& Visit) {
+    if (Which > 2) return Invalid;
+    const auto ID = static_cast<uint32_t>(Who);
+    bool Found {};
+    for (auto& [PID, Process] : Processes) {
+      if (Process.Reaped || Process.Exited) continue;
+      const bool Match = Which == 0 ? Process.PID == (ID ? ID : Task->PID)
+                       : Which == 1 ? Process.Group == (ID ? ID : Task->Group)
+                                    : Process.Creds.Uid[0] == (Who ? ID : Task->Creds.Uid[0]);
+      if (!Match) continue;
+      Found = true;
+      Visit(Process);
+    }
+    return Found ? 0 : -3;
+  }
+
+  int64_t GetPriority(uint64_t Which, uint64_t Who) {
+    int32_t Best = 20;
+    const auto Result = ForPriorityTargets(Which, Who, [&](GuestProcess& Process) { Best = std::min(Best, Process.Nice); });
+    return Result ? Result : 20 - Best;
+  }
+
+  int64_t SetPriority(uint64_t Which, uint64_t Who, uint64_t Value) {
+    const auto Nice = std::clamp(static_cast<int32_t>(Value), -20, 19);
+    int64_t Error = -3;
+    const auto Result = ForPriorityTargets(Which, Who, [&](GuestProcess& Process) {
+      const auto& Mine = Task->Creds.Uid;
+      const bool Nicer = Task->Creds.Capable(Switch2Guest::CapSysNice);
+      if (!Nicer && Process.Creds.Uid[0] != Mine[1] && Process.Creds.Uid[1] != Mine[1]) {
+        Error = -1;
+      } else if (Nice < Process.Nice && !Nicer) {
+        Error = -13; // RLIMIT_NICE is 0: lowering needs CAP_SYS_NICE.
+      } else {
+        if (Error == -3) Error = 0;
+        Process.Nice = Nice;
+      }
+    });
+    return Result ? Result : Error;
   }
 
   int64_t CopyExecVector(uint64_t Address, std::vector<std::string>& Strings, size_t& Budget) {
@@ -1232,25 +2319,74 @@ private:
     return -7;
   }
 
-  int64_t ExecGuest(uint64_t PathAddress, uint64_t Argv, uint64_t Envp) {
-    const auto Name = GuestString(PathAddress);
-    if (!Name) return Name.Error;
+  // execve and execveat (AT_EMPTY_PATH 0x1000, AT_SYMLINK_NOFOLLOW 0x100).
+  int64_t ExecGuest(uint64_t Directory, uint64_t PathAddress, uint64_t Argv, uint64_t Envp, uint64_t Flags) {
+    if (Flags & ~uint64_t {0x1100}) return Invalid;
+    const auto Text = GuestString(PathAddress);
+    if (!Text) return Text.Error;
+    std::string Name {*Text};
     std::string Path;
     LinuxStat Info {};
-    if (const auto Status = PathStat(CurrentDirectory, *Name, Info, &Path); Status < 0) return Status;
-    if ((Info.Mode & 0170000u) != 0100000u || !InodeAllows(Info.Inode, Info.Mode, 1)) return -13;
-    if (ExecutableHasWriter(Info.Inode)) return -26;
-
+    // The name a script's interpreter receives, as Linux builds it: a
+    // descriptor-relative exec names the file through /dev/fd.
+    const auto DescriptorNumber = static_cast<int32_t>(Directory);
+    const bool ThroughDescriptor = DescriptorNumber != -100 && (Name.empty() || Name.front() != '/');
+    std::string ScriptName = !ThroughDescriptor ? Name :
+                             "/dev/fd/" + std::to_string(DescriptorNumber) + (Name.empty() ? "" : "/" + Name);
+    const bool ScriptNameInaccessible = ThroughDescriptor && DescriptorNumber >= 0 &&
+      static_cast<size_t>(DescriptorNumber) < Descriptors().Flags.size() && Descriptors().Flags[DescriptorNumber];
+    if (Name.empty() && (Flags & 0x1000)) {
+      const auto* File = GetFile(Directory);
+      if (!File) return BadFile;
+      // Descriptors opened by path keep the SD path; the guest name drops the root.
+      std::string_view Opened = File->Path;
+      if (Opened.starts_with(RootPath)) Opened.remove_prefix(RootPath.size());
+      if (Opened.empty() || Opened.front() != '/') return -13;
+      Name = Opened;
+      Directory = CurrentDirectory;
+    }
     ExecImage Request;
+    Request.Path = Name;
+    size_t Budget = 128 * 1024;
+    if (const auto Result = CopyExecVector(Argv, Request.Arguments, Budget); Result < 0) return Result;
+    if (const auto Result = CopyExecVector(Envp, Request.Environment, Budget); Result < 0) return Result;
+
+    // binfmt_script: a "#!" file runs its interpreter, which may itself be a
+    // script, up to ScriptMaxRewrites times.
+    std::string Program = Name;
+    bool FollowLinks = !(Flags & 0x100);
+    for (int Rewrites = 0;; ++Rewrites) {
+      if (const auto Status = PathStat(Directory, Program, Info, &Path, FollowLinks); Status < 0) return Status;
+      if ((Info.Mode & 0170000u) == 0120000u) return -40; // ELOOP: AT_SYMLINK_NOFOLLOW on a link
+      if ((Info.Mode & 0170000u) != 0100000u || !InodeAllows(Info.Inode, Info.Mode, 1)) return -13;
+      if (ExecutableHasWriter(Info.Inode)) return -26;
+      std::array<char, ScriptHeadBytes> Head {};
+      const auto HeadSize = ReadFileHead(FileBackingPath(Path).c_str(), Head, Info.Size, FileExtents(Info.Inode));
+      if (HeadSize < 0) return HeadSize;
+      ScriptLine Line;
+      const auto Kind = ParseScriptLine({Head.data(), static_cast<size_t>(HeadSize)}, Line);
+      if (Kind == ScriptParse::NotScript) break;
+      if (Kind == ScriptParse::Invalid) return -8;
+      // The interpreter could not open a close-on-exec descriptor's script.
+      if (Rewrites == 0 && ScriptNameInaccessible) return -2;
+      if (Rewrites == ScriptMaxRewrites) return -40;
+      const size_t Added = Line.Interpreter.size() + 1 + (Line.Argument ? Line.Argument->size() + 1 : 0) + ScriptName.size() + 1;
+      if (Added > Budget) return -7;
+      Budget -= Added;
+      Request.Arguments = ScriptArguments(Line, ScriptName, Request.Arguments);
+      ScriptName = Program = Line.Interpreter;
+      Directory = CurrentDirectory;
+      FollowLinks = true;
+    }
+
+    // Credentials and /proc/self/exe follow the ELF that runs; Linux ignores
+    // set-user-ID bits on scripts.
     Request.Inode = Info.Inode;
-    Request.Path = *Name;
+    Request.ProgramPath = Program;
     if (!Task->NoNewPrivileges) {
       if (Info.Mode & 04000) Request.EffectiveUID = Info.Uid;
       if ((Info.Mode & 02010) == 02010) Request.EffectiveGID = Info.Gid;
     }
-    size_t Budget = 128 * 1024;
-    if (const auto Result = CopyExecVector(Argv, Request.Arguments, Budget); Result < 0) return Result;
-    if (const auto Result = CopyExecVector(Envp, Request.Environment, Budget); Result < 0) return Result;
     if (ReadElf(FileBackingPath(Path).c_str(), Request.Program, Info.Size, FileExtents(Info.Inode))) return -8;
     if (!Request.Program.Interpreter.empty()) {
       LinuxStat InterpreterInfo {};
@@ -1271,8 +2407,7 @@ private:
     auto* OldThread = Current->Core;
     FEXCore::Core::CPUState State {};
     const auto Mask = Current->SignalMask;
-    const auto Pending = Current->PendingSignals;
-    const auto SignalSenders = Current->SignalSenders;
+    auto Pending = std::move(Current->Pending);
     Task->PendingDescriptors = Current->Descriptors;
 
     // The dispatcher is process infrastructure. Keep its native mapping
@@ -1292,6 +2427,12 @@ private:
     Task->HeapStart = Task->HeapEnd = 0;
     Task->Image = std::make_shared<ExecImage>(std::move(*Task->PendingExec));
     Task->ExecutableInode = Task->Image->Inode;
+    {
+      const auto& Path = Task->Image->Path;
+      const auto Base = Path.substr(Path.find_last_of('/') == std::string::npos ? 0 : Path.find_last_of('/') + 1);
+      Task->Name = {};
+      std::memcpy(Task->Name.data(), Base.data(), std::min<size_t>(Base.size(), Task->Name.size() - 1));
+    }
     Task->PendingExec.reset();
     Task->InheritedImages.clear();
     for (size_t FD = 0; FD < Descriptors().Files.size(); ++FD) {
@@ -1300,18 +2441,19 @@ private:
     for (auto& Action : Task->SignalActions) {
       if (Action[0] != 1) Action = {};
     }
+    DeleteProcessTimers(*Task);
     ++IOEpoch;
 
     const auto& Image = *Task->Image;
-    Task->UserIDs[1] = Image.EffectiveUID.value_or(Task->UserIDs[1]);
-    Task->GroupIDs[1] = Image.EffectiveGID.value_or(Task->GroupIDs[1]);
-    Task->UserIDs[2] = Task->UserIDs[3] = Task->UserIDs[1];
-    Task->GroupIDs[2] = Task->GroupIDs[3] = Task->GroupIDs[1];
+    if (Image.EffectiveUID || Image.EffectiveGID) Task->ParentDeathSignal = 0;
+    Switch2Guest::ApplyExecCaps(Task->Creds, Image.EffectiveUID, Task->NoNewPrivileges, false, Image.EffectiveGID);
+    Task->Creds.Uid[2] = Task->Creds.Uid[3] = Task->Creds.Uid[1];
+    Task->Creds.Gid[2] = Task->Creds.Gid[3] = Task->Creds.Gid[1];
     for (const auto* ELF : {&Image.Program, &Image.Interpreter}) {
       for (const auto& Segment : ELF->GetSegments()) {
         Task->Memory.Register(Segment.Start, Segment.Size, Segment.Flags);
         RecordMapping(Segment.Start, Segment.Size, Segment.Start - ELF->Base,
-                      ELF == &Image.Program ? Image.Path : Image.Program.Interpreter);
+                      ELF == &Image.Program ? Image.ProgramPath : Image.Program.Interpreter);
       }
     }
     State.rip = Image.Interpreter.Entry ? Image.Interpreter.Entry : Image.Program.Entry;
@@ -1319,12 +2461,11 @@ private:
     if (!Base) return false;
     State.gregs[FEXCore::X86State::REG_RSP] =
       BuildInitialStack(Base, Image.Path, Image.Arguments, Image.Environment, &Image.Program, Image.Interpreter.Base,
-                        {Task->UserIDs[0], Task->UserIDs[1], Task->GroupIDs[0], Task->GroupIDs[1]});
+                        {Task->Creds.Uid[0], Task->Creds.Uid[1], Task->Creds.Gid[0], Task->Creds.Gid[1]});
     if (!AddThread(*Task->Context, State, PID, 0, PID)) return false;
     const auto Thread = std::find_if(Threads.begin(), Threads.end(), [PID](const auto& Entry) { return Entry.TID == PID; });
     Thread->SignalMask = Mask;
-    Thread->PendingSignals = Pending;
-    Thread->SignalSenders = SignalSenders;
+    Thread->Pending = std::move(Pending);
     Task->HasDispatched = false;
     Task->TraceFirstDispatch = true;
     Task->StartupSyscallCheckpoints = Logging == LogLevel::Trace ? 12 : 0;
@@ -1339,17 +2480,17 @@ private:
 
   enum class TimeInput { Seconds, Microseconds, Nanoseconds };
 
-  static FileTimestamp WallClock() {
-    struct timespec Now {};
-    if (clock_gettime(CLOCK_REALTIME, &Now) != 0) Now.tv_sec = time(nullptr);
-    return {Now.tv_sec, Now.tv_nsec};
+  // File times use the guest realtime clock, so they agree with clock_gettime(CLOCK_REALTIME).
+  FileTimestamp WallClock() const {
+    const auto Now = RealTimeNs();
+    return {static_cast<int64_t>(Now / 1'000'000'000), static_cast<int64_t>(Now % 1'000'000'000)};
   }
 
   void ImportTimestamps(FsFileSystem& SdCard, const std::string& Path, uint64_t Inode) {
     auto& Times = Inodes[Inode].Times;
     if (Times) return;
     FsTimeStampRaw Raw {};
-    if (R_SUCCEEDED(fsFsGetFileTimeStampRaw(&SdCard, Path.c_str(), &Raw)) && Raw.is_valid) {
+    if (R_SUCCEEDED(SdRetry(fsFsGetFileTimeStampRaw, &SdCard, Path.c_str(), &Raw)) && Raw.is_valid) {
       Times = InodeTimestamps {
         {static_cast<int64_t>(Raw.accessed), 0}, {static_cast<int64_t>(Raw.modified), 0},
         {static_cast<int64_t>(Raw.modified), 0}};
@@ -1368,15 +2509,48 @@ private:
     if (Inode >= InodeSnapshot::FirstInode) InodeStoreDirty = true;
   }
 
+  int64_t FillSharedFileView(OpenFile& File, void* Storage, size_t Size, uint64_t Offset) {
+    // Page-cache coherence does not access the file, so atime stays.
+    const auto Flags = File.StatusFlags;
+    File.StatusFlags |= NoAtimeFlag;
+    const auto Read = ReadFileAt(File, Storage, Size, Offset);
+    File.StatusFlags = Flags;
+    if (Read < 0) return Read;
+    // Bytes past EOF read as zero (Linux would raise SIGBUS past the last page).
+    std::memset(static_cast<uint8_t*>(Storage) + Read, 0, Size - Read);
+    return 0;
+  }
+
+  // Drops views whose mappings are gone, releasing their open files.
+  void PruneSharedFileViews() {
+    std::erase_if(SharedFileViews, [](const auto& Entry) { return Entry.second.Storage.expired(); });
+  }
+
+  void RefreshSharedFileViews(uint64_t Inode) {
+    const auto [First, Last] = SharedFileViews.equal_range(Inode);
+    for (auto It = First; It != Last;) {
+      const auto Storage = It->second.Storage.lock();
+      if (!Storage) {
+        It = SharedFileViews.erase(It);
+        continue;
+      }
+      if (FillSharedFileView(*It->second.File, Storage.get(), It->second.Size, It->second.Offset) < 0) {
+        WriteLog("Could not refresh a shared file mapping after a write.");
+      }
+      ++It;
+    }
+  }
+
   void MarkFileDataChanged(uint64_t Inode) {
     auto& Record = Inodes[Inode];
-    if (Record.Mode && Task->UserIDs[3]) {
+    if (Record.Mode && !Task->Creds.Capable(CapFsetid)) {
       // An unprivileged writer loses setuid and executable setgid.
       const uint32_t Clear = 04000 | ((*Record.Mode & 0010) ? 02000 : 0);
       *Record.Mode &= ~Clear;
     }
     if (Inode >= InodeSnapshot::FirstInode) DirtyFileData.insert(Inode);
     MarkInodeChanged(Inode, true);
+    if (SharedFileViews.contains(Inode)) RefreshSharedFileViews(Inode);
   }
 
   void MarkInodeAccessed(uint64_t Inode) {
@@ -1402,7 +2576,1054 @@ private:
     int64_t Reserved[3];
   };
   static_assert(sizeof(LinuxStat) == 144);
-  static constexpr uint64_t ProcDevice = 2, DevDevice = 3;
+  static constexpr uint64_t ProcDevice = 2, DevDevice = 3, AnonDevice = 13; // anon_inodefs is 0:13 on Linux
+
+  // ---- Timers: itimers, POSIX timers and timerfds ----
+
+  static constexpr int32_t SigevSignal = 0, SigevNone = 1, SigevThread = 2, SigevThreadId = 4;
+  static constexpr uint64_t TimerAbsolute = 1; // TIMER_ABSTIME, TFD_TIMER_ABSTIME
+  std::vector<std::weak_ptr<TimerFdState>> TimerFds;
+  uint64_t SignalChanges {}; // counts signal queue changes, for edge-triggered epoll on signalfd
+
+  // Current time in a timer's clock domain; nullopt when the clock's process or thread is gone.
+  std::optional<uint64_t> TimerNow(const TimerClock& Clock) {
+    switch (Clock.Domain) {
+    case TimerDomain::Monotonic: return MonotonicNs();
+    case TimerDomain::Realtime: return RealTimeNs();
+    case TimerDomain::Tai: return TaiNs();
+    case TimerDomain::ProcessCpu: {
+      const auto* Process = FindProcess(Clock.Owner);
+      if (!Process || Process->Exited) return std::nullopt;
+      return ProcessCpuNs(*Process);
+    }
+    case TimerDomain::ThreadCpu:
+      for (const auto& Thread : Threads) {
+        if (Thread.Core && !Thread.Exited && Thread.TID == Clock.Owner) return ThreadCpuNs(Thread);
+      }
+      return std::nullopt;
+    }
+    return std::nullopt;
+  }
+
+  // The timer clock for a clock id accepted by timer_create or timerfd_create.
+  TimerClock TimerClockFor(const Switch2Guest::DecodedClock& Clock) {
+    using Switch2Guest::ClockKind;
+    switch (Clock.Kind) {
+    case ClockKind::Realtime: case ClockKind::RealtimeAlarm: return {TimerDomain::Realtime, 0};
+    case ClockKind::Tai: return {TimerDomain::Tai, 0};
+    case ClockKind::ProcessCpu: return {TimerDomain::ProcessCpu, CpuClockProcess(Clock, false)->PID};
+    case ClockKind::ThreadCpu: return {TimerDomain::ThreadCpu, CpuClockThread(Clock)->TID};
+    default: return {TimerDomain::Monotonic, 0};
+    }
+  }
+
+  // The monotonic time at which a deadline in Clock's domain is reached at
+  // the earliest. CPU time advances no faster than real time.
+  std::optional<uint64_t> MonotonicDeadline(const TimerClock& Clock, uint64_t Deadline, uint64_t Mono) {
+    const auto Now = TimerNow(Clock);
+    if (!Now) return std::nullopt;
+    return Deadline <= *Now ? Mono : AddDeadline(Mono, Deadline - *Now);
+  }
+
+  // The earliest monotonic time an armed timer may expire, or 0. Without
+  // IncludeCpu, only timers that expire while every guest thread waits.
+  uint64_t NextTimerDeadline(bool IncludeCpu = true) {
+    const auto Mono = MonotonicNs();
+    uint64_t Next {};
+    auto Consider = [&](const TimerClock& Clock, const Switch2Guest::ArmedTimer& Timer) {
+      if (!Timer.Armed()) return;
+      if (!IncludeCpu && (Clock.Domain == TimerDomain::ProcessCpu || Clock.Domain == TimerDomain::ThreadCpu)) return;
+      if (const auto At = MonotonicDeadline(Clock, Timer.Deadline, Mono)) Next = Next ? std::min(Next, *At) : *At;
+    };
+    for (auto& [PID, Process] : Processes) {
+      if (Process.Exited || Process.Reaped) continue;
+      Consider({TimerDomain::Monotonic, 0}, Process.ITimers[0]);
+      Consider({TimerDomain::ProcessCpu, PID}, Process.ITimers[1]);
+      Consider({TimerDomain::ProcessCpu, PID}, Process.ITimers[2]);
+      for (const auto& Timer : Process.Timers) Consider(Timer.Clock, Timer.Timer);
+      if (const auto Limit = CpuLimitDeadline(Process); Limit && IncludeCpu) {
+        if (const auto At = MonotonicDeadline({TimerDomain::ProcessCpu, PID}, *Limit, Mono)) Next = Next ? std::min(Next, *At) : *At;
+      }
+    }
+    for (const auto& Weak : TimerFds) {
+      if (const auto State = Weak.lock()) Consider(State->Clock, State->Timer);
+    }
+    return Next;
+  }
+
+  // A thread of Process with the given tid, or null.
+  GuestThread* ProcessThread(const GuestProcess& Process, uint32_t TID) {
+    for (auto& Thread : Threads) {
+      if (Thread.Core && !Thread.Exited && Thread.PID == Process.PID && Thread.TID == TID) return &Thread;
+    }
+    return nullptr;
+  }
+
+  static bool IsTimerSignal(const SigInfo& Info, int32_t Id) {
+    return Info.Code == SiTimer && Info.Timer.Tid == Id;
+  }
+
+  // A queued timer signal carries its arming's sequence in si_sys_private
+  // (offset 32), which Linux clears before the signal reaches the guest.
+  static constexpr size_t TimerSequenceOffset = 32 - offsetof(SigInfo, Kill);
+  static uint32_t TimerSequence(const SigInfo& Info) {
+    uint32_t Sequence;
+    std::memcpy(&Sequence, Info.Raw + TimerSequenceOffset, sizeof(Sequence));
+    return Sequence;
+  }
+  static void SetTimerSequence(SigInfo& Info, uint32_t Sequence) {
+    std::memcpy(Info.Raw + TimerSequenceOffset, &Sequence, sizeof(Sequence));
+  }
+
+  // Linux posix_timer_fn/send_sigqueue: while the timer's previous signal is
+  // still queued, further expirations only add to its overrun.
+  void QueueTimerSignal(GuestProcess& Process, PosixTimer& Timer, uint64_t Count) {
+    if (Timer.Notify == SigevNone) return;
+    GuestThread* Thread {};
+    if (Timer.Notify == SigevThreadId) {
+      Thread = ProcessThread(Process, Timer.Tid);
+      if (!Thread) return; // the target thread exited
+    }
+    auto& Queue = Thread ? Thread->Pending : Process.SharedPending;
+    if (auto* Queued = Queue.Find([&](const SigInfo& Info) { return IsTimerSignal(Info, Timer.Id); })) {
+      // A stale signal from an earlier arming is reused for this one.
+      const auto Total = TimerSequence(*Queued) == Timer.Sequence ? static_cast<uint64_t>(Queued->Timer.Overrun) + Count : Count - 1;
+      Queued->Timer.Overrun = Switch2Guest::ClampOverrun(Total);
+      Queued->Timer.Value = Timer.Value;
+      SetTimerSequence(*Queued, Timer.Sequence);
+      return;
+    }
+    SigInfo Info;
+    Info.Signo = static_cast<int32_t>(Timer.Signal);
+    Info.Code = SiTimer;
+    Info.Timer.Tid = Timer.Id;
+    Info.Timer.Overrun = Switch2Guest::ClampOverrun(Count - 1);
+    Info.Timer.Value = Timer.Value;
+    SetTimerSequence(Info, Timer.Sequence);
+    SendSignal(Process, Thread, Info);
+  }
+
+  // Expires every due timer. Runs on each scheduler pass and after syscalls
+  // once a deadline has passed.
+  void FireTimers() {
+    constexpr uint32_t ITimerSignals[] {SigAlrm, SigVtalrm, SigProf};
+    for (auto& [PID, Process] : Processes) {
+      if (Process.Exited || Process.Reaped) continue;
+      for (size_t Which = 0; Which < Process.ITimers.size(); ++Which) {
+        auto& Timer = Process.ITimers[Which];
+        if (!Timer.Armed()) continue;
+        const auto Now = Which ? ProcessCpuNs(Process) : MonotonicNs();
+        // it_real_fn and the CPU itimers send with SEND_SIG_PRIV: SI_KERNEL.
+        if (Timer.Expire(Now)) SendSignal(Process, nullptr, MakeSigInfo(ITimerSignals[Which], SiKernel));
+      }
+      for (auto& Timer : Process.Timers) {
+        if (!Timer.Timer.Armed()) continue;
+        const auto Now = TimerNow(Timer.Clock);
+        if (!Now) continue;
+        if (const auto Count = Timer.Timer.Expire(*Now)) QueueTimerSignal(Process, Timer, Count);
+      }
+      CheckCpuLimit(Process);
+    }
+    std::erase_if(TimerFds, [&](const auto& Weak) {
+      const auto State = Weak.lock();
+      if (!State) return true;
+      if (!State->Timer.Armed()) return false;
+      const auto Now = TimerNow(State->Clock);
+      if (!Now) return false;
+      if (const auto Count = State->Timer.Expire(*Now)) {
+        State->Ticks += Count;
+        ++State->Changes;
+        ++IOEpoch;
+      }
+      return false;
+    });
+  }
+
+  // posixtimer_deliver_signal: a timer signal from a deleted or re-armed
+  // timer stays pending until dequeued, then is dropped. A live one records
+  // its overrun for timer_getoverrun.
+  bool TakeTimerSignal(SigInfo& Info) {
+    if (Info.Code != SiTimer) return true;
+    for (auto& Timer : Task->Timers) {
+      if (Timer.Id != Info.Timer.Tid) continue;
+      if (TimerSequence(Info) != Timer.Sequence) return false;
+      Timer.OverrunLast = Info.Timer.Overrun;
+      SetTimerSequence(Info, 0);
+      return true;
+    }
+    return false;
+  }
+
+  // Dequeues the next signal in Allowed for Thread of the current process:
+  // its own queue first, then the process queue.
+  std::optional<SigInfo> TakeSignal(GuestThread& Thread, uint64_t Allowed) {
+    for (;;) {
+      auto Info = Thread.Pending.Dequeue(Allowed);
+      if (!Info) Info = Task->SharedPending.Dequeue(Allowed);
+      if (Info) ++SignalChanges;
+      if (!Info || TakeTimerSignal(*Info)) return Info;
+    }
+  }
+
+  struct GuestTimeval {
+    int64_t Seconds, Microseconds;
+  };
+  struct GuestITimerval {
+    GuestTimeval Interval, Value;
+  };
+  struct GuestTimespec {
+    int64_t Seconds, Nanoseconds;
+  };
+  struct GuestITimerspec {
+    GuestTimespec Interval, Value;
+  };
+
+  static GuestTimeval ToGuestTimeval(uint64_t Ns) {
+    const auto Value = Switch2Guest::ToTimevalUp(Ns);
+    return {Value.Seconds, Value.Microseconds};
+  }
+  static GuestTimespec ToGuestTimespec(uint64_t Ns) {
+    return {static_cast<int64_t>(Ns / 1'000'000'000), static_cast<int64_t>(Ns % 1'000'000'000)};
+  }
+  static bool ValidTimespec(const GuestTimespec& Time) {
+    return Time.Seconds >= 0 && Time.Nanoseconds >= 0 && Time.Nanoseconds < 1'000'000'000;
+  }
+  static uint64_t TimespecNs(const GuestTimespec& Time) {
+    return Time.Seconds > static_cast<int64_t>((MaxDeadline - Time.Nanoseconds) / 1'000'000'000)
+      ? MaxDeadline : Time.Seconds * 1'000'000'000ULL + Time.Nanoseconds;
+  }
+
+  // Now in the domain of ITIMER Which of the current process.
+  uint64_t ITimerNow(size_t Which) { return Which ? ProcessCpuNs(*Task) : MonotonicNs(); }
+
+  GuestITimerval ReadITimer(size_t Which) {
+    const auto Left = Task->ITimers[Which].Remaining(ITimerNow(Which));
+    return {ToGuestTimeval(Left.IntervalNs), ToGuestTimeval(Left.ValueNs)};
+  }
+
+  int64_t GetITimer(uint64_t Which, uint64_t Address) {
+    if (Which > 2) return Invalid;
+    return CopyOut(Address, ReadITimer(Which));
+  }
+
+  // setitimer: a null new value disarms the timer, as Linux 7.3 does.
+  int64_t SetITimer(uint64_t Which, uint64_t NewAddress, uint64_t OldAddress) {
+    GuestITimerval New {};
+    if (NewAddress) {
+      if (Available(NewAddress, PF_R) < sizeof(New)) return Fault;
+      std::memcpy(&New, reinterpret_cast<const void*>(NewAddress), sizeof(New));
+    }
+    if (Which > 2) return Invalid;
+    auto Valid = [](const GuestTimeval& Time) {
+      return Time.Seconds >= 0 && Time.Microseconds >= 0 && Time.Microseconds < 1'000'000;
+    };
+    if (!Valid(New.Value) || !Valid(New.Interval)) return Invalid;
+    const auto Old = ReadITimer(Which);
+    auto& Timer = Task->ITimers[Which];
+    const auto Value = Switch2Guest::FromTimeval(New.Value.Seconds, New.Value.Microseconds);
+    if (Value) Timer.Arm(AddDeadline(ITimerNow(Which), Value), Switch2Guest::FromTimeval(New.Interval.Seconds, New.Interval.Microseconds));
+    else Timer.Disarm();
+    return OldAddress ? CopyOut(OldAddress, Old) : 0;
+  }
+
+  int64_t AlarmGuest(uint32_t Seconds) {
+    auto& Timer = Task->ITimers[0];
+    const auto Now = MonotonicNs();
+    const auto Left = Timer.Remaining(Now).ValueNs;
+    if (Seconds) Timer.Arm(AddDeadline(Now, Seconds * 1'000'000'000ULL), 0);
+    else Timer.Disarm();
+    return Switch2Guest::AlarmSecondsLeft(Left);
+  }
+
+  // Linux clockid_to_kclock and kc->timer_create for timer_create.
+  static int64_t CheckTimerClock(const Switch2Guest::DecodedClock& Clock) {
+    using Switch2Guest::ClockKind;
+    switch (Clock.Kind) {
+    case ClockKind::Invalid: return Invalid;
+    case ClockKind::MonotonicRaw: case ClockKind::RealtimeCoarse: case ClockKind::MonotonicCoarse: return NotSupported;
+    default: break;
+    }
+    return 0;
+  }
+
+  int64_t TimerCreate(uint64_t ClockId, uint64_t EventAddress, uint64_t IdAddress) {
+    struct GuestSigevent {
+      uint64_t Value;
+      int32_t Signal, Notify, Tid;
+      uint8_t Pad[44];
+    };
+    static_assert(sizeof(GuestSigevent) == 64);
+    GuestSigevent Event {};
+    if (EventAddress) {
+      if (Available(EventAddress, PF_R) < sizeof(Event)) return Fault;
+      std::memcpy(&Event, reinterpret_cast<const void*>(EventAddress), sizeof(Event));
+    }
+    using Switch2Guest::ClockKind;
+    const auto Clock = Switch2Guest::DecodeClock(static_cast<int32_t>(ClockId));
+    if (const auto Error = CheckTimerClock(Clock)) return Error;
+    if (Task->Timers.size() >= Task->Limits[ResourceSigpending][0]) return -11;
+    // The id is allocated before the remaining checks and is not reused.
+    const auto Id = Task->NextTimerId;
+    Task->NextTimerId = Id == INT32_MAX ? 0 : Id + 1;
+    PosixTimer Timer;
+    Timer.Id = Id;
+    if (EventAddress) {
+      // good_sigevent
+      switch (Event.Notify) {
+      case SigevThreadId:
+        if (!ProcessThread(*Task, static_cast<uint32_t>(Event.Tid))) return Invalid;
+        [[fallthrough]];
+      case SigevSignal: case SigevThread:
+        if (Event.Signal <= 0 || Event.Signal > static_cast<int32_t>(SigMax)) return Invalid;
+        [[fallthrough]];
+      case SigevNone: break;
+      default: return Invalid;
+      }
+      Timer.Notify = Event.Notify == SigevThread ? SigevSignal : Event.Notify;
+      Timer.Signal = static_cast<uint32_t>(Event.Signal);
+      Timer.Value = Event.Value;
+      Timer.Tid = static_cast<uint32_t>(Event.Tid);
+    } else {
+      Timer.Notify = SigevSignal;
+      Timer.Signal = SigAlrm;
+      Timer.Value = static_cast<uint32_t>(Id);
+    }
+    if (CopyOut(IdAddress, Id)) return Fault;
+    // kc->timer_create: alarm clocks need CAP_WAKE_ALARM; CPU clocks a live target.
+    if ((Clock.Kind == ClockKind::RealtimeAlarm || Clock.Kind == ClockKind::BoottimeAlarm) &&
+        !Task->Creds.Capable(Switch2Guest::CapWakeAlarm)) return -1;
+    if ((Clock.Kind == ClockKind::ProcessCpu || Clock.Kind == ClockKind::ThreadCpu) && !CpuClockValid(Clock)) return Invalid;
+    Timer.Clock = TimerClockFor(Clock);
+    Task->Timers.push_back(Timer);
+    return 0;
+  }
+
+  PosixTimer* FindTimer(uint64_t Id) {
+    for (auto& Timer : Task->Timers) {
+      if (static_cast<uint64_t>(static_cast<uint32_t>(Timer.Id)) == (Id & 0xffffffff)) return &Timer;
+    }
+    return nullptr;
+  }
+
+  GuestITimerspec TimerValue(const TimerClock& Clock, const Switch2Guest::ArmedTimer& Timer) {
+    const auto Now = TimerNow(Clock);
+    const auto Left = Timer.Remaining(Now.value_or(Timer.Deadline));
+    return {ToGuestTimespec(Left.IntervalNs), ToGuestTimespec(Left.ValueNs)};
+  }
+
+  // Arms Timer from a validated itimerspec; absolute values are times on the clock.
+  void ArmTimer(const TimerClock& Clock, Switch2Guest::ArmedTimer& Timer, const GuestITimerspec& New, bool Absolute) {
+    const auto Value = TimespecNs(New.Value);
+    if (!Value) {
+      Timer.Disarm();
+      return;
+    }
+    const auto Now = TimerNow(Clock).value_or(0);
+    Timer.Arm(Absolute ? Value : AddDeadline(Now, Value), TimespecNs(New.Interval));
+  }
+
+  int64_t TimerSetTime(uint64_t Id, uint64_t Flags, uint64_t NewAddress, uint64_t OldAddress) {
+    if (!NewAddress) return Invalid;
+    GuestITimerspec New {};
+    if (Available(NewAddress, PF_R) < sizeof(New)) return Fault;
+    std::memcpy(&New, reinterpret_cast<const void*>(NewAddress), sizeof(New));
+    if (!ValidTimespec(New.Interval) || !ValidTimespec(New.Value)) return Invalid;
+    auto* Timer = FindTimer(Id);
+    if (!Timer) return Invalid;
+    const auto Old = TimerValue(Timer->Clock, Timer->Timer);
+    // A signal queued by the previous arming is stale and never delivered.
+    ++Timer->Sequence;
+    ArmTimer(Timer->Clock, Timer->Timer, New, Flags & TimerAbsolute);
+    return OldAddress ? CopyOut(OldAddress, Old) : 0;
+  }
+
+  int64_t TimerGetTime(uint64_t Id, uint64_t Address) {
+    const auto* Timer = FindTimer(Id);
+    if (!Timer) return Invalid;
+    return CopyOut(Address, TimerValue(Timer->Clock, Timer->Timer));
+  }
+
+  int64_t TimerGetOverrun(uint64_t Id) {
+    const auto* Timer = FindTimer(Id);
+    return Timer ? Timer->OverrunLast : Invalid;
+  }
+
+  int64_t TimerDelete(uint64_t Id) {
+    auto* Timer = FindTimer(Id);
+    if (!Timer) return Invalid;
+    Task->Timers.erase(Task->Timers.begin() + (Timer - Task->Timers.data()));
+    return 0;
+  }
+
+  // exec deletes the POSIX timers (exit_itimers); itimers stay. Their
+  // queued signals turn stale.
+  void DeleteProcessTimers(GuestProcess& Process) { Process.Timers.clear(); }
+
+  static constexpr uint64_t AnonCloseOnExec = 02000000, AnonNonblock = 04000;
+
+  // A descriptor on the shared anonymous inode, like anon_inode_getfd.
+  int64_t OpenAnonymous(const char* Name, uint64_t Flags, uint32_t Access, std::shared_ptr<OpenFile> File) {
+    const auto FD = FreeDescriptor();
+    if (FD == NoDescriptor) return -24;
+    if (!AnonInode) AnonInode = NextAnonymousInode++;
+    File->AnonName = Name;
+    File->Path = std::string("anon_inode:") + Name;
+    File->Inode = AnonInode;
+    File->StatusFlags = Access | (Flags & AnonNonblock);
+    Descriptors().Files[FD] = std::move(File);
+    Descriptors().Flags[FD] = (Flags & AnonCloseOnExec) ? 1 : 0;
+    return FD;
+  }
+
+  int64_t TimerFdCreate(uint64_t ClockId, uint64_t Flags) {
+    using Switch2Guest::ClockKind;
+    const auto Clock = Switch2Guest::DecodeClock(static_cast<int32_t>(ClockId));
+    const bool Allowed = static_cast<int32_t>(ClockId) >= 0 &&
+      (Clock.Kind == ClockKind::Realtime || Clock.Kind == ClockKind::Monotonic || Clock.Kind == ClockKind::Boottime ||
+       Clock.Kind == ClockKind::RealtimeAlarm || Clock.Kind == ClockKind::BoottimeAlarm);
+    if ((Flags & ~(AnonCloseOnExec | AnonNonblock)) || !Allowed) return Invalid;
+    if ((Clock.Kind == ClockKind::RealtimeAlarm || Clock.Kind == ClockKind::BoottimeAlarm) &&
+        !Task->Creds.Capable(Switch2Guest::CapWakeAlarm)) return -1;
+    auto File = std::make_shared<OpenFile>();
+    File->TimerFd = std::make_shared<TimerFdState>();
+    File->TimerFd->Clock = TimerClockFor(Clock);
+    const auto State = File->TimerFd;
+    const auto FD = OpenAnonymous("[timerfd]", Flags, 2, std::move(File));
+    if (FD >= 0) TimerFds.push_back(State);
+    return FD;
+  }
+
+  // timerfd_fget: EBADF for a closed descriptor, EINVAL for another kind.
+  int64_t TimerFdOf(uint64_t FD, TimerFdState*& State) {
+    auto* File = GetFile(FD);
+    if (!File) return BadFile;
+    if (!File->TimerFd) return Invalid;
+    State = File->TimerFd.get();
+    return 0;
+  }
+
+  int64_t TimerFdSetTime(uint64_t FD, uint64_t Flags, uint64_t NewAddress, uint64_t OldAddress) {
+    constexpr uint64_t CancelOnSet = 2;
+    GuestITimerspec New {};
+    if (Available(NewAddress, PF_R) < sizeof(New)) return Fault;
+    std::memcpy(&New, reinterpret_cast<const void*>(NewAddress), sizeof(New));
+    if ((Flags & ~(TimerAbsolute | CancelOnSet)) || !ValidTimespec(New.Interval) || !ValidTimespec(New.Value)) return Invalid;
+    TimerFdState* State {};
+    if (const auto Error = TimerFdOf(FD, State)) return Error;
+    const auto Old = TimerValue(State->Clock, State->Timer);
+    // timerfd_setup_cancel: only absolute realtime timers may cancel; other flags are ignored.
+    State->CancelOnSet = State->Clock.Domain == TimerDomain::Realtime && (Flags & TimerAbsolute) && (Flags & CancelOnSet);
+    State->Canceled = false;
+    State->Ticks = 0;
+    ++State->Changes;
+    ArmTimer(State->Clock, State->Timer, New, Flags & TimerAbsolute);
+    ++IOEpoch;
+    return OldAddress ? CopyOut(OldAddress, Old) : 0;
+  }
+
+  int64_t TimerFdGetTime(uint64_t FD, uint64_t Address) {
+    TimerFdState* State {};
+    if (const auto Error = TimerFdOf(FD, State)) return Error;
+    return CopyOut(Address, TimerValue(State->Clock, State->Timer));
+  }
+
+  int64_t ReadTimerFd(OpenFile& File, char* Buffer, uint64_t Count) {
+    auto& State = *File.TimerFd;
+    if (Count < sizeof(uint64_t)) return Invalid;
+    if (!State.Ticks) return File.Nonblocking() ? -11 : WaitForIO();
+    ++State.Changes;
+    if (State.Canceled) {
+      State.Canceled = false;
+      State.Ticks = 0;
+      return -125; // ECANCELED
+    }
+    const auto Ticks = std::exchange(State.Ticks, 0);
+    std::memcpy(Buffer, &Ticks, sizeof(Ticks));
+    return sizeof(Ticks);
+  }
+
+  // eventfd and eventfd2. EFD_SEMAPHORE is 1; the others are O_ flags.
+  int64_t EventFdCreate(uint64_t Initial, uint64_t Flags) {
+    constexpr uint64_t Semaphore = 1;
+    if (Flags & ~(Semaphore | AnonNonblock | AnonCloseOnExec)) return Invalid;
+    auto File = std::make_shared<OpenFile>();
+    File->Event = std::make_shared<Switch2Guest::EventCounter>();
+    File->Event->Value = static_cast<uint32_t>(Initial);
+    File->Event->Semaphore = Flags & Semaphore;
+    return OpenAnonymous("[eventfd]", Flags, 2, std::move(File));
+  }
+
+  int64_t ReadEventFd(OpenFile& File, char* Buffer, uint64_t Count) {
+    if (Count < sizeof(uint64_t)) return Invalid;
+    uint64_t Value {};
+    if (File.Event->Read(Value) < 0) return File.Nonblocking() ? -11 : WaitForIO();
+    std::memcpy(Buffer, &Value, sizeof(Value));
+    ++IOEpoch; // a writer may have room now
+    return sizeof(Value);
+  }
+
+  int64_t WriteEventFd(OpenFile& File, const char* Buffer, uint64_t Count) {
+    if (Count < sizeof(uint64_t)) return Invalid;
+    uint64_t Add {};
+    std::memcpy(&Add, Buffer, sizeof(Add));
+    const auto Result = File.Event->Write(Add);
+    if (Result == -11) return File.Nonblocking() ? -11 : WaitForIO();
+    if (Result < 0) return Result;
+    if (Add) ++IOEpoch;
+    return sizeof(Add);
+  }
+
+  // signalfd and signalfd4. SIGKILL and SIGSTOP are silently left out.
+  int64_t SignalFdCreate(uint64_t FD, uint64_t MaskAddress, uint64_t MaskSize, uint64_t Flags) {
+    if (MaskSize != sizeof(uint64_t)) return Invalid;
+    uint64_t Mask {};
+    if (Available(MaskAddress, PF_R) < sizeof(Mask)) return Fault;
+    std::memcpy(&Mask, reinterpret_cast<const void*>(MaskAddress), sizeof(Mask));
+    if (Flags & ~(AnonNonblock | AnonCloseOnExec)) return Invalid;
+    Mask &= ~Unblockable;
+    if (static_cast<int32_t>(FD) == -1) {
+      auto File = std::make_shared<OpenFile>();
+      File->SignalFdMask = Mask;
+      return OpenAnonymous("[signalfd]", Flags, 2, std::move(File));
+    }
+    auto* File = GetFile(FD);
+    if (!File) return BadFile;
+    if (!File->SignalFdMask) return Invalid;
+    File->SignalFdMask = Mask;
+    ++IOEpoch;
+    return static_cast<int64_t>(static_cast<int32_t>(FD));
+  }
+
+  // Dequeues signals in the mask, blocked or not, from the reading thread's
+  // queue and then the process queue (signalfd_dequeue). Only the first
+  // record waits.
+  int64_t ReadSignalFd(OpenFile& File, char* Buffer, uint64_t Count) {
+    using Switch2Guest::SignalFdInfo;
+    if (Count < sizeof(SignalFdInfo)) return Invalid;
+    uint64_t Done {};
+    while (Count - Done >= sizeof(SignalFdInfo)) {
+      const auto Info = TakeSignal(*Current, *File.SignalFdMask);
+      if (!Info) break;
+      const auto Record = Switch2Guest::ToSignalFdInfo(*Info);
+      std::memcpy(Buffer + Done, &Record, sizeof(Record));
+      Done += sizeof(Record);
+    }
+    if (Done) return static_cast<int64_t>(Done);
+    return File.Nonblocking() ? -11 : WaitForIO();
+  }
+
+  // Anonymous descriptors (timerfd, eventfd, signalfd, epoll, inotify).
+  int64_t ReadAnonymous(OpenFile& File, char* Buffer, uint64_t Count) {
+    if (File.TimerFd) return ReadTimerFd(File, Buffer, Count);
+    if (File.Event) return ReadEventFd(File, Buffer, Count);
+    if (File.SignalFdMask) return ReadSignalFd(File, Buffer, Count);
+    if (File.Inotify) {
+      const auto Result = File.Inotify->Instance.Read(reinterpret_cast<uint8_t*>(Buffer), Count);
+      if (Result == -11 && !File.Nonblocking()) return WaitForIO();
+      return Result;
+    }
+    return Invalid;
+  }
+
+  int64_t WriteAnonymous(OpenFile& File, const char* Buffer, uint64_t Count) {
+    if (File.Event) return WriteEventFd(File, Buffer, Count);
+    return Invalid;
+  }
+
+  int64_t AnonymousIoctl(OpenFile& File, uint64_t Command, uint64_t Argument) {
+    constexpr uint64_t SetTicks = 0x40085400; // TFD_IOC_SET_TICKS
+    if (File.TimerFd && Command == SetTicks) {
+      uint64_t Ticks {};
+      if (Available(Argument, PF_R) < sizeof(Ticks)) return Fault;
+      std::memcpy(&Ticks, reinterpret_cast<const void*>(Argument), sizeof(Ticks));
+      if (!Ticks) return Invalid;
+      File.TimerFd->Ticks = Ticks;
+      ++File.TimerFd->Changes;
+      ++IOEpoch;
+      return 0;
+    }
+    if (File.Epoll) return Invalid; // ep_eventpoll_ioctl
+    if (File.Inotify && Command == 0x541b) { // FIONREAD
+      return CopyOut(Argument, static_cast<int32_t>(File.Inotify->Instance.PendingBytes()));
+    }
+    return -25;
+  }
+
+  // Poll mask of an anonymous descriptor.
+  uint16_t AnonymousEvents(const OpenFile& File) const {
+    if (File.TimerFd) return File.TimerFd->Ticks ? 1 : 0;
+    if (File.Event) return (File.Event->Readable() ? 1 : 0) | (File.Event->Writable() ? 4 : 0);
+    if (File.Inotify) return File.Inotify->Instance.Readable() ? 1 : 0;
+    if (File.Epoll) {
+      const auto Ready = File.Epoll->Set.AnyReady(
+        [&](const EpollKey& Key) { const auto Target = Key.File.lock(); return Target ? Readiness(*Target) : 0; },
+        [&](const EpollKey& Key) { const auto Target = Key.File.lock(); return Target ? ReadinessGeneration(*Target) : 0; });
+      return Ready ? 1 : 0;
+    }
+    if (File.SignalFdMask) {
+      // signalfd_poll: signals pending for the polling thread.
+      if (!Current) return 0;
+      return ((Current->Pending.Set() | Task->SharedPending.Set()) & *File.SignalFdMask) ? 1 : 0;
+    }
+    return 0;
+  }
+
+  LinuxStat AnonymousStat() const {
+    LinuxStat Info {};
+    Info.Device = AnonDevice;
+    Info.Inode = AnonInode;
+    Info.Links = 1;
+    Info.Mode = 0600; // anon_inode: no file type bits
+    Info.BlockSize = GuestPageSize;
+    return Info;
+  }
+
+  // ---- epoll ----
+
+  static constexpr unsigned EpollMaxNests = 4; // EP_MAX_NESTS
+  std::vector<std::weak_ptr<EpollState>> EpollInstances;
+
+  int64_t EpollCreate(uint64_t Flags) {
+    if (Flags & ~AnonCloseOnExec) return Invalid;
+    auto File = std::make_shared<OpenFile>();
+    File->Epoll = std::make_shared<EpollState>();
+    std::erase_if(EpollInstances, [](const auto& Weak) { return Weak.expired(); });
+    EpollInstances.push_back(File->Epoll);
+    return OpenAnonymous("[eventpoll]", Flags, 2, std::move(File));
+  }
+
+  // file_can_poll: the descriptor kinds with a poll operation.
+  static bool CanPoll(const OpenFile& File) {
+    return File.Socket || File.Console != ConsoleStream::None || File.AnonName || File.PidfdTarget;
+  }
+
+  static void ForgetClosed(EpollState& State) {
+    State.Set.ForgetIf([](const EpollKey& Key) { return Key.File.expired(); });
+  }
+
+  // ep_loop_check_proc: the deepest nesting below From, or UINT_MAX when Into
+  // is reachable (a cycle).
+  unsigned EpollDepthBelow(const EpollState& From, const EpollState& Into, unsigned Depth) const {
+    unsigned Result = Depth;
+    From.Set.ForEachKey([&](const EpollKey& Key) {
+      if (Result == UINT_MAX) return;
+      const auto Target = Key.File.lock();
+      if (!Target || !Target->Epoll) return;
+      if (Target->Epoll.get() == &Into) {
+        Result = UINT_MAX;
+        return;
+      }
+      Result = std::max(Result, EpollDepthBelow(*Target->Epoll, Into, Depth + 1));
+    });
+    return Result;
+  }
+
+  // ep_get_upwards_depth_proc: how deeply State is nested in other instances.
+  unsigned EpollDepthAbove(const EpollState& State, unsigned Depth) const {
+    unsigned Result = Depth;
+    for (const auto& Weak : EpollInstances) {
+      const auto Parent = Weak.lock();
+      if (!Parent || Parent.get() == &State) continue;
+      bool Contains {};
+      Parent->Set.ForEachKey([&](const EpollKey& Key) {
+        const auto Target = Key.File.lock();
+        Contains |= Target && Target->Epoll.get() == &State;
+      });
+      if (Contains && Depth < EpollMaxNests + 1) Result = std::max(Result, EpollDepthAbove(*Parent, Depth + 1));
+    }
+    return Result;
+  }
+
+  int64_t EpollCtl(uint64_t EpFd, uint64_t OpArgument, uint64_t FD, uint64_t EventAddress) {
+    using namespace Switch2Guest;
+    const auto Op = static_cast<uint32_t>(OpArgument);
+    EpollEvent Event {};
+    if (Op != EpollCtlDel) {
+      if (Available(EventAddress, PF_R) < sizeof(Event)) return Fault;
+      std::memcpy(&Event, reinterpret_cast<const void*>(EventAddress), sizeof(Event));
+    }
+    auto* Epoll = GetFile(EpFd);
+    if (!Epoll || Epoll->PathOnly()) return BadFile;
+    auto* Target = GetFile(FD);
+    if (!Target || Target->PathOnly()) return BadFile;
+    if (!CanPoll(*Target)) return -1;
+    if (Epoll == Target || !Epoll->Epoll) return Invalid;
+    if (Op != EpollCtlDel) {
+      if (const auto Error = CheckEpollExclusive(Op, Event.Events, Target->Epoll != nullptr)) return Error;
+    }
+    auto& State = *Epoll->Epoll;
+    if (Op == EpollCtlAdd && Target->Epoll) {
+      const auto Below = EpollDepthBelow(*Target->Epoll, State, 0);
+      if (Below == UINT_MAX || Below > EpollMaxNests || Below + 1 + EpollDepthAbove(State, 0) > EpollMaxNests) return -40;
+    }
+    ForgetClosed(State);
+    const EpollKey Key {Descriptors().Files[FD], Target, static_cast<int32_t>(FD)};
+    int64_t Result = Invalid;
+    switch (Op) {
+    case EpollCtlAdd: Result = State.Set.Add(Key, Event.Events, Event.Data); break;
+    case EpollCtlDel: Result = State.Set.Remove(Key); break;
+    case EpollCtlMod: Result = State.Set.Modify(Key, Event.Events, Event.Data); break;
+    }
+    if (!Result) ++IOEpoch; // a waiter may have a newly ready item
+    return Result;
+  }
+
+  int64_t EpollWait(uint64_t EpFd, uint64_t Events, uint64_t MaxArgument, int32_t Milliseconds) {
+    return EpollWaitCore(EpFd, Events, MaxArgument,
+                         Milliseconds < 0 ? std::nullopt : std::optional<uint64_t> {Milliseconds * 1'000'000ULL});
+  }
+
+  int64_t EpollPwait(uint64_t EpFd, uint64_t Events, uint64_t MaxArgument, int32_t Milliseconds, uint64_t Mask, uint64_t MaskSize) {
+    std::optional<uint64_t> WaitMask;
+    if (const auto Error = ReadWaitMask(Mask, MaskSize, WaitMask)) return Error;
+    InstallWaitMask(WaitMask);
+    return EpollWait(EpFd, Events, MaxArgument, Milliseconds);
+  }
+
+  int64_t EpollPwait2(uint64_t EpFd, uint64_t Events, uint64_t MaxArgument, uint64_t Timeout, uint64_t Mask, uint64_t MaskSize) {
+    uint64_t Duration {};
+    if (Timeout && Available(Timeout, PF_R) < 16) return Fault;
+    if (Timeout && !ReadTimespec(Timeout, Duration)) return Invalid;
+    std::optional<uint64_t> WaitMask;
+    if (const auto Error = ReadWaitMask(Mask, MaskSize, WaitMask)) return Error;
+    InstallWaitMask(WaitMask);
+    return EpollWaitCore(EpFd, Events, MaxArgument, Timeout ? std::optional {Duration} : std::nullopt);
+  }
+
+  // do_epoll_wait and ep_poll. Never restarted after a handler.
+  int64_t EpollWaitCore(uint64_t EpFd, uint64_t Events, uint64_t MaxArgument, std::optional<uint64_t> Duration) {
+    using Switch2Guest::EpollEvent;
+    const auto Max = static_cast<int32_t>(MaxArgument);
+    if (Max <= 0 || Max > static_cast<int32_t>(INT32_MAX / sizeof(EpollEvent))) return Invalid;
+    if (!IsGuestUserRange(Events, Max * sizeof(EpollEvent))) return Fault;
+    const auto* File = GetFile(EpFd);
+    if (!File || File->PathOnly()) return BadFile;
+    if (!File->Epoll) return Invalid;
+    const auto State = File->Epoll;
+    ForgetClosed(*State);
+    if (Interactive) PollTerminalInput();
+    std::vector<EpollEvent> Ready(std::min<size_t>(Max, std::max<size_t>(State->Set.Size(), 1)));
+    const auto Count = State->Set.Collect(
+      Ready.data(), Ready.size(),
+      [&](const EpollKey& Key) { const auto Target = Key.File.lock(); return Target ? Readiness(*Target) : 0; },
+      [&](const EpollKey& Key) { const auto Target = Key.File.lock(); return Target ? ReadinessGeneration(*Target) : 0; });
+    if (Count) {
+      const auto Bytes = Count * sizeof(EpollEvent);
+      if (AccessiblePrefix(Events, Bytes, PF_W) != Bytes) return Fault;
+      std::memcpy(reinterpret_cast<void*>(Events), Ready.data(), Bytes);
+      return static_cast<int64_t>(Count);
+    }
+    if (Duration == 0) return 0;
+    if (Duration) {
+      const auto Now = MonotonicNs();
+      if (!Current->Deadline) Current->Deadline = AddDeadline(Now, *Duration);
+      if (Current->Deadline <= Now) return 0;
+    }
+    return BlockPoll();
+  }
+
+  // ---- inotify ----
+  // Events come from the guest syscalls that change or use files (BeforeFs
+  // and AfterFs around the dispatcher, ClosedFiles for closes). Changes made
+  // by the FTP server or the rootfs setup do not notify.
+
+  std::vector<std::weak_ptr<InotifyState>> InotifyInstances;
+  uint32_t NextMoveCookie {};
+
+  int64_t InotifyInit(uint64_t Flags) {
+    if (Flags & ~(AnonNonblock | AnonCloseOnExec)) return Invalid;
+    std::erase_if(InotifyInstances, [](const auto& Weak) { return Weak.expired(); });
+    if (InotifyInstances.size() >= Switch2Guest::InotifyMaxInstances) return -24;
+    auto File = std::make_shared<OpenFile>();
+    File->Inotify = std::make_shared<InotifyState>();
+    InotifyInstances.push_back(File->Inotify);
+    return OpenAnonymous("inotify", Flags, 0, std::move(File));
+  }
+
+  int64_t InotifyAddWatch(uint64_t FD, uint64_t Address, uint32_t Mask) {
+    using namespace Switch2Guest;
+    constexpr uint32_t AllBits = InAllEvents | InUnmount | InQOverflow | InIgnored | InOnlyDir | InDontFollow | InExclUnlink |
+                                 InMaskAdd | InMaskCreate | InIsDir | InOneShot;
+    if ((Mask & InMaskAdd) && (Mask & InMaskCreate)) return Invalid;
+    if (!(Mask & AllBits)) return Invalid;
+    auto* File = GetFile(FD);
+    if (!File || File->PathOnly()) return BadFile;
+    if (!File->Inotify) return Invalid;
+    const auto Name = GuestString(Address);
+    if (!Name) return Name.Error;
+    LinuxStat Info {};
+    if (const auto Error = PathStat(CurrentDirectory, *Name, Info, nullptr, !(Mask & InDontFollow))) return Error;
+    const bool Directory = (Info.Mode & 0170000) == 0040000;
+    if ((Mask & InOnlyDir) && !Directory) return -20;
+    if (!InodeAllows(Info.Inode, Info.Mode, 4)) return -13;
+    return File->Inotify->Instance.AddWatch(Info.Inode, Mask, Directory);
+  }
+
+  int64_t InotifyRemoveWatch(uint64_t FD, uint64_t Wd) {
+    auto* File = GetFile(FD);
+    if (!File || File->PathOnly()) return BadFile;
+    if (!File->Inotify) return Invalid;
+    const auto Result = File->Inotify->Instance.RemoveWatch(static_cast<int32_t>(Wd));
+    if (!Result) ++IOEpoch;
+    return Result;
+  }
+
+  bool InotifyWatching() {
+    std::erase_if(InotifyInstances, [](const auto& Weak) { return Weak.expired(); });
+    return std::any_of(InotifyInstances.begin(), InotifyInstances.end(), [](const auto& Weak) {
+      const auto State = Weak.lock();
+      return State && State->Instance.HasWatches();
+    });
+  }
+
+  template<typename Fn>
+  void ForEachInotify(Fn Visit) {
+    for (const auto& Weak : InotifyInstances) {
+      const auto State = Weak.lock();
+      if (!State) continue;
+      const auto Before = State->Instance.Changes();
+      Visit(State->Instance);
+      if (State->Instance.Changes() != Before) ++IOEpoch;
+    }
+  }
+
+  void InotifyEmit(uint64_t Inode, uint32_t Mask, uint32_t Cookie, std::string_view Name, bool Directory, bool Unlinked = false) {
+    if (!Inode) return;
+    ForEachInotify([&](auto& Instance) { Instance.Emit(Inode, Mask, Cookie, Name, Directory, Unlinked); });
+  }
+
+  uint64_t KnownInode(std::string_view Path) const {
+    const auto It = SdInodes.find(Path);
+    return It == SdInodes.end() ? 0 : It->second;
+  }
+
+  static std::string_view BaseName(std::string_view Path) { return Path.substr(Path.rfind('/') + 1); }
+
+  // A watched directory's child event, named.
+  void NotifyChild(const std::string& Path, uint32_t Mask, uint32_t Cookie, bool Directory, bool Unlinked = false) {
+    if (Path.empty() || Path == RootPath) return;
+    InotifyEmit(KnownInode(ParentPath(Path)), Mask, Cookie, BaseName(Path), Directory, Unlinked);
+  }
+
+  // An event on a file: its directory's watches with the name, then its own
+  // (fsnotify_handle_event handles the parent mark first).
+  void NotifyPath(const std::string& Path, uint64_t Inode, uint32_t Mask, bool Directory, bool Unlinked = false) {
+    NotifyChild(Path, Mask, 0, Directory, Unlinked);
+    InotifyEmit(Inode, Mask, 0, {}, Directory, Unlinked);
+  }
+
+  void NotifyFile(const OpenFile& File, uint32_t Mask) {
+    if (!File.NotifyClose) return; // only regular files and directories opened by path
+    NotifyPath(File.Path, File.Inode, Mask, File.Directory.has_value(), IsUnlinked(File.Inode));
+  }
+
+  bool InodeOpen(uint64_t Inode) {
+    bool Open {};
+    ForEachOpenFile([&](const OpenFile& File) { Open |= File.Inode == Inode && File.NotifyClose; });
+    return Open;
+  }
+
+  // The inode is gone (last link and last description): IN_DELETE_SELF.
+  // EndInodeWatches then ends its watches with IN_IGNORED.
+  void InodeDeleted(uint64_t Inode, bool Directory) {
+    InotifyEmit(Inode, Switch2Guest::InDeleteSelf, 0, {}, Directory);
+  }
+  void EndInodeWatches(uint64_t Inode) {
+    ForEachInotify([&](auto& Instance) { Instance.DropInode(Inode); });
+  }
+
+  void DrainClosedFiles() {
+    auto Closed = std::move(ClosedFiles);
+    ClosedFiles.clear();
+    if (!InotifyWatching()) return;
+    for (const auto& File : Closed) {
+      const bool Unlinked = IsUnlinked(File.Inode);
+      NotifyPath(File.Path, File.Inode, File.Write ? Switch2Guest::InCloseWrite : Switch2Guest::InCloseNowrite,
+                 File.Directory, Unlinked);
+      if (Unlinked && !InodeOpen(File.Inode)) {
+        InodeDeleted(File.Inode, File.Directory);
+        EndInodeWatches(File.Inode);
+      }
+    }
+  }
+
+  struct FsSubject {
+    std::string Path;
+    uint64_t Inode {};
+    uint64_t Links {};
+    bool Exists {}, Directory {};
+  };
+  struct FsHook {
+    FsSubject First, Second;
+    uint64_t Flags {};
+  };
+
+  FsSubject Subject(uint64_t FD, uint64_t Address, bool Follow) {
+    FsSubject Result;
+    if (!Address) return Result;
+    const auto Name = GuestString(Address);
+    if (!Name || Name->empty()) return Result;
+    std::string_view Pathname = *Name;
+    while (Pathname.size() > 1 && Pathname.ends_with('/')) Pathname.remove_suffix(1);
+    LinuxStat Info {};
+    if (!PathStat(FD, Pathname, Info, &Result.Path, Follow)) {
+      Result.Exists = true;
+      Result.Inode = Info.Inode;
+      Result.Links = Info.Links;
+      Result.Directory = (Info.Mode & 0170000) == 0040000;
+      return Result;
+    }
+    Result.Path.clear();
+    FsFileSystem SdCard {};
+    if (R_SUCCEEDED(SdRetry(fsOpenSdCardFileSystem, &SdCard))) {
+      if (ResolveSdPath(FD, Pathname, SdCard, Result.Path, false)) Result.Path.clear();
+      fsFsClose(&SdCard);
+    }
+    return Result;
+  }
+
+  // Captures what path-based calls refer to before they run.
+  std::optional<FsHook> BeforeFs(uint64_t Number, const uint64_t* Args) {
+    constexpr uint64_t NoFollow = 0x100, FollowLink = 0x400, OpenNoFollow = 0400000;
+    const auto Cwd = CurrentDirectory;
+    FsHook Hook;
+    switch (Number) {
+    case 2: Hook.First = Subject(Cwd, Args[0], !(Args[1] & OpenNoFollow)); Hook.Flags = Args[1]; break;
+    case 85: Hook.First = Subject(Cwd, Args[0], true); Hook.Flags = 01101; break;
+    case 257: Hook.First = Subject(Args[0], Args[1], !(Args[2] & OpenNoFollow)); Hook.Flags = Args[2]; break;
+    case 437: {
+      uint64_t How {};
+      if (Available(Args[2], PF_R) >= sizeof(How)) std::memcpy(&How, reinterpret_cast<const void*>(Args[2]), sizeof(How));
+      Hook.First = Subject(Args[0], Args[1], !(How & OpenNoFollow));
+      Hook.Flags = How;
+      break;
+    }
+    case 83: case 133: case 84: case 87: case 90: case 92: case 132: case 235: case 76: case 188: case 197:
+      Hook.First = Subject(Cwd, Args[0], Number != 83 && Number != 133 && Number != 84 && Number != 87);
+      break;
+    case 94: case 189: case 198: Hook.First = Subject(Cwd, Args[0], false); break;
+    case 258: case 259: case 268: Hook.First = Subject(Args[0], Args[1], Number == 268); break;
+    case 263: Hook.First = Subject(Args[0], Args[1], false); Hook.Flags = Args[2]; break;
+    case 452: Hook.First = Subject(Args[0], Args[1], !(Args[3] & NoFollow)); break;
+    case 260: Hook.First = Subject(Args[0], Args[1], !(Args[4] & NoFollow)); break;
+    case 261: Hook.First = Subject(Args[0], Args[1], true); break;
+    case 280: if (Args[1]) Hook.First = Subject(Args[0], Args[1], !(Args[3] & NoFollow)); break;
+    case 463: case 466: Hook.First = Subject(Args[0], Args[1], !(Args[2] & NoFollow)); break;
+    case 88: Hook.First = Subject(Cwd, Args[1], false); break;
+    case 266: Hook.First = Subject(Args[1], Args[2], false); break;
+    case 86: Hook.First = Subject(Cwd, Args[0], false); Hook.Second = Subject(Cwd, Args[1], false); break;
+    case 265: Hook.First = Subject(Args[0], Args[1], Args[4] & FollowLink); Hook.Second = Subject(Args[2], Args[3], false); break;
+    case 82: Hook.First = Subject(Cwd, Args[0], false); Hook.Second = Subject(Cwd, Args[1], false); break;
+    case 264: Hook.First = Subject(Args[0], Args[1], false); Hook.Second = Subject(Args[2], Args[3], false); break;
+    case 316:
+      Hook.First = Subject(Args[0], Args[1], false);
+      Hook.Second = Subject(Args[2], Args[3], false);
+      Hook.Flags = Args[4];
+      break;
+    default: return std::nullopt;
+    }
+    return Hook;
+  }
+
+  void NotifyRemoved(const FsSubject& Removed) {
+    using namespace Switch2Guest;
+    if (!Removed.Exists) return;
+    // vfs_unlink: the link count changed (IN_ATTRIB); d_delete_notify: the
+    // inode's IN_DELETE_SELF and IN_IGNORED once it is gone, then the
+    // parent's IN_DELETE.
+    const bool Gone = Removed.Directory || (Removed.Links <= 1 && !InodeOpen(Removed.Inode));
+    if (!Removed.Directory) InotifyEmit(Removed.Inode, InAttrib, 0, {}, false);
+    if (Gone) {
+      InodeDeleted(Removed.Inode, Removed.Directory);
+      EndInodeWatches(Removed.Inode);
+    }
+    NotifyChild(Removed.Path, InDelete, 0, Removed.Directory);
+  }
+
+  // fsnotify_move.
+  void NotifyMove(const FsSubject& From, const FsSubject& To, const FsSubject* Replaced) {
+    using namespace Switch2Guest;
+    const auto Cookie = ++NextMoveCookie;
+    NotifyChild(From.Path, InMovedFrom, Cookie, From.Directory);
+    NotifyChild(To.Path, InMovedTo, Cookie, From.Directory);
+    if (Replaced) InotifyEmit(Replaced->Inode, InAttrib, 0, {}, Replaced->Directory);
+    InotifyEmit(From.Inode, InMoveSelf, 0, {}, From.Directory);
+  }
+
+  // Emits the events of a completed syscall.
+  void AfterFs(const std::optional<FsHook>& Hook, uint64_t Number, const uint64_t* Args, int64_t Result) {
+    using namespace Switch2Guest;
+    const bool Open = Number == 2 || Number == 85 || Number == 257 || Number == 437;
+    if (Open) {
+      // Closing a regular file or directory is an event even if the watch comes later.
+      auto* File = GetFile(Result);
+      if (File && !File->PathOnly() && (File->RealFile || File->Directory) && File->Path.starts_with('/')) File->NotifyClose = true;
+    }
+    if (!InotifyWatching()) return;
+    auto FileAt = [&](uint64_t FD) -> const OpenFile* { return GetFile(FD); };
+    auto Attrib = [&](const FsSubject& Subject) {
+      if (Subject.Exists) NotifyPath(Subject.Path, Subject.Inode, InAttrib, Subject.Directory);
+    };
+    auto Access = [&](uint64_t FD) { if (const auto* File = FileAt(FD); File && File->RealFile) NotifyFile(*File, InAccess); };
+    auto Modify = [&](uint64_t FD) { if (const auto* File = FileAt(FD); File && File->RealFile) NotifyFile(*File, InModify); };
+    switch (Number) {
+    case 0: case 17: case 19: case 295: case 327: if (Result > 0) Access(Args[0]); return;
+    case 1: case 18: case 20: case 296: case 328: if (Result > 0) Modify(Args[0]); return;
+    case 78: case 217: if (const auto* File = FileAt(Args[0]); File) NotifyFile(*File, InAccess); return;
+    case 77: case 285: Modify(Args[0]); return;
+    case 40: if (Result > 0) { Access(Args[1]); Modify(Args[0]); } return;
+    case 275: case 326: if (Result > 0) { Access(Args[0]); Modify(Args[2]); } return;
+    case 91: case 93: case 190: case 199:
+      if (const auto* File = FileAt(Args[0]); File) NotifyFile(*File, InAttrib);
+      return;
+    case 280:
+      if (!Args[1]) {
+        if (const auto* File = FileAt(Args[0]); File) NotifyFile(*File, InAttrib);
+        return;
+      }
+      break;
+    default: break;
+    }
+    if (!Hook) return;
+    const auto& First = Hook->First;
+    switch (Number) {
+    case 2: case 85: case 257: case 437: {
+      const auto* File = GetFile(Result);
+      if (!File) return;
+      if (!First.Exists && !File->Path.empty()) NotifyChild(File->Path, InCreate, 0, false);
+      else if (First.Exists && (Hook->Flags & 01000) && File->RealFile) NotifyFile(*File, InModify);
+      if (!File->PathOnly()) NotifyFile(*File, InOpen);
+      return;
+    }
+    case 83: case 258: NotifyChild(First.Path, InCreate, 0, true); return;
+    case 133: case 259: case 88: case 266: NotifyChild(First.Path, InCreate, 0, false); return;
+    case 86: case 265:
+      InotifyEmit(First.Inode, InAttrib, 0, {}, First.Directory);
+      NotifyChild(Hook->Second.Path, InCreate, 0, First.Directory);
+      return;
+    case 87: case 84: NotifyRemoved(First); return;
+    case 263: NotifyRemoved(First); return;
+    case 82: case 264: case 316: {
+      const auto& Second = Hook->Second;
+      if (!First.Exists) return;
+      constexpr uint64_t Exchange = 2;
+      if (Hook->Flags & Exchange) {
+        NotifyMove(First, Second, nullptr);
+        NotifyMove(Second, First, nullptr);
+        return;
+      }
+      const bool Replaced = Second.Exists && Second.Inode != First.Inode;
+      NotifyMove(First, Second, Replaced ? &Second : nullptr);
+      if (Replaced && (Second.Directory || (Second.Links <= 1 && !InodeOpen(Second.Inode)))) {
+        InodeDeleted(Second.Inode, Second.Directory);
+        EndInodeWatches(Second.Inode);
+      }
+      return;
+    }
+    case 76: if (First.Exists) NotifyPath(First.Path, First.Inode, InModify, false); return;
+    default: Attrib(First); return; // chmod, chown, utimes and xattr changes
+    }
+  }
 
   static constexpr uint64_t CurrentDirectory = static_cast<uint64_t>(-100);
   static bool IsCwd(uint64_t FD) { return FD == CurrentDirectory || FD == static_cast<uint32_t>(CurrentDirectory); }
@@ -1494,8 +3715,127 @@ private:
     return Inode;
   }
 
+  // capget(2)/capset(2) header handling (kernel/capability.c cap_validate_magic).
+  // Returns the number of 32-bit words per set (1 or 2), or a negative errno.
+  int64_t CapabilityWords(uint64_t Header) {
+    constexpr uint32_t Version1 = 0x19980330, Version2 = 0x20071026, Version3 = 0x20080522;
+    uint32_t Version {};
+    if (Available(Header, PF_R) < 8) return Fault;
+    std::memcpy(&Version, reinterpret_cast<const void*>(Header), sizeof(Version));
+    if (Version == Version1) return 1;
+    if (Version == Version2 || Version == Version3) return 2;
+    if (CopyOut(Header, Version3)) return Fault; // only the version word is written
+    return Invalid;
+  }
+
+  int64_t GetCapabilities(uint64_t Header, uint64_t Data) {
+    const auto Words = CapabilityWords(Header);
+    if (Words < 0) return !Data && Words == Invalid ? 0 : Words;
+    if (!Data) return 0;
+    int32_t PID {};
+    std::memcpy(&PID, reinterpret_cast<const void*>(Header + 4), sizeof(PID));
+    if (PID < 0) return Invalid;
+    const GuestProcess* Target = Task;
+    if (PID && static_cast<uint32_t>(PID) != Task->PID && static_cast<uint32_t>(PID) != Current->TID) {
+      Target = ProcessOfId(PID);
+      if (!Target || Target->Exited) return -3;
+    }
+    const auto& C = Target->Creds;
+    std::array<uint32_t, 6> Out {}; // {effective, permitted, inheritable} per word
+    for (int Word = 0; Word < Words; ++Word) {
+      Out[Word * 3 + 0] = static_cast<uint32_t>(C.CapEffective >> (32 * Word));
+      Out[Word * 3 + 1] = static_cast<uint32_t>(C.CapPermitted >> (32 * Word));
+      Out[Word * 3 + 2] = static_cast<uint32_t>(C.CapInheritable >> (32 * Word));
+    }
+    const size_t Bytes = Words * 3 * sizeof(uint32_t);
+    if (Available(Data, PF_W) < Bytes) return Fault;
+    std::memcpy(reinterpret_cast<void*>(Data), Out.data(), Bytes);
+    return 0;
+  }
+
+  int64_t SetCapabilities(uint64_t Header, uint64_t Data) {
+    const auto Words = CapabilityWords(Header);
+    if (Words < 0) return Words;
+    int32_t PID {};
+    std::memcpy(&PID, reinterpret_cast<const void*>(Header + 4), sizeof(PID));
+    if (PID && static_cast<uint32_t>(PID) != Task->PID && static_cast<uint32_t>(PID) != Current->TID) return -1;
+    const size_t Bytes = Words * 3 * sizeof(uint32_t);
+    if (!Data || Available(Data, PF_R) < Bytes) return Fault;
+    std::array<uint32_t, 6> In {};
+    std::memcpy(In.data(), reinterpret_cast<const void*>(Data), Bytes);
+    // mk_kernel_cap: bits above CAP_LAST_CAP are dropped, not rejected.
+    const auto Gather = [&](int Kind) {
+      return (static_cast<uint64_t>(In[3 + Kind]) << 32 | In[Kind]) & Switch2Guest::CapFull;
+    };
+    return Switch2Guest::CapSet(Task->Creds, Gather(0), Gather(1), Gather(2));
+  }
+
   int64_t GuestPrivilegeControl(uint64_t Operation, uint64_t Value, uint64_t Arg3, uint64_t Arg4, uint64_t Arg5) {
-    if (Operation != 38 && Operation != 39) return -38;
+    switch (Operation) {
+    case 1: // PR_SET_PDEATHSIG
+      if (Value > SigMax) return Invalid;
+      Task->ParentDeathSignal = Value;
+      return 0;
+    case 2: return CopyOut(Value, static_cast<int32_t>(Task->ParentDeathSignal)) ? Fault : 0;
+    case 3: return Task->Dumpable; // PR_GET_DUMPABLE
+    case 4:
+      if (Value > 1) return Invalid;
+      Task->Dumpable = Value;
+      return 0;
+    case 15: { // PR_SET_NAME: up to 15 bytes, always terminated
+      std::array<char, 16> Name {};
+      const auto Size = AccessiblePrefix(Value, Name.size() - 1, PF_R);
+      if (!Size) return Fault;
+      std::memcpy(Name.data(), reinterpret_cast<const void*>(Value), Size);
+      Name[std::strlen(Name.data())] = 0;
+      Task->Name = Name;
+      return 0;
+    }
+    case 16: return CopyOut(Value, Task->Name) ? Fault : 0;
+    // cap_task_prctl ignores the unused arguments of the keep-caps options;
+    // glibc's variadic prctl leaves whatever was in those registers.
+    case 7: // PR_GET_KEEPCAPS
+      return Task->Creds.Secure(Switch2Guest::SecbitKeepCaps) ? 1 : 0;
+    case 8: // PR_SET_KEEPCAPS
+      if (Value > 1) return Invalid;
+      if (Task->Creds.Secure(Switch2Guest::SecbitKeepCapsLocked)) return -1;
+      if (Value) Task->Creds.Securebits |= Switch2Guest::SecbitKeepCaps;
+      else Task->Creds.Securebits &= ~Switch2Guest::SecbitKeepCaps;
+      return 0;
+    case 23: // PR_CAPBSET_READ
+      if (Value > Switch2Guest::CapLast) return Invalid;
+      return Task->Creds.CapBounding >> Value & 1;
+    case 24: // PR_CAPBSET_DROP
+      if (!Task->Creds.Capable(Switch2Guest::CapSetpcap)) return -1;
+      if (Value > Switch2Guest::CapLast) return Invalid;
+      Task->Creds.CapBounding &= ~(uint64_t {1} << Value);
+      return 0;
+    case 47: { // PR_CAP_AMBIENT: Value is the sub-operation, Arg3 the capability
+      auto& C = Task->Creds;
+      if (Value == 4) { // PR_CAP_AMBIENT_CLEAR_ALL
+        if (Arg3 || Arg4 || Arg5) return Invalid;
+        C.CapAmbient = 0;
+        return 0;
+      }
+      if (Arg4 || Arg5 || Arg3 > Switch2Guest::CapLast) return Invalid;
+      const uint64_t Bit = uint64_t {1} << Arg3;
+      if (Value == 1) return (C.CapAmbient & Bit) ? 1 : 0; // IS_SET
+      if (Value == 2) { // RAISE
+        if (!(C.CapPermitted & Bit) || !(C.CapInheritable & Bit) || C.Secure(Switch2Guest::SecbitNoCapAmbientRaise)) return -1;
+        C.CapAmbient |= Bit;
+        return 0;
+      }
+      if (Value == 3) { // LOWER
+        C.CapAmbient &= ~Bit;
+        return 0;
+      }
+      return Invalid;
+    }
+    case 36: Task->ChildSubreaper = Value != 0; return 0;
+    case 37: return CopyOut(Value, static_cast<int32_t>(Task->ChildSubreaper)) ? Fault : 0;
+    case 38: case 39: break;
+    default: return Invalid;
+    }
     if (Arg3 || Arg4 || Arg5) return Invalid;
     if (Operation == 39) return Value ? Invalid : Task->NoNewPrivileges;
     if (Value != 1) return Invalid;
@@ -1505,12 +3845,12 @@ private:
 
   bool InGuestGroup(uint32_t Group, bool Real = false) const {
     const auto& Extra = Task->SupplementaryGroups;
-    return Group == Task->GroupIDs[Real ? 0 : 3] || std::binary_search(Extra.begin(), Extra.end(), Group);
+    return Group == Task->Creds.Gid[Real ? 0 : 3] || std::binary_search(Extra.begin(), Extra.end(), Group);
   }
 
   int64_t GuestGroups(bool Set, uint32_t Count, uint64_t Address) {
     auto& Groups = Task->SupplementaryGroups;
-    if (Set && Task->UserIDs[1] != 0) return -1;
+    if (Set && !Task->Creds.Capable(Switch2Guest::CapSetgid)) return -1;
     if (!Set && !Count) return Groups.size();
     if (Count > INT32_MAX || (Set ? Count > 65536 : Count < Groups.size())) return Invalid;
     const size_t Bytes = sizeof(uint32_t) * (Set ? Count : Groups.size());
@@ -1532,22 +3872,12 @@ private:
     return 0;
   }
 
-  int64_t SetGuestIDs(std::array<uint32_t, 4>& IDs, uint32_t Real, uint32_t Effective, uint32_t Saved) {
-    const std::array Requested {Real, Effective, Saved};
-    for (const auto Value : Requested) {
-      if (Task->UserIDs[1] != 0 && Value != UINT32_MAX && std::find(IDs.begin(), IDs.begin() + 3, Value) == IDs.begin() + 3) return -1;
-    }
-    for (size_t I = 0; I < Requested.size(); ++I) {
-      if (Requested[I] != UINT32_MAX) IDs[I] = Requested[I];
-    }
-    IDs[3] = IDs[1];
-    return 0;
-  }
-
-  uint32_t SetFilesystemID(std::array<uint32_t, 4>& IDs, uint32_t Value) {
-    const auto Previous = IDs[3];
-    if (Value != UINT32_MAX && (Task->UserIDs[1] == 0 || std::find(IDs.begin(), IDs.end(), Value) != IDs.end())) IDs[3] = Value;
-    return Previous;
+  // True when the credential holds Cap; access(2) and friends use the real
+  // ids, where Linux's override_creds keeps capabilities only for real root.
+  bool HasCap(uint32_t Cap, bool Real) const {
+    const auto& Creds = Task->Creds;
+    if (!Real || (Creds.Uid[0] == Creds.Uid[1] && Creds.Gid[0] == Creds.Gid[1])) return Creds.Capable(Cap);
+    return Creds.Uid[0] == 0 && (Creds.CapPermitted >> Cap & 1);
   }
 
   std::pair<uint32_t, uint32_t> InodeOwner(uint64_t Inode) const {
@@ -1557,13 +3887,20 @@ private:
   }
 
   bool OwnsInodeOrRoot(uint64_t Inode) const {
-    return !Task->UserIDs[3] || InodeOwner(Inode).first == Task->UserIDs[3];
+    return Task->Creds.Capable(CapFowner) || InodeOwner(Inode).first == Task->Creds.Uid[3];
   }
 
   bool InodeAllows(uint64_t Inode, uint32_t Mode, unsigned Requested, bool Real = false) const {
     const auto [UID, GID] = InodeOwner(Inode);
-    const auto User = Task->UserIDs[Real ? 0 : 3];
-    if (User == 0) return !(Requested & 1) || (Mode & 0170000) == 0040000 || (Mode & 0111);
+    const auto User = Task->Creds.Uid[Real ? 0 : 3];
+    const bool Directory = (Mode & 0170000) == 0040000;
+    // generic_permission: CAP_DAC_OVERRIDE / CAP_DAC_READ_SEARCH grant access
+    // whatever the mode bits and ACL say (execute needs some x bit on files).
+    const auto Override = [&] {
+      if (HasCap(Switch2Guest::CapDacOverride, Real) && (!(Requested & 1) || Directory || (Mode & 0111))) return true;
+      return HasCap(CapDacReadSearch, Real) && ((Requested == 4) || (Directory && !(Requested & 2)));
+    };
+    if (Override()) return true;
     const auto Record = Inodes.find(Inode);
     if (Record != Inodes.end()) {
       const auto ACL = Record->second.Attributes.find(AccessAcl);
@@ -1597,10 +3934,10 @@ private:
 
   static int64_t DirectoryLinks(FsFileSystem& SdCard, const std::string& Path) {
     FsDir Directory {};
-    const auto Opened = SdFileError(fsFsOpenDirectory(&SdCard, Path.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_NoFileSize, &Directory));
+    const auto Opened = SdFileError(SdRetry(fsFsOpenDirectory, &SdCard, Path.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_NoFileSize, &Directory));
     if (Opened) return Opened;
     s64 Count {};
-    const auto Status = SdFileError(fsDirGetEntryCount(&Directory, &Count));
+    const auto Status = SdFileError(SdRetry(fsDirGetEntryCount, &Directory, &Count));
     fsDirClose(&Directory);
     return Status ? Status : 2 + Count;
   }
@@ -1610,9 +3947,9 @@ private:
     const auto Node = Inodes.find(File.Inode);
     const auto Path = Node != Inodes.end() && Node->second.ManagedFile ? ObjectPath(Node->second.BackingObject.value_or(File.Inode)) : File.Path;
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     FsFile Native {};
-    const auto Status = fsFsOpenFile(&SdCard, Path.c_str(), Mode, &Native);
+    const auto Status = SdRetry(fsFsOpenFile, &SdCard, Path.c_str(), Mode, &Native);
     fsFsClose(&SdCard);
     if (R_FAILED(Status)) return SdFileError(Status);
     const auto Result = Use(Native);
@@ -1646,13 +3983,13 @@ private:
 
   int64_t DiskAllocation(const OpenFile& File, s64& Size) {
     return WithDiskFile(File, FsOpenMode_Read, [&](FsFile& Native) {
-      return SdFileError(fsFileGetSize(&Native, &Size));
+      return SdFileError(SdRetry(fsFileGetSize, &Native, &Size));
     });
   }
 
   int64_t FlushDiskFile(const OpenFile& File) {
     const auto Error = WithDiskFile(File, FsOpenMode_Write, [](FsFile& Native) {
-      return SdFileError(fsFileFlush(&Native));
+      return SdFileError(SdRetry(fsFileFlush, &Native));
     });
     if (!Error) DirtyFileData.erase(File.Inode);
     return Error;
@@ -1662,7 +3999,7 @@ private:
     const std::array<uint8_t, 4096> Zeros {};
     while (Begin < End) {
       const auto Count = std::min<uint64_t>(Zeros.size(), End - Begin);
-      if (const auto Error = SdFileError(fsFileWrite(&Native, Begin, Zeros.data(), Count, FsWriteOption_None)); Error) return Error;
+      if (const auto Error = SdFileError(SdRetry(fsFileWrite, &Native, Begin, Zeros.data(), Count, FsWriteOption_None)); Error) return Error;
       Begin += Count;
     }
     return 0;
@@ -1670,10 +4007,10 @@ private:
 
   static int64_t ResizeNativeFile(FsFile& Native, uint64_t Size) {
     s64 Old {};
-    if (const auto Error = SdFileError(fsFileGetSize(&Native, &Old)); Error) return Error;
-    if (Size <= static_cast<uint64_t>(Old)) return SdFileError(fsFileSetSize(&Native, Size));
+    if (const auto Error = SdFileError(SdRetry(fsFileGetSize, &Native, &Old)); Error) return Error;
+    if (Size <= static_cast<uint64_t>(Old)) return SdFileError(SdRetry(fsFileSetSize, &Native, Size));
     if (const auto Error = ZeroDiskRange(Native, Old, Size); Error) {
-      fsFileSetSize(&Native, Old);
+      SdRetry(fsFileSetSize, &Native, Old);
       return Error;
     }
     return 0;
@@ -1695,35 +4032,35 @@ private:
     RetiredBackingObjects.insert(Candidate);
     InodeStoreDirty = true;
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     const auto Commit = [&] {
       if (const auto Error = SaveInodeStore(); Error) return Error;
-      return SdFileError(fsFsCommit(&SdCard));
+      return SdFileError(SdRetry(fsFsCommit, &SdCard));
     };
     auto Error = Commit();
     const auto Path = ObjectPath(Candidate);
-    if (!Error) Error = SdFileError(fsFsCreateFile(&SdCard, Path.c_str(), 0, 0));
+    if (!Error) Error = SdFileError(SdRetry(fsFsCreateFile, &SdCard, Path.c_str(), 0, 0));
     if (!Error) {
       FsFile Output {};
-      Error = SdFileError(fsFsOpenFile(&SdCard, Path.c_str(), FsOpenMode_Write | FsOpenMode_Append, &Output));
+      Error = SdFileError(SdRetry(fsFsOpenFile, &SdCard, Path.c_str(), FsOpenMode_Write | FsOpenMode_Append, &Output));
       if (!Error) {
         Error = WithDiskFile(File, FsOpenMode_Read, [&](FsFile& Input) {
           std::array<char, 4096> Scratch;
           return Source.CopyTo(Destination, Scratch,
             [&](uint64_t Offset, std::span<char> Chunk) -> int64_t {
               u64 Count {};
-              const auto ReadError = SdFileError(fsFileRead(&Input, Offset, Chunk.data(), Chunk.size(), FsReadOption_None, &Count));
+              const auto ReadError = SdFileError(SdRetry(fsFileRead, &Input, Offset, Chunk.data(), Chunk.size(), FsReadOption_None, &Count));
               return ReadError ? ReadError : static_cast<int64_t>(Count);
             },
             [&](uint64_t Offset, std::span<const char> Chunk) {
-              return SdFileError(fsFileWrite(&Output, Offset, Chunk.data(), Chunk.size(), FsWriteOption_None));
+              return SdFileError(SdRetry(fsFileWrite, &Output, Offset, Chunk.data(), Chunk.size(), FsWriteOption_None));
             }, Update, ShiftBoundary, SourceShift);
         });
-        if (!Error) Error = SdFileError(fsFileFlush(&Output));
+        if (!Error) Error = SdFileError(SdRetry(fsFileFlush, &Output));
         fsFileClose(&Output);
       }
     }
-    if (!Error) Error = SdFileError(fsFsCommit(&SdCard));
+    if (!Error) Error = SdFileError(SdRetry(fsFsCommit, &SdCard));
     if (!Error) {
       const auto OldBacking = Record.BackingObject;
       const auto OldSize = Record.LogicalSize;
@@ -1749,10 +4086,10 @@ private:
         // current operation's previous object still belongs to one slot.
         std::vector<uint64_t> Removed;
         for (const auto Object : PreviouslyRetired) {
-          const auto Delete = SdFileError(fsFsDeleteFile(&SdCard, ObjectPath(Object).c_str()));
+          const auto Delete = SdFileError(SdRetry(fsFsDeleteFile, &SdCard, ObjectPath(Object).c_str()));
           if (!Delete || Delete == -2) Removed.push_back(Object);
         }
-        if (!Removed.empty() && R_SUCCEEDED(fsFsCommit(&SdCard))) {
+        if (!Removed.empty() && R_SUCCEEDED(SdRetry(fsFsCommit, &SdCard))) {
           for (const auto Object : Removed) RetiredBackingObjects.erase(Object);
           InodeStoreDirty = true;
         }
@@ -1787,15 +4124,15 @@ private:
         }
       }
       s64 Allocated {};
-      if (R_FAILED(fsFileGetSize(&Native, &Allocated)) ||
-          (Size < static_cast<uint64_t>(Allocated) && R_FAILED(fsFileSetSize(&Native, Size)))) {
+      if (R_FAILED(SdRetry(fsFileGetSize, &Native, &Allocated)) ||
+          (Size < static_cast<uint64_t>(Allocated) && R_FAILED(SdRetry(fsFileSetSize, &Native, Size)))) {
         WriteLog("Guest truncate changed logical EOF but could not release native backing space.");
       }
       return 0;
     }
     if (Size > *OldLogical) {
       s64 Allocated {};
-      if (const auto Error = SdFileError(fsFileGetSize(&Native, &Allocated)); Error) return Error;
+      if (const auto Error = SdFileError(SdRetry(fsFileGetSize, &Native, &Allocated)); Error) return Error;
       if (Size > static_cast<uint64_t>(Allocated)) {
         if (const auto Error = ResizeNativeFile(Native, Size); Error) return Error;
       }
@@ -1824,7 +4161,7 @@ private:
       if (const auto Error = EnsureLogicalDiskSize(File, Visible); Error) return Error;
       const auto Clear = WithDiskFile(File, FsOpenMode_Write | FsOpenMode_Append, [&](FsFile& Native) {
         s64 Allocated {};
-        if (const auto Error = SdFileError(fsFileGetSize(&Native, &Allocated)); Error) return Error;
+        if (const auto Error = SdFileError(SdRetry(fsFileGetSize, &Native, &Allocated)); Error) return Error;
         return ZeroDiskRange(Native, Visible, std::min<uint64_t>(Size, Allocated));
       });
       if (Clear) return Clear;
@@ -1842,7 +4179,7 @@ private:
     const auto Existing = Inodes.find(File.Inode);
     if (Existing == Inodes.end() || !Existing->second.ManagedFile) {
       FsFileSystem SdCard {};
-      if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+      if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
       const auto Promotion = PromoteSdFile(SdCard, File.Path);
       fsFsClose(&SdCard);
       if (Promotion) return Promotion;
@@ -1861,6 +4198,10 @@ private:
   }
 
   int64_t FileStat(uint64_t FD, LinuxStat& Info) {
+    if (const auto* Anonymous = GetFile(FD); Anonymous && Anonymous->AnonName) {
+      Info = AnonymousStat();
+      return 0;
+    }
     if (auto* File = GetFile(FD)) {
       s64 Size = File->Memory ? File->Memory->Size : File->Contents.size();
       s64 Allocated {};
@@ -1894,7 +4235,7 @@ private:
         int64_t Links = 2;
         if (!IsOverflowDirectory(File->Path)) {
           FsFileSystem SdCard {};
-          if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+          if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
           Links = DirectoryLinks(SdCard, File->Path);
           fsFsClose(&SdCard);
           if (Links < 0) return Links;
@@ -1965,7 +4306,7 @@ private:
 
   int64_t PathStat(uint64_t Directory, std::string_view Name, LinuxStat& Info, std::string* Resolved = nullptr, bool Follow = true) {
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string Path;
     auto Error = ResolveSdPath(Directory, Name, SdCard, Path, Follow);
     if (!Error) {
@@ -2020,9 +4361,9 @@ private:
         Error = -20;
       } else {
         FsFile File {};
-        Error = SdFileError(fsFsOpenFile(&SdCard, Backing.c_str(), FsOpenMode_Read, &File));
+        Error = SdFileError(SdRetry(fsFsOpenFile, &SdCard, Backing.c_str(), FsOpenMode_Read, &File));
         if (!Error) {
-          Error = SdFileError(fsFileGetSize(&File, &Size));
+          Error = SdFileError(SdRetry(fsFileGetSize, &File, &Size));
           fsFileClose(&File);
         }
       }
@@ -2061,7 +4402,7 @@ private:
 
   void SetInodeMode(uint64_t Inode, uint32_t Mode) {
     auto& Record = Inodes[Inode];
-    if (Task->UserIDs[3] && !InGuestGroup(InodeOwner(Inode).second)) Mode &= ~02000U;
+    if (!Task->Creds.Capable(CapFsetid) && !InGuestGroup(InodeOwner(Inode).second)) Mode &= ~02000U;
     Record.Mode = Mode & 07777;
     if (auto ACL = Record.Attributes.find(AccessAcl); ACL != Record.Attributes.end()) {
       if (const auto Layout = ParsePosixAcl(ACL->second)) Layout->ApplyMode(ACL->second, Mode, false);
@@ -2147,8 +4488,8 @@ private:
       Error = GetStatAt(FD, Address, Flags, Info);
     }
     if (Error) return Error;
-    const auto User = Task->UserIDs[3];
-    if (User && (Info.Uid != User || (UID != Unchanged && UID != Info.Uid) ||
+    const auto User = Task->Creds.Uid[3];
+    if (!Task->Creds.Capable(Switch2Guest::CapChown) && (Info.Uid != User || (UID != Unchanged && UID != Info.Uid) ||
                  (GID != Unchanged && GID != Info.Gid && !InGuestGroup(GID)))) return -1;
     if (Info.Inode < InodeSnapshot::FirstInode && (Info.Mode & 0170000) != 0100000) return -1;
     if ((Info.Mode & 0170000) == 0100000) {
@@ -2340,6 +4681,7 @@ private:
     if (File->Socket || File->Console != ConsoleStream::None) return -29;
     if (Origin > 4) return Invalid;
     if (File->Path == "/dev/null") return 0;
+    if (File->AnonName) return File->Offset; // noop_llseek
     int64_t Base {};
     if (Origin == 1) Base = File->Offset;
     else if (Origin >= 2) {
@@ -2452,7 +4794,6 @@ private:
   int64_t ResolveSdPath(uint64_t FD, std::string_view Name, FsFileSystem& SdCard, std::string& Path, bool Follow = true,
                         uint64_t Resolve = 0) {
     if (Name.empty()) return -2;
-    if (Name.find_first_of(":\\") != Name.npos) return Invalid;
     const bool Absolute = Name.starts_with('/');
     if (Absolute && (Resolve & ResolveBeneath)) return -18;
     if (Absolute && !(Resolve & ResolveInRoot)) {
@@ -2504,11 +4845,22 @@ private:
     return Metadata != Inodes.end() && Metadata->second.OverflowDirectory && !Metadata->second.Unlinked;
   }
 
-  // Entries the SD card cannot hold natively: paths beyond SdPathLimit and
-  // anything inside an overflow directory. All directories below an
-  // overflow directory are overflow directories too, so the parent decides.
+  // Linux allows every byte but '/' and NUL in a name; FAT and exFAT reject
+  // control characters and " * : < > ? \ |, and Horizon treats ':' as a
+  // mount separator.
+  static bool SdNameUnsafe(std::string_view Path) {
+    const auto Name = Path.substr(Path.rfind('/') + 1);
+    return std::any_of(Name.begin(), Name.end(), [](char C) {
+      return static_cast<uint8_t>(C) < 0x20 || std::strchr("\"*:<>?\\|", C) != nullptr;
+    });
+  }
+
+  // Entries the SD card cannot hold natively: paths beyond SdPathLimit,
+  // names with characters the SD card rejects, and anything inside an
+  // overflow directory. All directories below an overflow directory are
+  // overflow directories too, so the parent decides.
   bool NeedsOverflow(std::string_view Path) const {
-    return Path.size() > SdPathLimit || IsOverflowDirectory(ParentPath(Path));
+    return Path.size() > SdPathLimit || SdNameUnsafe(Path) || IsOverflowDirectory(ParentPath(Path));
   }
 
   // Store-backed entries of any kind, including overflow directories.
@@ -2525,10 +4877,10 @@ private:
       return 0;
     }
     if (IsManagedFile(Path)) {
-      return SdFileError(fsFsGetEntryType(&SdCard, FileBackingPath(Path).c_str(), &Type));
+      return SdFileError(SdRetry(fsFsGetEntryType, &SdCard, FileBackingPath(Path).c_str(), &Type));
     }
     if (NeedsOverflow(Path)) return -2;
-    return SdFileError(fsFsGetEntryType(&SdCard, Path.c_str(), &Type));
+    return SdFileError(SdRetry(fsFsGetEntryType, &SdCard, Path.c_str(), &Type));
   }
 
   // Overflow subdirectories directly below Path, for st_nlink.
@@ -2579,7 +4931,6 @@ private:
 
   int64_t WalkSdPath(std::string_view Name, FsFileSystem& SdCard, std::string& Path, bool Follow, unsigned Depth,
                      uint64_t Resolve, std::string_view Scope) {
-    if (Name.find_first_of(":\\") != Name.npos) return Invalid;
     const bool UnderRoot = Path == RootPath ||
                            (Path.starts_with(RootPath) && Path[RootPath.size()] == '/');
     const size_t Boundary = !Scope.empty() ? Scope.size() : UnderRoot ? RootPath.size() : LaunchFolder.size();
@@ -2648,8 +4999,8 @@ private:
   }
 
   bool CanRemoveStickyEntry(const std::string& Path) {
-    const auto User = Task->UserIDs[3];
-    if (!User) return true;
+    const auto User = Task->Creds.Uid[3];
+    if (Task->Creds.Capable(CapFowner)) return true;
     const auto Parent = SdInode(ParentPath(Path));
     return !(ModeForInode(Parent, 0040755) & 01000) ||
            InodeOwner(Parent).first == User || InodeOwner(SdInode(Path)).first == User;
@@ -2782,7 +5133,7 @@ private:
       const auto Child = Path + "/" + Entry.Name;
       int64_t Error {};
       if (IsOverflowDirectory(Child)) {
-        Error = SdFileError(fsFsDeleteDirectory(&SdCard, Child.c_str()));
+        Error = SdFileError(SdRetry(fsFsDeleteDirectory, &SdCard, Child.c_str()));
         if (Error == -2) Error = 0;
       } else {
         Error = Entry.IsDirectory ? ConvertToOverflow(SdCard, Child) : PromoteSdFile(SdCard, Child);
@@ -2803,7 +5154,7 @@ private:
       InodeStoreDirty = PreviousDirty;
       return Error;
     }
-    const auto Removed = SdFileError(fsFsDeleteDirectory(&SdCard, Path.c_str()));
+    const auto Removed = SdFileError(SdRetry(fsFsDeleteDirectory, &SdCard, Path.c_str()));
     if (Removed && Removed != -2) WriteLog("Converted overflow directory left its empty native directory behind.");
     return 0;
   }
@@ -2896,10 +5247,10 @@ private:
           if (HasStoreChildren(NewPath)) return -39;
           if (!IsOverflowDirectory(NewPath)) {
             FsDir Directory {};
-            auto Error = SdFileError(fsFsOpenDirectory(&SdCard, NewPath.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &Directory));
+            auto Error = SdFileError(SdRetry(fsFsOpenDirectory, &SdCard, NewPath.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &Directory));
             if (Error) return Error;
             s64 Count {};
-            Error = SdFileError(fsDirGetEntryCount(&Directory, &Count));
+            Error = SdFileError(SdRetry(fsDirGetEntryCount, &Directory, &Count));
             fsDirClose(&Directory);
             if (Error) return Error;
             if (Count) return -39;
@@ -2921,10 +5272,10 @@ private:
     int64_t Error {};
     if (!Exchange) {
       FsDir Directory {};
-      Error = SdFileError(fsFsOpenDirectory(&SdCard, New.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &Directory));
+      Error = SdFileError(SdRetry(fsFsOpenDirectory, &SdCard, New.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &Directory));
       if (Error) return Error;
       s64 Count {};
-      Error = SdFileError(fsDirGetEntryCount(&Directory, &Count));
+      Error = SdFileError(SdRetry(fsDirGetEntryCount, &Directory, &Count));
       fsDirClose(&Directory);
       if (Error) return Error;
       if (Count) return -39;
@@ -2941,8 +5292,8 @@ private:
     if (Intent.empty()) return -28;
     Error = PublishInodeIntent(SdCard, DirectoryIntentPath, Intent);
     if (Error) return Error;
-    if (!VirtualDestination) Error = SdFileError(fsFsRenameDirectory(&SdCard, New.c_str(), DirectoryBackupPath));
-    if (!Error) Error = SdFileError(fsFsRenameDirectory(&SdCard, Old.c_str(), New.c_str()));
+    if (!VirtualDestination) Error = SdFileError(SdRetry(fsFsRenameDirectory, &SdCard, New.c_str(), DirectoryBackupPath));
+    if (!Error) Error = SdFileError(SdRetry(fsFsRenameDirectory, &SdCard, Old.c_str(), New.c_str()));
 
     uint64_t Destination {};
     if (!Error) {
@@ -3005,7 +5356,7 @@ private:
   }
 
   int64_t InterruptInodeTransaction(FsFileSystem& SdCard) {
-    const auto Error = SdFileError(fsFsCommit(&SdCard));
+    const auto Error = SdFileError(SdRetry(fsFsCommit, &SdCard));
     InodeStoreAvailable = false;
     WriteLog("Filesystem recovery probe left a committed journal intent for the next launch.");
     return Error ? Error : -4;
@@ -3025,8 +5376,8 @@ private:
     const auto SourceTimes = Inodes[Source].Times;
     auto PreviousNames = SdInodes;
     const auto PreviousDirty = InodeStoreDirty;
-    Error = SdFileError(Type == FsDirEntryType_Dir ? fsFsRenameDirectory(&SdCard, Old.c_str(), New.c_str()) :
-                                                   fsFsRenameFile(&SdCard, Old.c_str(), New.c_str()));
+    Error = SdFileError(Type == FsDirEntryType_Dir ? SdRetry(fsFsRenameDirectory, &SdCard, Old.c_str(), New.c_str()) :
+                                                   SdRetry(fsFsRenameFile, &SdCard, Old.c_str(), New.c_str()));
     // Recovery acceptance: a launch opted in with a .recovery-test file stops
     // its probe move before or after the metadata checkpoint, as a power loss
     // would, and the next launch must roll the journal back or forward.
@@ -3063,7 +5414,10 @@ private:
     }
     if (const auto Recovery = RecoverDirectoryRename(SdCard); Recovery) {
       InodeStoreAvailable = false;
-      WriteLog("Guest native move could not finish recovery.");
+      char Message[160];
+      std::snprintf(Message, sizeof(Message), "Guest native move could not finish recovery (move %lld, recovery %lld, %zu names, %zu inodes).",
+                    static_cast<long long>(Error), static_cast<long long>(Recovery), SdInodes.size(), Inodes.size());
+      WriteLog(Message);
       return Error ? Error : Recovery;
     }
     if (!Error && !Remove) TrackRenamedHandles(Old, New);
@@ -3077,7 +5431,7 @@ private:
     if (!NewName) return NewName.Error;
 
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string OldPath, NewPath;
     const auto WithoutTrailingSlashes = [](std::string_view Name) {
       const auto Last = Name.find_last_not_of('/');
@@ -3181,11 +5535,11 @@ private:
     if (!InodeStoreAvailable) return -5;
     const auto Inode = SdInode(Path);
     ImportTimestamps(SdCard, Path, Inode);
-    const auto Storage = SdFileError(fsFsCreateDirectory(&SdCard, InodeObjects.data()));
+    const auto Storage = SdFileError(SdRetry(fsFsCreateDirectory, &SdCard, InodeObjects.data()));
     if (Storage && Storage != -17) return Storage;
     if (const auto Error = BeginPromotion(SdCard, Path, Inode); Error < 0) return Error;
     const auto Object = ObjectPath(Inode);
-    auto Error = SdFileError(fsFsRenameFile(&SdCard, Path.c_str(), Object.c_str()));
+    auto Error = SdFileError(SdRetry(fsFsRenameFile, &SdCard, Path.c_str(), Object.c_str()));
     if (!Error) {
       auto& Record = Inodes[Inode];
       const auto OldMode = Record.Mode;
@@ -3195,7 +5549,7 @@ private:
       InodeStoreDirty = true;
       Error = SaveInodeStore();
       if (Error) {
-        const auto Rollback = SdFileError(fsFsRenameFile(&SdCard, Object.c_str(), Path.c_str()));
+        const auto Rollback = SdFileError(SdRetry(fsFsRenameFile, &SdCard, Object.c_str(), Path.c_str()));
         if (Rollback) {
           InodeStoreAvailable = false;
           WriteLog("Failed to restore file after inode metadata checkpoint error.");
@@ -3229,7 +5583,7 @@ private:
     }
 
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string OldPath, NewPath;
     auto Error = Temporary ? int64_t {0} : ResolveSdPath(OldFD, *OldName, SdCard, OldPath, Flags & Follow);
     if (!Error) Error = ResolveSdPath(NewFD, *NewName, SdCard, NewPath, false);
@@ -3288,7 +5642,7 @@ private:
     const auto Name = GuestString(Address);
     if (!Name) return Name.Error;
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string Path;
     auto Error = ResolveSdPath(FD, *Name, SdCard, Path, false);
     if (!Error && Name->ends_with('/')) Error = -2;
@@ -3355,7 +5709,7 @@ private:
     if (!Name) return Name.Error;
     if (Target->empty()) return -2;
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string Path;
     auto Error = ResolveSdPath(FD, *Name, SdCard, Path, false);
     if (!Error && (Name->ends_with('/') || !CanModifyParent(Path))) Error = Name->ends_with('/') ? -2 : -13;
@@ -3406,13 +5760,13 @@ private:
     const auto Parent = ParentPath(Path);
     const auto Now = WallClock();
     Record.Times = InodeTimestamps {Now, Now, Now};
-    uint32_t Group = Task->GroupIDs[3];
+    uint32_t Group = Task->Creds.Gid[3];
     const auto ParentInode = SdInode(Parent);
     if (ModeForInode(ParentInode, 0040755) & 02000) {
       Group = InodeOwner(ParentInode).second;
       if (Directory) Mode |= 02000;
     }
-    Record.Owner.emplace(Task->UserIDs[3], Group);
+    Record.Owner.emplace(Task->Creds.Uid[3], Group);
     const bool Symlink = Record.Symlink.has_value();
     Inodes.emplace(Inode, std::move(Record));
     if (!Symlink) InitializeInodeMode(Inode, Parent, Mode, Directory);
@@ -3431,7 +5785,7 @@ private:
   int64_t CreateNativeEntry(FsFileSystem& SdCard, const std::string& Path, uint32_t Mode, bool Directory) {
     if (!InodeStoreAvailable || InodeGeneration == UINT64_MAX) return -5;
     FsDirEntryType StagingType {};
-    const auto Staging = SdFileError(fsFsGetEntryType(&SdCard, DirectoryBackupPath, &StagingType));
+    const auto Staging = SdFileError(SdRetry(fsFsGetEntryType, &SdCard, DirectoryBackupPath, &StagingType));
     if (Staging != -2) return Staging ? Staging : -5;
     const auto First = InodeSnapshot::FirstInode;
     const auto Intent = EncodeInodeSnapshot(InodeGeneration + 1, First + (Directory ? 9 : 10),
@@ -3440,12 +5794,15 @@ private:
     auto Error = PublishInodeIntent(SdCard, DirectoryIntentPath, Intent);
     if (Error) return Error;
 
-    Error = SdFileError(Directory ? fsFsCreateDirectory(&SdCard, DirectoryBackupPath) :
-                                   fsFsCreateFile(&SdCard, DirectoryBackupPath, 0, 0));
+    Error = SdFileError(Directory ? SdRetry(fsFsCreateDirectory, &SdCard, DirectoryBackupPath) :
+                                             SdRetry(fsFsCreateFile, &SdCard, DirectoryBackupPath, 0, 0));
     if (!Error) Error = CheckpointNewEntry(Path, Mode, Directory);
     if (const auto Recovery = RecoverDirectoryRename(SdCard); Recovery) {
       InodeStoreAvailable = false;
-      WriteLog("Guest native creation could not finish recovery.");
+      char Message[200];
+      std::snprintf(Message, sizeof(Message), "Guest native creation could not finish recovery (create %lld, recovery %lld) for %s.",
+                    static_cast<long long>(Error), static_cast<long long>(Recovery), Path.c_str());
+      WriteLog(Message);
       return Error ? Error : Recovery;
     }
     return Error;
@@ -3456,23 +5813,23 @@ private:
   // before the name is published leaves an object the next launch reclaims.
   int64_t CreateOverflowFile(FsFileSystem& SdCard, const std::string& Path, uint32_t Mode) {
     if (!InodeStoreAvailable || InodeGeneration == UINT64_MAX) return -5;
-    const auto Storage = SdFileError(fsFsCreateDirectory(&SdCard, InodeObjects.data()));
+    const auto Storage = SdFileError(SdRetry(fsFsCreateDirectory, &SdCard, InodeObjects.data()));
     if (Storage && Storage != -17) return Storage;
     const auto Parent = ParentPath(Path);
     const auto ParentInode = SdInode(Parent);
     const auto Inode = NextSdInode++;
     auto& Record = Inodes[Inode];
     Record.ManagedFile = Record.Unlinked = true;
-    uint32_t Group = Task->GroupIDs[3];
+    uint32_t Group = Task->Creds.Gid[3];
     if (ModeForInode(ParentInode, 0040755) & 02000) Group = InodeOwner(ParentInode).second;
-    Record.Owner.emplace(Task->UserIDs[3], Group);
+    Record.Owner.emplace(Task->Creds.Uid[3], Group);
     InitializeInodeMode(Inode, Parent, Mode, false);
     const auto Now = WallClock();
     Record.Times = InodeTimestamps {Now, Now, Now};
     InodeStoreDirty = true;
     auto Error = SaveInodeStore();
-    if (!Error) Error = SdFileError(fsFsCommit(&SdCard));
-    if (!Error) Error = SdFileError(fsFsCreateFile(&SdCard, ObjectPath(Inode).c_str(), 0, 0));
+    if (!Error) Error = SdFileError(SdRetry(fsFsCommit, &SdCard));
+    if (!Error) Error = SdFileError(SdRetry(fsFsCreateFile, &SdCard, ObjectPath(Inode).c_str(), 0, 0));
     if (Error) return Error; // The unlinked record is reclaimed later.
     SdInodes[Path] = Inode;
     Inodes.at(Inode).Unlinked = false;
@@ -3492,7 +5849,7 @@ private:
     const auto Name = GuestString(Address);
     if (!Name) return Name.Error;
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string Path;
     const auto Last = Name->find_last_not_of('/');
     const auto Pathname = Last == Name->npos ? *Name : Name->substr(0, Last + 1);
@@ -3543,7 +5900,7 @@ private:
     if (!Name) return Name.Error;
 
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string Path;
     auto Error = ResolveSdPath(FD, *Name, SdCard, Path, false);
     const bool Virtual = !Error && (SymlinkAt(Path) || SpecialNodeAt(Path));
@@ -3586,7 +5943,7 @@ private:
     }
 
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string Path;
     auto Pathname = *Name;
     if (Last != Name->npos) Pathname = Name->substr(0, Last + 1);
@@ -3606,11 +5963,11 @@ private:
     }
     if (!Error) {
       FsDir Directory {};
-      auto Status = fsFsOpenDirectory(&SdCard, Path.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &Directory);
+      auto Status = SdRetry(fsFsOpenDirectory, &SdCard, Path.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &Directory);
       Error = SdFileError(Status);
       if (!Error) {
         s64 Entries {};
-        Status = fsDirGetEntryCount(&Directory, &Entries);
+        Status = SdRetry(fsDirGetEntryCount, &Directory, &Entries);
         fsDirClose(&Directory);
         Error = SdFileError(Status);
         if (!Error && Entries) Error = -39;
@@ -3641,7 +5998,7 @@ private:
   }
 
   int64_t DuplicateDescriptor(uint64_t Old, uint64_t New, bool CloseOnExec) {
-    if (!GetFile(Old) || New >= Descriptors().Files.size()) return BadFile;
+    if (!GetFile(Old) || New >= DescriptorLimit()) return BadFile;
     if (Old == New) return New;
     if (GetFile(New)) CloseGuest(New);
     Descriptors().Files[New] = Descriptors().Files[Old];
@@ -3877,7 +6234,7 @@ private:
       return 0;
     }
     if (Command == 0 || Command == 1030) {
-      if (Arg >= Descriptors().Files.size()) return Invalid;
+      if (Arg >= DescriptorLimit()) return Invalid;
       const auto NewFD = FreeDescriptor(Arg);
       if (NewFD == NoDescriptor) return -24;
       Descriptors().Files[NewFD] = Descriptors().Files[FD];
@@ -3887,8 +6244,13 @@ private:
     return Invalid;
   }
 
+  // RLIMIT_NOFILE: descriptors at or above the soft limit are not allocated.
+  uint64_t DescriptorLimit() const {
+    return std::min<uint64_t>(Task->Limits[ResourceNofile][0], Descriptors().Files.size());
+  }
+
   uint64_t FreeDescriptor(uint64_t Start = 0) const {
-    for (uint64_t FD = Start; FD < Descriptors().Files.size(); ++FD) {
+    for (uint64_t FD = Start; FD < DescriptorLimit(); ++FD) {
       if (!Descriptors().Files[FD]) return FD;
     }
     return NoDescriptor;
@@ -3955,15 +6317,15 @@ private:
 
   static int64_t ReadInodeSlot(FsFileSystem& SdCard, const char* Path, std::vector<uint8_t>& Bytes) {
     FsFile File {};
-    auto Error = SdFileError(fsFsOpenFile(&SdCard, Path, FsOpenMode_Read, &File));
+    auto Error = SdFileError(SdRetry(fsFsOpenFile, &SdCard, Path, FsOpenMode_Read, &File));
     if (Error) return Error;
     s64 Size {};
-    Error = SdFileError(fsFileGetSize(&File, &Size));
+    Error = SdFileError(SdRetry(fsFileGetSize, &File, &Size));
     if (!Error && (Size <= 0 || static_cast<uint64_t>(Size) > InodeSnapshot::MaxBytes)) Error = -5;
     if (!Error) {
       Bytes.resize(Size);
       u64 Read {};
-      Error = SdFileError(fsFileRead(&File, 0, Bytes.data(), Bytes.size(), FsReadOption_None, &Read));
+      Error = SdFileError(SdRetry(fsFileRead, &File, 0, Bytes.data(), Bytes.size(), FsReadOption_None, &Read));
       if (!Error && Read != Bytes.size()) Error = -5;
       if (Error) Bytes.clear();
     }
@@ -3973,30 +6335,30 @@ private:
 
   static int64_t WriteInodeFile(FsFileSystem& SdCard, const char* Path, std::span<const uint8_t> Bytes) {
     FsFile File {};
-    auto Error = SdFileError(fsFsOpenFile(&SdCard, Path, FsOpenMode_Write | FsOpenMode_Append, &File));
+    auto Error = SdFileError(SdRetry(fsFsOpenFile, &SdCard, Path, FsOpenMode_Write | FsOpenMode_Append, &File));
     if (Error) return Error;
-    Error = SdFileError(fsFileSetSize(&File, Bytes.size()));
-    if (!Error) Error = SdFileError(fsFileWrite(&File, 0, Bytes.data(), Bytes.size(), FsWriteOption_Flush));
+    Error = SdFileError(SdRetry(fsFileSetSize, &File, Bytes.size()));
+    if (!Error) Error = SdFileError(SdRetry(fsFileWrite, &File, 0, Bytes.data(), Bytes.size(), FsWriteOption_Flush));
     fsFileClose(&File);
     return Error;
   }
 
   static int64_t FinishInodeIntent(FsFileSystem& SdCard, const char* Path) {
-    if (const auto Error = SdFileError(fsFsCommit(&SdCard)); Error) return Error;
-    if (const auto Error = SdFileError(fsFsDeleteFile(&SdCard, Path)); Error) return Error;
-    return SdFileError(fsFsCommit(&SdCard));
+    if (const auto Error = SdFileError(SdRetry(fsFsCommit, &SdCard)); Error) return Error;
+    if (const auto Error = SdFileError(SdRetry(fsFsDeleteFile, &SdCard, Path)); Error) return Error;
+    return SdFileError(SdRetry(fsFsCommit, &SdCard));
   }
 
   int64_t PublishInodeIntent(FsFileSystem& SdCard, const char* Destination, std::span<const uint8_t> Bytes) {
-    auto Error = SdFileError(fsFsCreateFile(&SdCard, IntentStagingPath, 0, 0));
+    auto Error = SdFileError(SdRetry(fsFsCreateFile, &SdCard, IntentStagingPath, 0, 0));
     if (Error) return Error;
     Error = WriteInodeFile(SdCard, IntentStagingPath, Bytes);
-    if (!Error) Error = SdFileError(fsFsRenameFile(&SdCard, IntentStagingPath, Destination));
+    if (!Error) Error = SdFileError(SdRetry(fsFsRenameFile, &SdCard, IntentStagingPath, Destination));
     if (Error) {
-      fsFsDeleteFile(&SdCard, IntentStagingPath);
+      SdRetry(fsFsDeleteFile, &SdCard, IntentStagingPath);
       return Error;
     }
-    Error = SdFileError(fsFsCommit(&SdCard));
+    Error = SdFileError(SdRetry(fsFsCommit, &SdCard));
     if (Error) {
       // The intent may already be durable. Leave it for recovery, and do
       // not start the native mutation or another transaction in this run.
@@ -4025,10 +6387,10 @@ private:
     const auto& [Path, Inode] = *Intent->Names.begin();
     const auto Object = ObjectPath(Inode);
     FsDirEntryType Type {};
-    const auto ObjectStatus = SdFileError(fsFsGetEntryType(&SdCard, Object.c_str(), &Type));
+    const auto ObjectStatus = SdFileError(SdRetry(fsFsGetEntryType, &SdCard, Object.c_str(), &Type));
     if (ObjectStatus && ObjectStatus != -2) return ObjectStatus;
     if (!ObjectStatus && Type != FsDirEntryType_File) return -5;
-    const auto OriginalStatus = SdFileError(fsFsGetEntryType(&SdCard, Path.c_str(), &Type));
+    const auto OriginalStatus = SdFileError(SdRetry(fsFsGetEntryType, &SdCard, Path.c_str(), &Type));
     if (OriginalStatus && OriginalStatus != -2) return OriginalStatus;
 
     const auto Name = SdInodes.find(Path);
@@ -4037,7 +6399,7 @@ private:
     if (Committed) {
       if (ObjectStatus || OriginalStatus != -2) return -5;
     } else if (!ObjectStatus && OriginalStatus == -2) {
-      if (const auto Move = SdFileError(fsFsRenameFile(&SdCard, Object.c_str(), Path.c_str())); Move < 0) return Move;
+      if (const auto Move = SdFileError(SdRetry(fsFsRenameFile, &SdCard, Object.c_str(), Path.c_str())); Move < 0) return Move;
     } else if (ObjectStatus != -2 || OriginalStatus || Type != FsDirEntryType_File) {
       return -5;
     }
@@ -4069,7 +6431,7 @@ private:
 
     const auto Check = [&](const char* Path) -> int64_t {
       FsDirEntryType Type {};
-      const auto Status = SdFileError(fsFsGetEntryType(&SdCard, Path, &Type));
+      const auto Status = SdFileError(SdRetry(fsFsGetEntryType, &SdCard, Path, &Type));
       return !Status && Type != EntryType ? -20 : Status;
     };
     const auto OldState = Check(Old->c_str());
@@ -4087,8 +6449,8 @@ private:
     if (Plan == DirectoryRecovery::Invalid) return -5;
 
     const auto Move = [&](const char* From, const char* To) {
-      return SdFileError(EntryType == FsDirEntryType_File ? fsFsRenameFile(&SdCard, From, To) :
-                                                           fsFsRenameDirectory(&SdCard, From, To));
+      return SdFileError(EntryType == FsDirEntryType_File ? SdRetry(fsFsRenameFile, &SdCard, From, To) :
+                                                                              SdRetry(fsFsRenameDirectory, &SdCard, From, To));
     };
     int64_t RecoveryError {};
     switch (Plan) {
@@ -4101,8 +6463,8 @@ private:
       RecoveryError = Move(DirectoryBackupPath, New->c_str());
       break;
     case DirectoryRecovery::RemoveBackup:
-      RecoveryError = SdFileError(File ? fsFsDeleteFile(&SdCard, DirectoryBackupPath) :
-                                         fsFsDeleteDirectory(&SdCard, DirectoryBackupPath));
+      RecoveryError = SdFileError(File ? SdRetry(fsFsDeleteFile, &SdCard, DirectoryBackupPath) :
+                                         SdRetry(fsFsDeleteDirectory, &SdCard, DirectoryBackupPath));
       break;
     case DirectoryRecovery::CompleteExchange:
       RecoveryError = Move(DirectoryBackupPath, Old->c_str());
@@ -4117,7 +6479,7 @@ private:
 
   void LoadInodeStore() {
     FsFileSystem SdCard {};
-    if (R_FAILED(fsOpenSdCardFileSystem(&SdCard))) return;
+    if (R_FAILED(SdRetry(fsOpenSdCardFileSystem, &SdCard))) return;
     std::vector<uint8_t> First, Second;
     const auto A = ReadInodeSlot(SdCard, InodeStorePaths[0], First);
     const auto B = ReadInodeSlot(SdCard, InodeStorePaths[1], Second);
@@ -4145,7 +6507,7 @@ private:
       WriteLog("Guest inode promotion could not be recovered.");
     }
     if (InodeStoreAvailable) {
-      const auto Cleanup = SdFileError(fsFsDeleteFile(&SdCard, IntentStagingPath));
+      const auto Cleanup = SdFileError(SdRetry(fsFsDeleteFile, &SdCard, IntentStagingPath));
       if (Cleanup && Cleanup != -2) {
         InodeStoreAvailable = false;
         WriteLog("Guest inode intent staging file could not be removed.");
@@ -4157,7 +6519,7 @@ private:
       for (auto It = RetiredBackingObjects.begin(); It != RetiredBackingObjects.end();) {
         InodeStoreDirty = true;
         if (Older && Older->Generation != InodeGeneration && CanReclaimInode(*It, *Older)) {
-          const auto Error = SdFileError(fsFsDeleteFile(&SdCard, ObjectPath(*It).c_str()));
+          const auto Error = SdFileError(SdRetry(fsFsDeleteFile, &SdCard, ObjectPath(*It).c_str()));
           if (!Error || Error == -2) {
             It = RetiredBackingObjects.erase(It);
             continue;
@@ -4172,8 +6534,8 @@ private:
       // directory behind its overflow record. Remove it so a later rmdir of
       // the overflow directory cannot uncover it.
       for (const auto& [Path, Inode] : SdInodes) {
-        if (Path.size() > SdPathLimit || !IsOverflowDirectory(Path)) continue;
-        const auto Error = SdFileError(fsFsDeleteDirectory(&SdCard, Path.c_str()));
+        if (Path.size() > SdPathLimit || SdNameUnsafe(Path) || !IsOverflowDirectory(Path)) continue;
+        const auto Error = SdFileError(SdRetry(fsFsDeleteDirectory, &SdCard, Path.c_str()));
         if (Error && Error != -2) WriteLog("A native directory shadowed by an overflow directory could not be removed.");
       }
     }
@@ -4191,12 +6553,12 @@ private:
       const auto Object = Record.BackingObject.value_or(Inode);
       InodeStoreDirty = true;
       if (Older && Older->Generation < InodeGeneration && CanReclaimInode(Object, *Older)) {
-        const auto Error = SdFileError(fsFsDeleteFile(&SdCard, ObjectPath(Object).c_str()));
+        const auto Error = SdFileError(SdRetry(fsFsDeleteFile, &SdCard, ObjectPath(Object).c_str()));
         if (!Error || Error == -2) Removed.push_back(Inode);
       }
     }
     if (Removed.empty()) return 0;
-    if (const auto Error = SdFileError(fsFsCommit(&SdCard)); Error) return Error;
+    if (const auto Error = SdFileError(SdRetry(fsFsCommit, &SdCard)); Error) return Error;
     for (const auto Inode : Removed) Inodes.erase(Inode);
     return 0;
   }
@@ -4209,11 +6571,11 @@ private:
     if (Bytes.empty()) return -28;
 
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     const auto* Path = InodeStorePaths[Generation % 2];
     auto Error = WriteInodeFile(SdCard, Path, Bytes);
     if (Error == -2) {
-      Error = SdFileError(fsFsCreateFile(&SdCard, Path, 0, 0));
+      Error = SdFileError(SdRetry(fsFsCreateFile, &SdCard, Path, 0, 0));
       if (!Error) Error = WriteInodeFile(SdCard, Path, Bytes);
     }
     fsFsClose(&SdCard);
@@ -4227,8 +6589,8 @@ private:
   int64_t CommitSdInodeStore() {
     if (const auto Error = SaveInodeStore(); Error) return Error;
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
-    const auto Error = SdFileError(fsFsCommit(&SdCard));
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
+    const auto Error = SdFileError(SdRetry(fsFsCommit, &SdCard));
     fsFsClose(&SdCard);
     return Error;
   }
@@ -4238,7 +6600,7 @@ private:
     const auto Name = GuestString(Address);
     if (!Name) return Name.Error;
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string Path;
     auto Error = ResolveSdPath(CurrentDirectory, *Name, SdCard, Path);
     if (!Error && VirtualMount(Path)) {
@@ -4441,16 +6803,16 @@ private:
     const auto Error = WithDiskFile(*File, FsOpenMode_Write | FsOpenMode_Append, [&](FsFile& Native) {
       if (Mode & PunchHole) {
         if (const auto Clear = ZeroDiskRange(Native, Offset, ClearEnd); Clear) return Clear;
-        return ReclaimTail ? SdFileError(fsFileSetSize(&Native, *ReclaimTail)) : int64_t {0};
+        return ReclaimTail ? SdFileError(SdRetry(fsFileSetSize, &Native, *ReclaimTail)) : int64_t {0};
       }
       if (Mode & ZeroRange) {
         s64 Allocated {};
-        if (const auto Status = SdFileError(fsFileGetSize(&Native, &Allocated)); Status) return Status;
+        if (const auto Status = SdFileError(SdRetry(fsFileGetSize, &Native, &Allocated)); Status) return Status;
         auto Begin = std::min<uint64_t>(Offset, Allocated);
         const bool Grow = !(Mode & KeepSize) && End > static_cast<uint64_t>(Visible);
         if (Grow) Begin = std::min<uint64_t>(Begin, Visible);
         if (const auto Clear = ZeroDiskRange(Native, Begin, End); Clear) {
-          if (End > static_cast<uint64_t>(Allocated) && R_FAILED(fsFileSetSize(&Native, Allocated))) {
+          if (End > static_cast<uint64_t>(Allocated) && R_FAILED(SdRetry(fsFileSetSize, &Native, Allocated))) {
             WriteLog("Guest zero-range could not restore native allocation after a write failure.");
           }
           return Clear;
@@ -4463,7 +6825,7 @@ private:
       }
       if (Mode & KeepSize) {
         s64 Allocated {};
-        if (const auto Status = SdFileError(fsFileGetSize(&Native, &Allocated)); Status) return Status;
+        if (const auto Status = SdFileError(SdRetry(fsFileGetSize, &Native, &Allocated)); Status) return Status;
         if (End > static_cast<uint64_t>(Allocated)) {
           if (const auto Grow = ResizeNativeFile(Native, End); Grow) return Grow;
         }
@@ -4472,7 +6834,7 @@ private:
           if (const auto Grow = ResizeDiskInode(Native, File->Inode, End); Grow) return Grow;
         } else if (LogicalSize(File->Inode)) {
           s64 Allocated {};
-          if (const auto Status = SdFileError(fsFileGetSize(&Native, &Allocated)); Status) return Status;
+          if (const auto Status = SdFileError(SdRetry(fsFileGetSize, &Native, &Allocated)); Status) return Status;
           if (End > static_cast<uint64_t>(Allocated)) {
             if (const auto Grow = ResizeNativeFile(Native, End); Grow) return Grow;
           }
@@ -4515,10 +6877,10 @@ private:
 
   int64_t QuerySdFilesystem(LinuxStatFS& Info) {
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     s64 Total {}, Free {};
-    auto Error = SdFileError(fsFsGetTotalSpace(&SdCard, "/", &Total));
-    if (!Error) Error = SdFileError(fsFsGetFreeSpace(&SdCard, "/", &Free));
+    auto Error = SdFileError(SdRetry(fsFsGetTotalSpace, &SdCard, "/", &Total));
+    if (!Error) Error = SdFileError(SdRetry(fsFsGetFreeSpace, &SdCard, "/", &Free));
     fsFsClose(&SdCard);
     if (Error) return Error;
     if (Total < 0 || Free < 0 || Free > Total) return -5;
@@ -4622,7 +6984,7 @@ private:
       if (!File) return BadFile;
       SdMount = DescriptorFilesystem(*File) == FilesystemType::Sd && !VirtualMount(File->Path);
     }
-    if (Task->UserIDs[1] != 0) return -1; // CAP_DAC_READ_SEARCH
+    if (!Task->Creds.Capable(CapDacReadSearch)) return -1;
     struct { uint32_t Bytes; int32_t Type; } Header {};
     if (AccessiblePrefix(Handle, sizeof(Header), PF_R) != sizeof(Header)) return Fault;
     std::memcpy(&Header, reinterpret_cast<const void*>(Handle), sizeof(Header));
@@ -4717,8 +7079,8 @@ private:
     DirtyFileData.clear();
     if (const auto Error = SaveInodeStore(); Error < 0) return Error;
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
-    auto Error = SdFileError(fsFsCommit(&SdCard));
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
+    auto Error = SdFileError(SdRetry(fsFsCommit, &SdCard));
     if (!Error && InodeStoreAvailable && InodeGeneration && std::any_of(Inodes.begin(), Inodes.end(), [](const auto& Entry) {
           return Entry.second.ManagedFile && Entry.second.Unlinked;
         })) {
@@ -4862,7 +7224,10 @@ private:
     if (!File->Socket || File->Pipe) return -88;
     if (!File->Socket->Bound || File->Socket->Connected) return Invalid;
     File->Socket->Listening = true;
-    File->Socket->Backlog = std::clamp(Backlog, 1, 16);
+    // __sys_listen: a backlog above net.core.somaxconn (4096), including a
+    // negative one read as unsigned, is capped to it.
+    constexpr uint32_t SoMaxConn = 4096;
+    File->Socket->Backlog = std::min(static_cast<uint32_t>(Backlog), SoMaxConn);
     return 0;
   }
 
@@ -4878,7 +7243,8 @@ private:
     auto Listener = Entry == SocketNames.end() ? nullptr : Entry->second.lock();
     if (!Listener) return -2;
     if (!Listener->Listening) return -111;
-    if (Listener->Pending.size() >= Listener->Backlog) {
+    // unix_recvq_full: the queue is full once it holds more than the backlog.
+    if (Listener->Pending.size() > Listener->Backlog) {
       return File->Socket->Nonblocking ? -11 : WaitForIO();
     }
     auto Connection = std::make_shared<StreamSocket>();
@@ -4946,13 +7312,27 @@ private:
 
   int64_t WriteSocket(StreamSocket& Socket, const char* Buffer, uint64_t Count, bool DontWait, bool Atomic = false, bool Merge = true) {
     if (!Socket.Connected) return -107;
+    const bool Blocking = !Socket.Nonblocking && !DontWait;
+    // A blocking write returns only when every byte is queued, when the
+    // reader goes away after some bytes (their count), or on a signal
+    // (InterruptWait reports the count).
+    const uint64_t Done = Blocking ? std::exchange(Current->StreamProgress, 0) : 0;
     auto Peer = Socket.Peer.lock();
-    if (!Peer || Socket.ShutWrite || Peer->ShutRead) return -32;
-    const auto Bytes = std::min<uint64_t>(Count, Socket.WriteSpace(Merge, Count));
-    if (!Bytes || (Atomic && Count <= StreamSocket::PipePage && Bytes < Count)) return Socket.Nonblocking || DontWait ? -11 : WaitForIO();
-    const auto Written = Socket.Send({reinterpret_cast<const uint8_t*>(Buffer), Count}, {}, Merge);
+    if (!Peer || Socket.ShutWrite || Peer->ShutRead) return Done ? static_cast<int64_t>(Done) : -32;
+    const auto Remaining = Count - Done;
+    const auto Bytes = std::min<uint64_t>(Remaining, Socket.WriteSpace(Merge, Remaining));
+    if (!Bytes || (Atomic && !Done && Count <= StreamSocket::PipePage && Bytes < Count)) {
+      if (!Blocking) return -11;
+      Current->StreamProgress = Done;
+      return WaitForIO();
+    }
+    const auto Written = Socket.Send({reinterpret_cast<const uint8_t*>(Buffer) + Done, Remaining}, {}, Merge);
     ++IOEpoch;
-    return Written;
+    if (Blocking && Done + Written < Count) {
+      Current->StreamProgress = Done + Written;
+      return WaitForIO();
+    }
+    return Done + Written;
   }
 
   int64_t SocketTransfer(bool Write, uint64_t FD, uint64_t Address, uint64_t Count, uint64_t Flags,
@@ -4966,7 +7346,7 @@ private:
     } else if (PeerAddress) {
       return -106;
     }
-    Count = std::min<uint64_t>(Count, StreamSocket::Capacity);
+    Count = std::min<uint64_t>(Count, Write ? MaxRWCount : StreamSocket::Capacity);
     if (!Count) return 0;
     if (Available(Address, Write ? PF_R : PF_W) < Count) return Fault;
     auto* Buffer = reinterpret_cast<char*>(Address);
@@ -5135,20 +7515,61 @@ private:
     return 0;
   }
 
+  // ppoll, pselect6, epoll_pwait and epoll_pwait2 install a signal mask for
+  // the wait, as rt_sigsuspend does. HandleSyscall restores the caller's mask
+  // unless the call ends with EINTR; then the handler frame carries it
+  // (restore_saved_sigmask_unless).
+  int64_t ReadWaitMask(uint64_t Address, uint64_t Size, std::optional<uint64_t>& Mask) {
+    if (!Address) return 0;
+    if (Size != sizeof(uint64_t)) return Invalid;
+    uint64_t Value {};
+    if (Available(Address, PF_R) < sizeof(Value)) return Fault;
+    std::memcpy(&Value, reinterpret_cast<const void*>(Address), sizeof(Value));
+    Mask = Value;
+    return 0;
+  }
+
+  void InstallWaitMask(std::optional<uint64_t> Mask) {
+    if (!Mask || Current->SuspendMask) return;
+    Current->SuspendMask = Current->SignalMask;
+    Current->SignalMask = *Mask & ~Unblockable;
+  }
+
+  static bool MaskedWait(uint64_t Number) { return Number == 270 || Number == 271 || Number == 281 || Number == 441; }
+
+  // Blocks a poll-type call: EINTR at once when a signal would interrupt it
+  // (the wait mask may have unblocked one), else wait for any I/O change.
+  int64_t BlockPoll() {
+    if (HasActionableSignal(*Current)) return -4;
+    return WaitForIO(Interactive ? WaitKind::Terminal : WaitKind::IO);
+  }
+
+  // Linux poll_select_finish: timed calls write back the time left.
+  void WriteRemaining(uint64_t Address, uint64_t Duration, bool Timeval) {
+    const auto Now = MonotonicNs();
+    const auto Left = !Current->Deadline ? Duration : Current->Deadline > Now ? Current->Deadline - Now : 0;
+    if (Timeval) CopyOut(Address, GuestTimeval {static_cast<int64_t>(Left / 1'000'000'000), static_cast<int64_t>(Left % 1'000'000'000 / 1000)});
+    else CopyOut(Address, ToGuestTimespec(Left));
+  }
+
   int64_t PollGuestWithTimespec(uint64_t Address, uint64_t Count, uint64_t Time, uint64_t Mask, uint64_t MaskSize) {
-    if (Mask && MaskSize != sizeof(Current->SignalMask)) return Invalid;
-    if (Mask && Available(Mask, PF_R) < MaskSize) return Fault;
-    if (Mask) return -38; // Temporary masks require guest signal delivery.
     uint64_t Duration {};
     if (Time && Available(Time, PF_R) < 2 * sizeof(int64_t)) return Fault;
     if (Time && !ReadTimespec(Time, Duration)) return Invalid;
-    return PollGuest(Address, Count, Time ? std::optional {Duration} : std::nullopt);
+    std::optional<uint64_t> WaitMask;
+    if (const auto Error = ReadWaitMask(Mask, MaskSize, WaitMask)) return Error;
+    InstallWaitMask(WaitMask);
+    const auto Result = PollGuest(Address, Count, Time ? std::optional {Duration} : std::nullopt);
+    if (Result != RetrySyscall && Time) WriteRemaining(Time, Duration, false);
+    return Result;
   }
 
   int64_t PollGuest(uint64_t Address, uint64_t Count, std::optional<uint64_t> Duration) {
     struct PollFD { int32_t FD; int16_t Events, Revents; };
-    if (Count > Descriptors().Files.size()) return Invalid;
+    if (Count > Task->Limits[ResourceNofile][0]) return Invalid; // poll: nfds above RLIMIT_NOFILE
+    if (Count > Descriptors().Files.size()) return -12;
     if (Count && Available(Address, PF_R | PF_W) < Count * sizeof(PollFD)) return Fault;
+    if (Interactive) PollTerminalInput();
     int64_t ReadyCount {};
     for (size_t Index = 0; Index < Count; ++Index) {
       auto* Position = reinterpret_cast<void*>(Address + Index * sizeof(PollFD));
@@ -5157,11 +7578,9 @@ private:
       Entry.Revents = 0;
       if (Entry.FD >= 0) {
         const auto* File = GetFile(Entry.FD);
-        if (File && File->Socket) Entry.Revents = StreamPoll(*File, Entry.Events);
-        else if (!File) Entry.Revents = 0x20;
-        else if (File->Console != ConsoleStream::Input) {
-          Entry.Revents = Entry.Events & (File->Console == ConsoleStream::None ? 5 : 4);
-        }
+        // POLLERR and POLLHUP are always reported; a closed descriptor is POLLNVAL.
+        if (!File) Entry.Revents = 0x20;
+        else Entry.Revents = static_cast<int16_t>(Readiness(*File, static_cast<uint16_t>(Entry.Events)) & (static_cast<uint16_t>(Entry.Events) | 0x18));
       }
       ReadyCount += Entry.Revents != 0;
       std::memcpy(Position, &Entry, sizeof(Entry));
@@ -5172,7 +7591,123 @@ private:
       if (!Current->Deadline) Current->Deadline = AddDeadline(Now, *Duration);
       if (Current->Deadline <= Now) return 0;
     }
-    return WaitForIO();
+    return BlockPoll();
+  }
+
+  // The poll mask of any descriptor: poll, select and epoll all use it.
+  // Requested matters only for sockets, which compute some bits on demand.
+  uint32_t Readiness(const OpenFile& File, uint32_t Requested = 0x2007) const {
+    uint32_t Mask {};
+    if (File.Socket) Mask = static_cast<uint16_t>(StreamPoll(File, static_cast<int16_t>(Requested & 0x2007)));
+    else if (File.AnonName || File.PidfdTarget) return DescriptorEvents(File);
+    else if (File.Console == ConsoleStream::Input && !Interactive) return 0;
+    else Mask = DescriptorEvents(File);
+    // pipe_poll, unix_poll and DEFAULT_POLLMASK add the normal-data bits.
+    if (Mask & 1) Mask |= 0x40;
+    if (Mask & 4) Mask |= 0x100;
+    return Mask;
+  }
+
+  // Changes whenever File's readiness may have changed (edge-triggered epoll).
+  uint64_t ReadinessGeneration(const OpenFile& File) const {
+    auto Mix = [](uint64_t Seed, uint64_t Value) { return (Seed ^ (Value + 0x9e3779b97f4a7c15ULL + (Seed << 6) + (Seed >> 2))) * 0xff51afd7ed558ccdULL; };
+    if (File.Socket) {
+      const auto& Socket = *File.Socket;
+      const auto Other = Socket.Peer.lock();
+      uint64_t Value = Mix(Socket.Changes, Other ? Other->Changes : UINT64_MAX);
+      Value = Mix(Value, Socket.ShutRead | Socket.ShutWrite << 1 | Socket.Connected << 2 | Socket.Listening << 3 |
+                         (Other && Other->ShutRead) << 4 | (Other && Other->ShutWrite) << 5);
+      Value = Mix(Value, Socket.Pending.size());
+      if (File.Fifo) Value = Mix(Mix(Mix(Value, File.Fifo->Readers), File.Fifo->Writers), File.Fifo->WriterGeneration);
+      return Value;
+    }
+    if (File.TimerFd) return File.TimerFd->Changes;
+    if (File.Event) return File.Event->Changes;
+    if (File.SignalFdMask) return SignalChanges;
+    if (File.Inotify) return File.Inotify->Instance.Changes();
+    if (File.PidfdTarget) {
+      const auto It = Processes.find(File.PidfdTarget);
+      return It == Processes.end() ? 3 : It->second.Exited + 2 * It->second.Reaped;
+    }
+    // Terminals and nested epoll instances: any I/O change counts.
+    return IOEpoch;
+  }
+
+  // select (timeval) and pselect6 (timespec and a signal mask).
+  int64_t SelectTimeval(uint64_t Count, uint64_t Read, uint64_t Write, uint64_t Except, uint64_t Timeout) {
+    uint64_t Duration {};
+    if (Timeout) {
+      GuestTimeval Value {};
+      if (Available(Timeout, PF_R) < sizeof(Value)) return Fault;
+      std::memcpy(&Value, reinterpret_cast<const void*>(Timeout), sizeof(Value));
+      // poll_select_set_timeout after normalizing the microseconds.
+      const GuestTimespec Time {Value.Seconds + Value.Microseconds / 1'000'000, Value.Microseconds % 1'000'000 * 1000};
+      if (!ValidTimespec(Time)) return Invalid;
+      Duration = TimespecNs(Time);
+    }
+    const auto Result = SelectCore(Count, Read, Write, Except, Timeout ? std::optional {Duration} : std::nullopt);
+    if (Result != RetrySyscall && Timeout) WriteRemaining(Timeout, Duration, true);
+    return Result;
+  }
+
+  int64_t SelectGuest(uint64_t Count, uint64_t Read, uint64_t Write, uint64_t Except, uint64_t Timeout, uint64_t SigData) {
+    uint64_t Duration {};
+    if (Timeout && !ReadTimespec(Timeout, Duration)) return Available(Timeout, PF_R) < 16 ? Fault : Invalid;
+    std::optional<uint64_t> WaitMask;
+    if (SigData) {
+      uint64_t SignalMaskArgs[2];
+      if (Available(SigData, PF_R) < sizeof(SignalMaskArgs)) return Fault;
+      std::memcpy(SignalMaskArgs, reinterpret_cast<const void*>(SigData), sizeof(SignalMaskArgs));
+      if (const auto Error = ReadWaitMask(SignalMaskArgs[0], SignalMaskArgs[1], WaitMask)) return Error;
+    }
+    InstallWaitMask(WaitMask);
+    const auto Result = SelectCore(Count, Read, Write, Except, Timeout ? std::optional {Duration} : std::nullopt);
+    if (Result != RetrySyscall && Timeout) WriteRemaining(Timeout, Duration, false);
+    return Result;
+  }
+
+  // core_sys_select: n above the descriptor table is clamped, negative n is EINVAL.
+  int64_t SelectCore(uint64_t CountArgument, uint64_t Read, uint64_t Write, uint64_t Except, std::optional<uint64_t> Duration) {
+    if (static_cast<int32_t>(CountArgument) < 0) return Invalid;
+    const size_t Count = std::min<size_t>(static_cast<uint32_t>(CountArgument), Descriptors().Files.size());
+    using Mask = std::array<uint64_t, DescriptorCount / 64>;
+    static_assert(std::tuple_size_v<Mask> * 64 == DescriptorCount);
+    const auto Size = (Count + 63) / 64 * sizeof(uint64_t);
+    const uint64_t Addresses[] {Read, Write, Except};
+    std::array<Mask, 3> Requested {};
+    for (size_t Set = 0; Set < Requested.size(); ++Set) {
+      if (!Addresses[Set] || !Size) continue;
+      if (Available(Addresses[Set], PF_R | PF_W) < Size) return Fault;
+      std::memcpy(Requested[Set].data(), reinterpret_cast<const void*>(Addresses[Set]), Size);
+    }
+    if (Duration && !Current->Deadline) Current->Deadline = AddDeadline(MonotonicNs(), *Duration);
+    if (Interactive) PollTerminalInput();
+    // POLLIN_SET, POLLOUT_SET and POLLEX_SET.
+    constexpr uint32_t SelectBits[] {0x1 | 0x8 | 0x10 | 0x40 | 0x80, 0x4 | 0x8 | 0x100 | 0x200, 0x2};
+    std::array<Mask, 3> ReadySets {};
+    int64_t ReadyCount {};
+    for (size_t FD = 0; FD < Count; ++FD) {
+      const auto Word = FD / 64;
+      const auto Bit = 1ULL << (FD % 64);
+      if (!((Requested[0][Word] | Requested[1][Word] | Requested[2][Word]) & Bit)) continue;
+      const auto* File = GetFile(FD);
+      if (!File) return BadFile;
+      const auto Events = Readiness(*File, 0x7);
+      for (size_t Set = 0; Set < ReadySets.size(); ++Set) {
+        if ((Requested[Set][Word] & Bit) && (Events & SelectBits[Set])) {
+          ReadySets[Set][Word] |= Bit;
+          ++ReadyCount;
+        }
+      }
+    }
+    const auto Now = MonotonicNs();
+    if (ReadyCount || (Duration && Now >= Current->Deadline) || TerminalClosed) {
+      for (size_t Set = 0; Set < ReadySets.size(); ++Set) {
+        if (Addresses[Set] && Size) std::memcpy(reinterpret_cast<void*>(Addresses[Set]), ReadySets[Set].data(), Size);
+      }
+      return ReadyCount;
+    }
+    return BlockPoll();
   }
 
   template<typename T>
@@ -5182,28 +7717,13 @@ private:
     return 0;
   }
 
-  static constexpr uint32_t PipeSignal = 13;
-  static constexpr uint64_t PipeSignalMask = uint64_t {1} << (PipeSignal - 1);
-
+  // A default terminate or core action kills every thread of the current
+  // process (Linux do_group_exit). No core file is written, so the wait
+  // status never carries the core flag (WCOREDUMP).
   void TerminateForSignal(uint32_t Signal) {
-    Task->TerminatingSignal = Signal;
-    Task->Exited = true;
-    ExitThread();
-    if (Task->PID == ProcessID) {
-      Number = LinuxExitSyscall;
-      ExitStatus = 128 + Signal;
-      ProcessExited = true;
-    }
+    ExitProcess(0, Signal);
   }
 
-  bool DeliverDefaultPipeSignal() {
-    const auto Disposition = Task->SignalActions[PipeSignal - 1][0];
-    if (Disposition == 1) Current->PendingSignals &= ~PipeSignalMask;
-    if (Disposition || !(Current->PendingSignals & ~Current->SignalMask & PipeSignalMask)) return false;
-    Current->PendingSignals &= ~PipeSignalMask;
-    TerminateForSignal(PipeSignal);
-    return true;
-  }
 
   struct GuestSignalFrame {
     uint64_t Restorer;
@@ -5213,7 +7733,7 @@ private:
       struct { uint64_t Registers[23], FP, Reserved[8]; } Machine;
       uint64_t Mask[16];
     } Context;
-    std::array<int32_t, 32> Info;
+    SigInfo Info;
     uint64_t FPPadding;
     struct {
       uint16_t Control, Status, Tag, Opcode;
@@ -5232,41 +7752,290 @@ private:
                        REG_RDI, REG_RSI, REG_RBP, REG_RBX, REG_RDX, REG_RAX, REG_RCX, REG_RSP};
   }();
 
-  static uint32_t PendingCaughtSignal(const GuestThread& Thread, const GuestProcess& Process) {
-    auto Pending = Thread.PendingSignals & ~Thread.SignalMask;
-    while (Pending) {
-      const auto Index = std::countr_zero(Pending);
-      if (Process.SignalActions[Index][0] > 1) return Index + 1;
-      Pending &= Pending - 1;
+  static constexpr uint64_t SaNoCldStop = 0x1, SaNoCldWait = 0x2, SaSigInfo = 0x4, SaOnStack = 0x08000000, SaRestart = 0x10000000, SaNoDefer = 0x40000000,
+                            SaResetHand = 0x80000000;
+  static constexpr uint64_t SigDefault = 0, SigIgnore = 1;
+
+  // Linux sig_handler_ignored: SIG_IGN, or SIG_DFL with an ignore default
+  // (SIGCONT's continue happens when it is sent).
+  static bool SignalIgnored(const GuestProcess& Process, uint32_t Signal) {
+    const auto Handler = Process.SignalActions[Signal - 1][0];
+    if (Handler == SigIgnore) return true;
+    const auto Default = DefaultAction(Signal);
+    return Handler == SigDefault && (Default == SignalDefault::Ignore || Default == SignalDefault::Continue);
+  }
+
+  // Signals the thread may take now: unblocked and not reserved by
+  // rt_sigtimedwait.
+  uint64_t DeliverableSignals(const GuestThread& Thread) const {
+    const auto& Process = Processes.at(Thread.PID);
+    return (Thread.Pending.Set() | Process.SharedPending.Set()) & ~(Thread.SignalMask | Thread.WaitSignals);
+  }
+
+  // True when delivery would run a handler or a default action.
+  bool HasActionableSignal(const GuestThread& Thread) const {
+    const auto& Process = Processes.at(Thread.PID);
+    for (auto Pending = DeliverableSignals(Thread); Pending; Pending &= Pending - 1) {
+      if (!SignalIgnored(Process, std::countr_zero(Pending) + 1)) return true;
     }
-    return 0;
+    return false;
   }
 
-  static void QueueGuestSignal(GuestThread& Thread, uint32_t Signal, uint32_t Sender) {
-    const uint64_t Mask = uint64_t {1} << (Signal - 1);
-    if (!(Thread.PendingSignals & Mask)) Thread.SignalSenders[Signal - 1] = Sender;
-    Thread.PendingSignals |= Mask;
-  }
-
-  int64_t SignalProcess(int32_t PID, uint32_t Signal) {
-    if (Signal > 64) return Invalid;
-    if (PID <= 0) return -95;
-    const auto Target = Processes.find(PID);
-    if (Target == Processes.end() || Target->second.Exited) return -3;
-    if (!Signal) return 0;
-    const auto Action = Target->second.SignalActions[Signal - 1][0];
-    if (Action == 1) return 0;
-    if (!Action) return -95; // Default process-directed dispositions are not implemented here.
-    const uint64_t Mask = uint64_t {1} << (Signal - 1);
-    GuestThread* Receiver {};
+  // Linux complete_signal's reference thread for a process-directed signal.
+  GuestThread* LeaderThread(uint32_t PID) {
+    GuestThread* First {};
     for (auto& Thread : Threads) {
-      if (!Thread.Core || Thread.Exited || Thread.PID != static_cast<uint32_t>(PID)) continue;
-      Receiver = &Thread;
-      if (!(Thread.SignalMask & Mask)) break;
+      if (!Thread.Core || Thread.Exited || Thread.PID != PID) continue;
+      if (Thread.TID == PID) return &Thread;
+      if (!First) First = &Thread;
     }
-    if (!Receiver) return -3;
-    QueueGuestSignal(*Receiver, Signal, Task->PID);
+    return First;
+  }
+
+  // Linux prepare_signal and __send_signal_locked. Thread is the target for
+  // a thread-directed signal, else nullptr. Returns 0 or -EAGAIN.
+  int64_t SendSignal(GuestProcess& Target, GuestThread* Thread, const SigInfo& Info) {
+    const auto Signal = static_cast<uint32_t>(Info.Signo);
+    const auto Bit = SignalBit(Signal);
+    auto Discard = [&](uint64_t Mask) {
+      Target.SharedPending.Discard(Mask);
+      for (auto& Entry : Threads) {
+        if (Entry.Core && Entry.PID == Target.PID) Entry.Pending.Discard(Mask);
+      }
+    };
+    if (StopSet & Bit) Discard(SignalBit(SigCont));
+    if (Signal == SigCont) {
+      Discard(StopSet);
+      ContinueProcess(Target);
+    }
+    // A blocked signal is queued even when ignored: unblocking may follow
+    // a change of disposition.
+    const auto* Reference = Thread ? Thread : LeaderThread(Target.PID);
+    // blocked | real_blocked: rt_sigtimedwait's set is not part of the mask.
+    const bool Blocked = Reference && (Reference->SignalMask & Bit);
+    if (!Blocked && SignalIgnored(Target, Signal)) return 0;
+    auto& Queue = Thread ? Thread->Pending : Target.SharedPending;
+    if (!Queue.Enqueue(Info, Target.Limits[ResourceSigpending][0])) return -11;
+    ++IOEpoch; // signalfd readers and pollers
+    ++SignalChanges;
     return 0;
+  }
+
+  // Linux kill_ok_by_cred. SIGCONT may always reach the caller's session.
+  bool CanSignal(const GuestProcess& Target, uint32_t Signal) const {
+    if (&Target == Task) return true;
+    if (Signal == SigCont && Target.Session == Task->Session) return true;
+    const auto& From = Task->Creds.Uid;
+    const auto& To = Target.Creds.Uid;
+    if (Task->Creds.Capable(Switch2Guest::CapKill)) return true;
+    return From[1] == To[0] || From[1] == To[2] || From[0] == To[0] || From[0] == To[2];
+  }
+
+  // check_kill_permission, then send. A zombie accepts and drops signals.
+  int64_t SignalOne(GuestProcess& Target, GuestThread* Thread, uint32_t Signal, const SigInfo& Info) {
+    if (Signal > SigMax) return Invalid;
+    if (!CanSignal(Target, Signal)) return -1;
+    if (!Signal || Target.Exited) return 0;
+    return SendSignal(Target, Thread, Info);
+  }
+
+  // kill(2), Linux kill_something_info.
+  int64_t SignalProcess(int32_t PID, uint32_t Signal) {
+    const auto Info = MakeSigInfo(Signal, SiUser, Task->PID, Task->Creds.Uid[0]);
+    if (PID > 0) {
+      auto* Target = ProcessOfId(PID);
+      return Target ? SignalOne(*Target, nullptr, Signal, Info) : -3;
+    }
+    if (PID == INT32_MIN) return -3;
+    if (PID == -1) {
+      int64_t Result {};
+      size_t Count {};
+      for (auto& [ID, Target] : Processes) {
+        if (ID <= 1 || &Target == Task || Target.Reaped) continue;
+        ++Count;
+        if (const auto Error = SignalOne(Target, nullptr, Signal, Info); Error != -1) Result = Error;
+      }
+      return Count ? Result : -3;
+    }
+    return SignalProcessGroup(PID ? static_cast<uint32_t>(-PID) : Task->Group, Signal, Info);
+  }
+
+  // __kill_pgrp_info: success if any member was signalled.
+  int64_t SignalProcessGroup(uint32_t Group, uint32_t Signal, const SigInfo& Info) {
+    bool Success {};
+    int64_t Result = -3;
+    for (auto& [ID, Target] : Processes) {
+      if (Target.Reaped || Target.Group != Group) continue;
+      Result = SignalOne(Target, nullptr, Signal, Info);
+      Success |= !Result;
+    }
+    return Success ? 0 : Result;
+  }
+
+  // tkill (TGID -1) and tgkill: Linux do_send_specific.
+  int64_t SignalThread(int64_t TGID, uint64_t TID, uint32_t Signal, const SigInfo& Info) {
+    for (auto& Thread : Threads) {
+      if (!Thread.Core || Thread.Exited || Thread.TID != TID) continue;
+      if (TGID > 0 && Thread.PID != TGID) break;
+      return SignalOne(Processes.at(Thread.PID), &Thread, Signal, Info);
+    }
+    return -3;
+  }
+
+  int64_t TkillGuest(uint64_t TGID, uint64_t TID, uint64_t Signal) {
+    if (static_cast<int32_t>(TGID) <= 0 || static_cast<int32_t>(TID) <= 0) return Invalid;
+    return SignalThread(static_cast<int32_t>(TGID), TID, Signal, MakeSigInfo(Signal, SiTkill, Task->PID, Task->Creds.Uid[0]));
+  }
+
+  // rt_sigqueueinfo and rt_tgsigqueueinfo. Only a thread signalling itself
+  // may claim a kernel or kill() origin.
+  int64_t QueueSignalInfo(uint64_t TGID, uint64_t TID, uint64_t Signal, uint64_t Address, bool ThreadDirected) {
+    if (ThreadDirected && (static_cast<int32_t>(TGID) <= 0 || static_cast<int32_t>(TID) <= 0)) return Invalid;
+    SigInfo Info;
+    if (Available(Address, PF_R) < sizeof(Info)) return Fault;
+    std::memcpy(&Info, reinterpret_cast<const void*>(Address), sizeof(Info));
+    if ((Info.Code >= 0 || Info.Code == SiTkill) && static_cast<uint32_t>(TID) != Current->TID) return -1;
+    Info.Signo = static_cast<int32_t>(Signal);
+    if (ThreadDirected) return SignalThread(static_cast<int32_t>(TGID), TID, Signal, Info);
+    const auto PID = static_cast<int32_t>(TGID);
+    auto* Target = PID > 0 ? ProcessOfId(PID) : nullptr;
+    return Target ? SignalOne(*Target, nullptr, Signal, Info) : -3;
+  }
+
+  // kill_pid_info: a thread ID names its thread group.
+  GuestProcess* ProcessOfId(uint32_t ID) {
+    if (auto* Process = FindProcess(ID)) return Process;
+    for (const auto& Thread : Threads) {
+      if (Thread.Core && !Thread.Exited && Thread.TID == ID) return FindProcess(Thread.PID);
+    }
+    return nullptr;
+  }
+
+  int64_t PendingSignalsGuest(uint64_t Address, uint64_t Size) {
+    if (Size > sizeof(uint64_t)) return Invalid;
+    const auto Pending = (Current->Pending.Set() | Task->SharedPending.Set()) & Current->SignalMask;
+    if (Available(Address, PF_W) < Size) return Fault;
+    std::memcpy(reinterpret_cast<void*>(Address), &Pending, Size);
+    return 0;
+  }
+
+  // pause and rt_sigsuspend wait until delivery interrupts them (EINTR).
+  int64_t PauseGuest() {
+    Current->Waiting = WaitKind::Signal;
+    return RetrySyscall;
+  }
+
+  int64_t SuspendGuest(uint64_t Address, uint64_t Size) {
+    if (Size != sizeof(uint64_t)) return Invalid;
+    uint64_t Mask {};
+    if (Available(Address, PF_R) < sizeof(Mask)) return Fault;
+    std::memcpy(&Mask, reinterpret_cast<const void*>(Address), sizeof(Mask));
+    if (!Current->SuspendMask) {
+      Current->SuspendMask = Current->SignalMask;
+      Current->SignalMask = Mask & ~Unblockable;
+    }
+    return PauseGuest();
+  }
+
+  int64_t TimedWaitSignal(uint64_t SetAddress, uint64_t InfoAddress, uint64_t Timeout, uint64_t Size) {
+    if (Size != sizeof(uint64_t)) return Invalid;
+    uint64_t Set {};
+    if (Available(SetAddress, PF_R) < sizeof(Set)) return Fault;
+    std::memcpy(&Set, reinterpret_cast<const void*>(SetAddress), sizeof(Set));
+    Set &= ~Unblockable;
+    uint64_t Duration {};
+    if (Timeout && Available(Timeout, PF_R) < 2 * sizeof(int64_t)) return Fault;
+    if (Timeout && !ReadTimespec(Timeout, Duration)) return Invalid;
+    auto Info = TakeSignal(*Current, Set);
+    if (Info) {
+      Current->WaitSignals = 0;
+      if (InfoAddress && CopyOut(InfoAddress, *Info)) return Fault;
+      return Info->Signo;
+    }
+    if (Timeout) {
+      const auto Now = MonotonicNs();
+      if (!Current->Deadline) Current->Deadline = AddDeadline(Now, Duration);
+      if (Current->Deadline <= Now) return -11;
+    }
+    Current->WaitSignals = Set;
+    Current->Waiting = WaitKind::Signal;
+    return RetrySyscall;
+  }
+
+  // Syscalls Linux restarts after an SA_RESTART handler (-ERESTARTSYS).
+  // Sleeps, polls and signal waits return EINTR instead.
+  static bool RestartableSyscall(uint64_t Number) {
+    switch (Number) {
+    case 7: case 23: case 34: case 35: case 128: case 130: case 230: case 232: case 270: case 271: case 281: case 441:
+      return false;
+    default: return true;
+    }
+  }
+
+  // Ends the wait of a thread about to run a handler for Signal.
+  void InterruptWait(GuestThread& Thread, uint32_t Signal) {
+    using namespace FEXCore::X86State;
+    auto& State = Thread.Core->CurrentFrame->State;
+    const bool Restart = Task->SignalActions[Signal - 1][1] & SaRestart;
+    switch (Thread.Waiting) {
+    case WaitKind::None: return;
+    case WaitKind::Sleep: InterruptSleep(Thread); break;
+    case WaitKind::Vfork: break; // vfork already returned the child's pid
+    case WaitKind::Futex:
+      // The wait already advanced rip; RAX still holds the syscall number.
+      // A timed wait uses a restart block, which a handler turns into EINTR.
+      if (Restart && !Thread.Deadline) State.rip -= 2;
+      else State.gregs[REG_RAX] = -4;
+      break;
+    default:
+      // A stream write that queued bytes returns their count (pipe_write).
+      if (Thread.StreamProgress) {
+        State.gregs[REG_RAX] = std::exchange(Thread.StreamProgress, 0);
+        State.rip += 2;
+        break;
+      }
+      // The syscall instruction has not completed: rerun or fail it.
+      if (!Restart || !RestartableSyscall(State.gregs[REG_RAX])) {
+        State.gregs[REG_RAX] = -4;
+        State.rip += 2;
+      }
+      break;
+    }
+    Thread.Waiting = WaitKind::None;
+    Thread.Deadline = 0;
+    Thread.WaitSignals = 0;
+    Thread.PendingRecordLock.reset();
+  }
+
+  // Linux get_signal for the current thread: drops ignored signals, runs
+  // default actions and stacks one frame per caught signal, lowest first,
+  // like the kernel's exit-to-user loop.
+  void DeliverSignals(GuestThread& Thread) {
+    while (!Thread.Exited) {
+      // A stopped process only takes SIGKILL.
+      const auto Allowed = DeliverableSignals(Thread) & (Task->Stopped ? SignalBit(SigKill) : ~uint64_t {});
+      auto Info = TakeSignal(Thread, Allowed);
+      if (!Info) return;
+      const auto Signal = static_cast<uint32_t>(Info->Signo);
+      if (SignalIgnored(*Task, Signal)) continue;
+      if (Task->SignalActions[Signal - 1][0] == SigDefault) {
+        if (DefaultAction(Signal) == SignalDefault::Stop) {
+          // Terminal stops to an orphaned group are discarded (get_signal).
+          if (Signal != SigStop && IsOrphanedGroup(Task->Group)) continue;
+          StopProcess(*Task, Signal);
+          return;
+        }
+        // Terminate or core; ignore and continue never reach here.
+        TerminateForSignal(Signal);
+        return;
+      }
+      InterruptWait(Thread, Signal);
+      if (!EnterSignalHandler(Thread.Core->CurrentFrame, *Info)) {
+        // Linux force_sigsegv.
+        TerminateForSignal(SigSegv);
+        return;
+      }
+    }
   }
 
   static constexpr auto X87SignalFlags = [] {
@@ -5276,28 +8045,28 @@ private:
                        std::pair {X87FLAG_C3_LOC, 14}};
   }();
 
-  bool EnterSignalHandler(CoreFrame* Frame, uint32_t Signal) {
+  bool EnterSignalHandler(CoreFrame* Frame, const SigInfo& Info) {
     using namespace FEXCore::X86State;
     auto& State = Frame->State;
+    const auto Signal = static_cast<uint32_t>(Info.Signo);
     const auto Action = Task->SignalActions[Signal - 1];
-    const uint64_t Mask = uint64_t {1} << (Signal - 1);
+    const uint64_t Mask = SignalBit(Signal);
     const auto SP = State.gregs[REG_RSP];
     const auto& Alt = Current->AltStack;
     const bool OnAlt = Alt[1] == 0 && SP >= Alt[0] && SP - Alt[0] < Alt[2];
-    const bool UseAlt = (Action[1] & 0x08000000) && Alt[1] == 0 && !OnAlt;
+    const bool UseAlt = (Action[1] & SaOnStack) && Alt[1] == 0 && !OnAlt;
     const auto Top = UseAlt ? Alt[0] + Alt[2] : SP;
     if (Top < sizeof(GuestSignalFrame) + 152 || !Action[2] ||
         !(Task->Memory.Query(Action[0]).Flags & PF_X)) return false;
     const auto Address = ((Top - 128 - sizeof(GuestSignalFrame)) & ~uint64_t {15}) - 8;
     GuestSignalFrame Guest {};
     Guest.Restorer = Action[2];
-    Guest.Info[0] = Signal;
-    Guest.Info[4] = Current->SignalSenders[Signal - 1];
-    Guest.Info[5] = 1000;
+    Guest.Info = Info;
     Guest.Context.Stack.Pointer = Alt[0];
     Guest.Context.Stack.Flags = OnAlt ? 1 : Alt[1];
     Guest.Context.Stack.Size = Alt[2];
-    Guest.Context.Mask[0] = Current->SignalMask;
+    // rt_sigsuspend's caller mask returns with the first frame.
+    Guest.Context.Mask[0] = Current->SuspendMask.value_or(Current->SignalMask);
     auto& Context = Guest.Context.Machine;
     for (size_t I = 0; I < SignalRegisters.size(); ++I) Context.Registers[I] = State.gregs[SignalRegisters[I]];
     Context.Registers[16] = State.rip;
@@ -5317,10 +8086,10 @@ private:
     for (size_t I = 0; I < 8; ++I) std::memcpy(Guest.FP.ST[I], State.mm[(I + TopRegister) % 8], sizeof(State.mm[0]));
     if (CopyOut(Address, Guest)) return false;
     Current->SignalFrames.push_back({Address, YMM});
-    Current->PendingSignals &= ~Mask;
-    Current->SignalMask |= Action[3] | ((Action[1] & 0x40000000) ? 0 : Mask);
-    Current->SignalMask &= ~((1ULL << 8) | (1ULL << 18));
-    if (Action[1] & 0x80000000) Task->SignalActions[Signal - 1] = {};
+    Current->SuspendMask.reset();
+    Current->SignalMask |= Action[3] | ((Action[1] & SaNoDefer) ? 0 : Mask);
+    Current->SignalMask &= ~Unblockable;
+    if (Action[1] & SaResetHand) Task->SignalActions[Signal - 1][0] = SigDefault;
     State.gregs[REG_RSP] = Address;
     State.gregs[REG_RDI] = Signal;
     State.gregs[REG_RSI] = Address + offsetof(GuestSignalFrame, Info);
@@ -5368,7 +8137,15 @@ private:
       std::memcpy(New.data(), reinterpret_cast<const void*>(Input), sizeof(New));
     }
     if (Output && CopyOut(Output, Action)) return Fault;
+    New[3] &= ~Unblockable; // sigdelsetmask(SIGKILL, SIGSTOP)
     Action = New;
+    // Linux do_sigaction: a newly ignored signal leaves every pending queue.
+    if (Input && SignalIgnored(*Task, Number)) {
+      Task->SharedPending.Discard(SignalBit(Number));
+      for (auto& Thread : Threads) {
+        if (Thread.Core && Thread.PID == Task->PID) Thread.Pending.Discard(SignalBit(Number));
+      }
+    }
     return 0;
   }
 
@@ -5409,15 +8186,82 @@ private:
     return CopyOut(Address, Names);
   }
 
-  int64_t LimitGuest(uint64_t Resource, uint64_t Output, uint64_t Input) {
-    if (Resource > 15) return Invalid;
-    if (Input) return -1;
-    if (!Output) return 0;
-    constexpr uint64_t Unlimited = UINT64_MAX;
-    uint64_t Limits[2] {Unlimited, Unlimited};
-    if (Resource == 3) Limits[0] = MainStackSize;
-    if (Resource == 7) Limits[0] = Limits[1] = Descriptors().Files.size();
-    return CopyOut(Output, Limits);
+  // copy_process: a non-root user with RLIMIT_NPROC tasks or more cannot
+  // create another without CAP_SYS_RESOURCE or CAP_SYS_ADMIN.
+  bool NprocExceeded() const {
+    const auto Uid = Task->Creds.Uid[0];
+    if (!Uid || Task->Creds.Capable(CapSysResource) || Task->Creds.Capable(CapSysAdmin)) return false;
+    uint64_t Count {};
+    for (const auto& Thread : Threads) {
+      if (!Thread.Core || Thread.Exited) continue;
+      const auto Owner = Processes.find(Thread.PID);
+      Count += Owner != Processes.end() && Owner->second.Creds.Uid[0] == Uid;
+    }
+    return Count >= Task->Limits[ResourceNproc][0];
+  }
+
+  // getrlimit (97), setrlimit (160) and prlimit64 (302).
+  int64_t PrLimit(uint64_t Pid, uint64_t Resource, uint64_t Input, uint64_t Output) {
+    std::array<uint64_t, 2> New {};
+    if (Input) {
+      if (Available(Input, PF_R) < sizeof(New)) return Fault;
+      std::memcpy(New.data(), reinterpret_cast<const void*>(Input), sizeof(New));
+    }
+    GuestProcess* Target = Task;
+    const auto Id = static_cast<uint32_t>(Pid);
+    if (Id && Id != Task->PID) {
+      auto It = Processes.find(Id);
+      if (It == Processes.end()) {
+        const auto Thread = std::find_if(Threads.begin(), Threads.end(), [&](const auto& Entry) { return Entry.Core && Entry.TID == Id; });
+        if (Thread != Threads.end()) It = Processes.find(Thread->PID);
+      }
+      if (It == Processes.end() || It->second.Reaped) return -3;
+      Target = &It->second;
+      // check_prlimit_permission: all three ids match, or CAP_SYS_RESOURCE.
+      const auto& Mine = Task->Creds;
+      const auto& Theirs = Target->Creds;
+      const bool Same = Theirs.Uid[0] == Mine.Uid[0] && Theirs.Uid[1] == Mine.Uid[0] && Theirs.Uid[2] == Mine.Uid[0] &&
+                        Theirs.Gid[0] == Mine.Gid[0] && Theirs.Gid[1] == Mine.Gid[0] && Theirs.Gid[2] == Mine.Gid[0];
+      if (!Same && !Mine.Capable(CapSysResource)) return -1;
+    }
+    // do_prlimit.
+    if (Resource >= ResourceCount) return Invalid;
+    auto& Limit = Target->Limits[Resource];
+    const auto Old = Limit;
+    if (Input) {
+      if (New[0] > New[1]) return Invalid;
+      // sysctl nr_open is the descriptor table size.
+      if (Resource == ResourceNofile && New[1] > DescriptorCount) return -1;
+      if (New[1] > Limit[1] && !Task->Creds.Capable(CapSysResource)) return -1;
+      Limit = New;
+    }
+    if (Output && CopyOut(Output, Old)) return Fault;
+    return 0;
+  }
+
+  // RLIMIT_CPU (check_process_timers): SIGXCPU once the soft limit is
+  // reached, raising the soft limit by a second each time; SIGKILL at the
+  // hard limit.
+  static std::optional<uint64_t> CpuLimitDeadline(const GuestProcess& Process) {
+    const auto [Soft, Hard] = Process.Limits[ResourceCpu];
+    if (Soft == Infinity && Hard == Infinity) return std::nullopt;
+    auto Seconds = [](uint64_t Value) { return Value >= UINT64_MAX / 1'000'000'000 ? UINT64_MAX : Value * 1'000'000'000; };
+    return std::min(Seconds(Soft), Seconds(Hard));
+  }
+
+  void CheckCpuLimit(GuestProcess& Process) {
+    const auto Deadline = CpuLimitDeadline(Process);
+    if (!Deadline) return;
+    const auto Now = ProcessCpuNs(Process);
+    auto& [Soft, Hard] = Process.Limits[ResourceCpu];
+    if (Hard != Infinity && Now >= Hard * 1'000'000'000) {
+      SendSignal(Process, nullptr, MakeSigInfo(SigKill, SiKernel));
+      return;
+    }
+    if (Soft != Infinity && Now >= Soft * 1'000'000'000) {
+      if (Soft < Hard) ++Soft;
+      SendSignal(Process, nullptr, MakeSigInfo(SigXcpu, SiKernel));
+    }
   }
 
   int64_t SystemInfo(uint64_t Address) {
@@ -5433,7 +8277,8 @@ private:
     Info Data {};
     Data.Uptime = MonotonicNs() / 1'000'000'000;
     Data.TotalRAM = MemoryLimit;
-    Data.Processes = 1;
+    // Linux reports nr_threads.
+    Data.Processes = std::count_if(Threads.begin(), Threads.end(), [](const auto& Thread) { return Thread.Core && !Thread.Exited; });
     Data.MemUnit = 1;
     return CopyOut(Address, Data);
   }
@@ -5445,12 +8290,178 @@ private:
     return Result ? Result : 8;
   }
 
-  int64_t ClockGuest(uint64_t Clock, uint64_t Address) {
-    uint64_t Ns = MonotonicNs();
-    if (Clock == 0 || Clock == 5) Ns = time(nullptr) * 1'000'000'000ULL;
-    else if (Clock != 1 && Clock != 4 && Clock != 6 && Clock != 7) return Invalid;
-    const uint64_t Time[] {Ns / 1'000'000'000, Ns % 1'000'000'000};
+  static constexpr int64_t NotPermitted = -1;
+  static constexpr int64_t NotSupported = -95;
+
+  int64_t ClockGuest(uint64_t ClockId, uint64_t Address) {
+    uint64_t Ns {};
+    if (const auto Error = ReadClock(Switch2Guest::DecodeClock(static_cast<int32_t>(ClockId)), Ns)) return Error;
+    const int64_t Time[] {static_cast<int64_t>(Ns / 1'000'000'000), static_cast<int64_t>(Ns % 1'000'000'000)};
     return CopyOut(Address, Time);
+  }
+
+  int64_t ClockResolution(uint64_t ClockId, uint64_t Address) {
+    const auto Clock = Switch2Guest::DecodeClock(static_cast<int32_t>(ClockId));
+    if (Clock.Kind == Switch2Guest::ClockKind::Invalid) return Invalid;
+    if ((Clock.Kind == Switch2Guest::ClockKind::ProcessCpu || Clock.Kind == Switch2Guest::ClockKind::ThreadCpu) &&
+        static_cast<int32_t>(ClockId) < 0 && !CpuClockValid(Clock)) return Invalid;
+    if (!Address) return 0;
+    const int64_t Time[] {0, static_cast<int64_t>(Switch2Guest::ResolutionNs(Clock))};
+    return CopyOut(Address, Time);
+  }
+
+  int64_t GetTimeOfDay(uint64_t TimeValue, uint64_t Timezone) {
+    if (TimeValue) {
+      const auto Ns = RealTimeNs();
+      const int64_t Value[] {static_cast<int64_t>(Ns / 1'000'000'000), static_cast<int64_t>(Ns % 1'000'000'000 / 1000)};
+      if (CopyOut(TimeValue, Value)) return Fault;
+    }
+    if (Timezone) {
+      const int32_t Zone[] {TimezoneMinutesWest, TimezoneDstTime};
+      if (CopyOut(Timezone, Zone)) return Fault;
+    }
+    return 0;
+  }
+
+  int64_t TimeGuest(uint64_t Address) {
+    const int64_t Seconds = RealTimeNs() / 1'000'000'000;
+    if (Address && CopyOut(Address, Seconds)) return Fault;
+    return Seconds;
+  }
+
+  // Sets the guest realtime clock to Seconds.Nanoseconds. Linux do_sys_settimeofday64 checks the time
+  // is valid, then CAP_SYS_TIME.
+  static constexpr int64_t MaxClockSeconds = INT64_MAX / 1'000'000'000;
+  int64_t SetRealtime(int64_t Seconds, int64_t Nanoseconds) {
+    if (Seconds < 0 || Seconds > MaxClockSeconds || Nanoseconds < 0 || Nanoseconds >= 1'000'000'000) return Invalid;
+    if (!Task->Creds.Capable(Switch2Guest::CapSysTime)) return NotPermitted;
+    Realtime.Set(Seconds * 1'000'000'000 + Nanoseconds, MonotonicNs());
+    RealtimeClockSet();
+    return 0;
+  }
+
+  int64_t SetTimeOfDay(uint64_t TimeValue, uint64_t Timezone) {
+    int64_t Value[2] {};
+    int32_t Zone[2] {};
+    if (TimeValue) {
+      if (Available(TimeValue, PF_R) < sizeof(Value)) return Fault;
+      std::memcpy(Value, reinterpret_cast<const void*>(TimeValue), sizeof(Value));
+      if (static_cast<uint64_t>(Value[1]) >= 1'000'000) return Invalid;
+    }
+    if (Timezone) {
+      if (Available(Timezone, PF_R) < sizeof(Zone)) return Fault;
+      std::memcpy(Zone, reinterpret_cast<const void*>(Timezone), sizeof(Zone));
+    }
+    if (TimeValue && (Value[0] < 0 || Value[0] > MaxClockSeconds)) return Invalid;
+    if (!Task->Creds.Capable(Switch2Guest::CapSysTime)) return NotPermitted;
+    if (Timezone) {
+      if (Zone[0] > 15 * 60 || Zone[0] < -15 * 60) return Invalid;
+      TimezoneMinutesWest = Zone[0];
+      TimezoneDstTime = Zone[1];
+      // Linux also warps the clock by the zone on the first settimeofday(NULL, tz) after boot;
+      // not modelled (ProcessInventory.md).
+    }
+    return TimeValue ? SetRealtime(Value[0], Value[1] * 1000) : 0;
+  }
+
+  int64_t ClockSetTime(uint64_t ClockId, uint64_t Address) {
+    const auto Clock = Switch2Guest::DecodeClock(static_cast<int32_t>(ClockId));
+    // Dynamic CPU clocks validate their target, then can never be set. Every other clock but
+    // CLOCK_REALTIME has no set operation (the static CPU clock ids included).
+    if (static_cast<int32_t>(ClockId) < 0 && Clock.Kind != Switch2Guest::ClockKind::Invalid) return CpuClockValid(Clock) ? NotPermitted : Invalid;
+    if (Clock.Kind != Switch2Guest::ClockKind::Realtime) return Invalid;
+    int64_t Time[2] {};
+    if (Available(Address, PF_R) < sizeof(Time)) return Fault;
+    std::memcpy(Time, reinterpret_cast<const void*>(Address), sizeof(Time));
+    return SetRealtime(Time[0], Time[1]);
+  }
+
+  // struct timex on x86-64 (208 bytes).
+  struct GuestTimex {
+    uint32_t Modes;
+    int64_t Offset, Frequency, MaxError, EstError;
+    int32_t Status;
+    int64_t Constant, Precision, Tolerance, TimeSeconds, TimeSub, Tick, PpsFrequency, Jitter;
+    int32_t Shift;
+    int64_t Stability, JitterCount, CalibrationCount, ErrorCount, StabilityCount;
+    int32_t Tai;
+    int32_t Padding[11];
+  };
+  static_assert(sizeof(GuestTimex) == 208);
+
+  // adjtimex and clock_adjtime(CLOCK_REALTIME). The validation and error order follow Linux
+  // (timekeeping_validate_timex); the NTP discipline itself is not run: write modes store their
+  // fields for read-back without steering the clock, except ADJ_SETOFFSET and ADJ_TAI.
+  int64_t AdjustTime(uint64_t Address) {
+    constexpr uint32_t AdjOffset = 0x1, AdjFrequency = 0x2, AdjMaxError = 0x4, AdjEstError = 0x8, AdjStatus = 0x10,
+                       AdjTimeConstant = 0x20, AdjTai = 0x80, AdjSetOffset = 0x100, AdjMicro = 0x1000, AdjNano = 0x2000,
+                       AdjTick = 0x4000, AdjAdjtime = 0x8000, AdjSingleShot = 0x1, AdjReadOnly = 0x2000;
+    constexpr int32_t StaNano = 0x2000, StaReadOnly = 0xff00, StaUnsync = 0x40;
+    constexpr int64_t MaxFrequency = 500 * 65536, MaxPhase = 500'000'000;
+    GuestTimex Request {};
+    if (Available(Address, PF_R) < sizeof(Request)) return Fault;
+    std::memcpy(&Request, reinterpret_cast<const void*>(Address), sizeof(Request));
+    const bool CanSet = Task->Creds.Capable(Switch2Guest::CapSysTime);
+    const auto Modes = Request.Modes;
+    if (Modes & AdjAdjtime) {
+      if (!(Modes & AdjSingleShot)) return Invalid;
+      if (!(Modes & AdjReadOnly) && !CanSet) return NotPermitted;
+    } else {
+      if (Modes && !CanSet) return NotPermitted;
+      if ((Modes & AdjTick) && (Request.Tick < 900'000 / 100 || Request.Tick > 1'100'000 / 100)) return Invalid;
+    }
+    int64_t Delta {};
+    if (Modes & AdjSetOffset) {
+      if (!CanSet) return NotPermitted;
+      const int64_t Sub = Request.TimeSub;
+      if (Sub < 0 || Sub >= ((Modes & AdjNano) ? 1'000'000'000 : 1'000'000)) return Invalid;
+      const int64_t Seconds = Request.TimeSeconds;
+      if (Seconds > MaxClockSeconds || Seconds < -MaxClockSeconds) return Invalid;
+      Delta = Seconds * 1'000'000'000 + ((Modes & AdjNano) ? Sub : Sub * 1000);
+      if (Realtime.Now(MonotonicNs()) + Delta < 0) return Invalid;
+    }
+    if ((Modes & AdjTai) && Request.Constant < 0) return Invalid;
+    if (Modes & AdjSetOffset) {
+      Realtime.SetOffset(Delta, MonotonicNs());
+      RealtimeClockSet();
+    }
+    // adjtime(3) single-shot slews are accepted without slewing.
+    if (!(Modes & AdjAdjtime)) {
+      if (Modes & AdjStatus) Ntp.Status = (Ntp.Status & StaReadOnly) | (Request.Status & ~StaReadOnly);
+      if (Modes & AdjNano) Ntp.Status |= StaNano;
+      if (Modes & AdjMicro) Ntp.Status &= ~StaNano;
+      if (Modes & AdjOffset) Ntp.Offset = std::clamp<int64_t>(Request.Offset, -MaxPhase / ((Ntp.Status & StaNano) ? 1 : 1000), MaxPhase / ((Ntp.Status & StaNano) ? 1 : 1000));
+      if (Modes & AdjFrequency) Ntp.Frequency = std::clamp<int64_t>(Request.Frequency, -MaxFrequency, MaxFrequency);
+      if (Modes & AdjMaxError) Ntp.MaxError = Request.MaxError;
+      if (Modes & AdjEstError) Ntp.EstError = Request.EstError;
+      if (Modes & AdjTimeConstant) Ntp.Constant = std::clamp<int64_t>(Request.Constant, 0, 10);
+      if (Modes & AdjTick) Ntp.Tick = Request.Tick;
+      if (Modes & AdjTai) Realtime.TaiOffsetNs = Request.Constant * 1'000'000'000;
+    }
+    GuestTimex Reply {};
+    Reply.Modes = Modes;
+    const auto Now = static_cast<uint64_t>(std::max<int64_t>(Realtime.Now(MonotonicNs()), 0));
+    Reply.TimeSeconds = static_cast<int64_t>(Now / 1'000'000'000);
+    Reply.TimeSub = static_cast<int64_t>(Now % 1'000'000'000) / ((Ntp.Status & StaNano) ? 1 : 1000);
+    Reply.Offset = Ntp.Offset;
+    Reply.Frequency = Ntp.Frequency;
+    Reply.MaxError = Ntp.MaxError;
+    Reply.EstError = Ntp.EstError;
+    Reply.Status = Ntp.Status;
+    Reply.Constant = Ntp.Constant;
+    Reply.Precision = 1;
+    Reply.Tolerance = MaxFrequency / 1;
+    Reply.Tick = Ntp.Tick;
+    Reply.Tai = static_cast<int32_t>(Realtime.TaiOffsetNs / 1'000'000'000);
+    if (CopyOut(Address, Reply)) return Fault;
+    return (Ntp.Status & StaUnsync) ? 5 : 0; // TIME_ERROR while unsynchronised, else TIME_OK
+  }
+
+  int64_t ClockAdjustTime(uint64_t ClockId, uint64_t Address) {
+    const auto Clock = Switch2Guest::DecodeClock(static_cast<int32_t>(ClockId));
+    if (Clock.Kind == Switch2Guest::ClockKind::Invalid) return Invalid;
+    if (Clock.Kind != Switch2Guest::ClockKind::Realtime) return NotSupported;
+    return AdjustTime(Address);
   }
 
   int64_t AdviseGuest(uint64_t Address, uint64_t Size, uint64_t Advice) {
@@ -5530,7 +8541,7 @@ private:
 
     const auto Metadata = Inodes.find(Info.Inode);
     auto* Attributes = Metadata == Inodes.end() ? nullptr : &Metadata->second.Attributes;
-    const bool Admin = Task->UserIDs[1] == 0;
+    const bool Admin = Task->Creds.Capable(CapSysAdmin);
     const auto Visible = [&](std::string_view Attribute) {
       return Admin || !Attribute.starts_with("trusted.");
     };
@@ -5565,7 +8576,7 @@ private:
     if ((User && Name->size() == 5) || (Trusted && Name->size() == 8)) return Invalid;
     const auto Type = Info.Mode & 0170000;
     const bool Get = Operation == XattrOp::Get;
-    const bool Owner = Info.Uid == Task->UserIDs[3] || Task->UserIDs[3] == 0;
+    const bool Owner = Info.Uid == Task->Creds.Uid[3] || Task->Creds.Capable(CapFowner);
     if (User && Type != 0100000 && Type != 0040000) return Get ? -61 : -1;
     if (ACL && Info.Device == ProcDevice) return -95;
     if (ACL && Type == 0120000) return -95;
@@ -5597,7 +8608,7 @@ private:
         if (*Name == AccessAcl) {
           auto& Record = Inodes[Info.Inode];
           Record.Mode = (Info.Mode & 07000) | Layout->Mode(Bytes);
-          if (Task->UserIDs[3] && !InGuestGroup(Info.Gid)) *Record.Mode &= ~02000;
+          if (Task->Creds.Uid[3] && !InGuestGroup(Info.Gid)) *Record.Mode &= ~02000;
           if (!Layout->Extended) {
             if (Present) Record.Attributes.erase(Existing);
             MarkInodeChanged(Info.Inode);
@@ -5637,6 +8648,7 @@ private:
       std::memcpy(&Enable, reinterpret_cast<const void*>(Argument), sizeof(Enable));
       return FileControl(FD, 4, (File->StatusFlags & ~04000u) | (Enable ? 04000u : 0));
     }
+    if (File->AnonName) return AnonymousIoctl(*const_cast<OpenFile*>(File), Command, Argument);
     if (Command == 0x541b && File->Socket) { // FIONREAD
       if (File->Pipe && (File->StatusFlags & 3) == 1) {
         const auto Reader = File->Socket->Peer.lock();
@@ -5648,6 +8660,7 @@ private:
     switch (Command) {
     case 0x5401: return CopyOut(Argument, Terminal.Attributes); // TCGETS
     case 0x5402: case 0x5403: case 0x5404: {
+      if (const auto Access = TerminalAccess(SigTtou)) return Access;
       TerminalAttributes New;
       if (Available(Argument, PF_R) < sizeof(New)) return Fault;
       std::memcpy(&New, reinterpret_cast<const void*>(Argument), sizeof(New));
@@ -5656,18 +8669,61 @@ private:
     }
     case 0x540b: // TCFLSH
       if (Argument > 2) return Invalid;
+      if (const auto Access = TerminalAccess(SigTtou)) return Access;
       if (Argument != 1) Terminal.Clear();
       return 0;
-    case 0x540f: return CopyOut(Argument, ForegroundGroup);
-    case 0x5429: return CopyOut(Argument, ProcessID); // TIOCGPGRP, TIOCGSID
-    case 0x5410: {
-      uint32_t Group {};
+    case 0x540f: // TIOCGPGRP
+      if (!ControlsTerminal()) return -25;
+      return CopyOut(Argument, ForegroundGroup);
+    case 0x5429: // TIOCGSID
+      if (!ControlsTerminal() || !TerminalSession) return -25;
+      return CopyOut(Argument, TerminalSession);
+    case 0x5410: { // TIOCSPGRP
+      if (!ControlsTerminal()) return -25;
+      if (const auto Access = TerminalAccess(SigTtou)) return Access;
+      int32_t Group {};
       if (Available(Argument, PF_R) < sizeof(Group)) return Fault;
       std::memcpy(&Group, reinterpret_cast<const void*>(Argument), sizeof(Group));
-      if (std::none_of(Processes.begin(), Processes.end(), [&](const auto& Item) { return Item.second.Group == Group; })) return -1;
+      if (Group < 0) return Invalid;
+      const bool Exists = std::any_of(Processes.begin(), Processes.end(), [&](const auto& Item) {
+        return !Item.second.Reaped && Item.second.Group == static_cast<uint32_t>(Group);
+      });
+      if (!Exists) return -3;
+      if (!GroupInSession(Group, Task->Session)) return -1;
       ForegroundGroup = Group;
       return 0;
     }
+    case 0x540e: { // TIOCSCTTY
+      const bool Leader = Task->Session == Task->PID;
+      if (Leader && Task->HasTerminal && TerminalSession == Task->Session) return 0;
+      if (!Leader || Task->HasTerminal) return -1;
+      if (TerminalSession) {
+        if (Argument != 1 || !Task->Creds.Capable(CapSysAdmin)) return -1;
+        for (auto& [ID, Member] : Processes) {
+          if (Member.Session == TerminalSession) Member.HasTerminal = false;
+        }
+      }
+      TerminalSession = Task->Session;
+      ForegroundGroup = Task->Group;
+      Task->HasTerminal = true;
+      return 0;
+    }
+    case 0x5422: // TIOCNOTTY
+      if (!ControlsTerminal()) return -25;
+      if (Task->Session == Task->PID) {
+        // disassociate_ctty: the foreground group gets SIGHUP and SIGCONT.
+        if (ForegroundGroup) {
+          SignalGroup(ForegroundGroup, SigHup);
+          SignalGroup(ForegroundGroup, SigCont);
+        }
+        for (auto& [ID, Member] : Processes) {
+          if (Member.Session == Task->Session) Member.HasTerminal = false;
+        }
+        TerminalSession = 0;
+        ForegroundGroup = 0;
+      }
+      Task->HasTerminal = false;
+      return 0;
     case 0x5413: {
       const auto* Console = consoleGetDefault();
       const uint16_t Size[] {static_cast<uint16_t>(Console->windowHeight), static_cast<uint16_t>(Console->windowWidth), 0, 0};
@@ -5681,8 +8737,39 @@ private:
     }
   }
 
+  bool ControlsTerminal() const {
+    return Interactive && Task->HasTerminal && TerminalSession && Task->Session == TerminalSession;
+  }
+
+  // Linux __tty_check_change and job_control for the console: a process in
+  // a background group that uses its controlling terminal gets Signal for
+  // its group and retries; EIO when SIGTTIN is ignored or blocked or the
+  // group is orphaned. An ignored or blocked SIGTTOU permits the access.
+  int64_t TerminalAccess(uint32_t Signal) {
+    if (!ControlsTerminal() || !ForegroundGroup || Task->Group == ForegroundGroup) return 0;
+    const bool Ignored = Task->SignalActions[Signal - 1][0] == SigIgnore || (Current->SignalMask & SignalBit(Signal));
+    if (Ignored) return Signal == SigTtin ? -5 : 0;
+    if (IsOrphanedGroup(Task->Group)) return -5;
+    SignalGroup(Task->Group, Signal);
+    return WaitForIO();
+  }
+
   void FeedTerminalByte(char Byte) {
     ++IOEpoch;
+    const auto& Attributes = Terminal.Attributes;
+    if (const auto Signal = TerminalSignalFor(static_cast<uint8_t>(Byte), Attributes.Characters.data(), Attributes.Local)) {
+      // n_tty isig: flush unless NOFLSH, echo ^X with ECHO|ECHOCTL, signal
+      // the foreground group.
+      constexpr uint32_t NoFlush = 0x80, Echo = 0x8, EchoControl = 0x200;
+      if (!(Attributes.Local & NoFlush)) Terminal.Clear();
+      if ((Attributes.Local & (Echo | EchoControl)) == (Echo | EchoControl)) {
+        const char Text[] {'^', static_cast<char>(Byte ^ 0x40)};
+        std::fwrite(Text, 1, sizeof(Text), stdout);
+        consoleUpdate(nullptr);
+      }
+      if (ForegroundGroup) SignalGroup(ForegroundGroup, Signal);
+      return;
+    }
     const auto Echo = Terminal.Feed(Byte);
     if (!Echo.empty()) {
       std::fwrite(Echo.data(), 1, Echo.size(), stdout);
@@ -5778,58 +8865,6 @@ private:
     return WaitForIO(WaitKind::Terminal);
   }
 
-  int64_t SelectGuest(uint64_t Count, uint64_t Read, uint64_t Write, uint64_t Except, uint64_t Timeout, uint64_t SigData) {
-    if (Count > Descriptors().Files.size()) return Invalid;
-    using Mask = std::array<uint64_t, DescriptorCount / 64>;
-    static_assert(std::tuple_size_v<Mask> * 64 == DescriptorCount);
-    const auto Size = (Count + 63) / 64 * sizeof(uint64_t);
-    const uint64_t Addresses[] {Read, Write, Except};
-    std::array<Mask, 3> Requested {};
-    for (size_t Set = 0; Set < Requested.size(); ++Set) {
-      if (!Addresses[Set] || !Size) continue;
-      if (Available(Addresses[Set], PF_R | PF_W) < Size) return Fault;
-      std::memcpy(Requested[Set].data(), reinterpret_cast<const void*>(Addresses[Set]), Size);
-    }
-    if (SigData) {
-      uint64_t SignalMaskArgs[2];
-      if (Available(SigData, PF_R) < sizeof(SignalMaskArgs)) return Fault;
-      std::memcpy(SignalMaskArgs, reinterpret_cast<const void*>(SigData), sizeof(SignalMaskArgs));
-      if (SignalMaskArgs[0] && SignalMaskArgs[1] != 8) return Invalid;
-      if (SignalMaskArgs[0] && Available(SignalMaskArgs[0], PF_R) < 8) return Fault;
-    }
-    uint64_t TimeoutNs {};
-    if (Timeout && !ReadTimespec(Timeout, TimeoutNs)) return Available(Timeout, PF_R) < 16 ? Fault : Invalid;
-    if (Timeout && !Current->Deadline) Current->Deadline = AddDeadline(MonotonicNs(), TimeoutNs);
-    {
-      if (Interactive) PollTerminalInput();
-      std::array<Mask, 3> ReadySets {};
-      int64_t ReadyCount {};
-      for (size_t FD = 0; FD < Count; ++FD) {
-        const auto Word = FD / 64;
-        const auto Bit = 1ULL << (FD % 64);
-        const auto* File = GetFile(FD);
-        if (!File && ((Requested[0][Word] | Requested[1][Word] | Requested[2][Word]) & Bit)) return BadFile;
-        if (!File) continue;
-        const auto Events = DescriptorEvents(*File);
-        for (size_t Set = 0; Set < ReadySets.size(); ++Set) {
-          const uint16_t MaskBits[] {0x19, 0x1c, 2};
-          if ((Requested[Set][Word] & Bit) && (Events & MaskBits[Set])) {
-            ReadySets[Set][Word] |= Bit;
-            ++ReadyCount;
-          }
-        }
-      }
-      const auto Now = MonotonicNs();
-      if (ReadyCount || (Timeout && Now >= Current->Deadline) || TerminalClosed) {
-        for (size_t Set = 0; Set < ReadySets.size(); ++Set) {
-          if (Addresses[Set] && Size) std::memcpy(reinterpret_cast<void*>(Addresses[Set]), ReadySets[Set].data(), Size);
-        }
-        return ReadyCount;
-      }
-      return WaitForIO(Interactive ? WaitKind::Terminal : WaitKind::IO);
-    }
-  }
-
   static int16_t StreamPoll(const OpenFile& File, int16_t Events) {
     if (!File.Pipe) return File.Socket->Poll(Events);
     if (File.Fifo) {
@@ -5841,13 +8876,14 @@ private:
         if (!Fifo.Writers && Fifo.WriterGeneration != File.InitialWriterGeneration) Ready |= 0x10;
       }
       if (Access != 0) {
-        if (!Fifo.Readers) Ready |= 8;
+        if (!Fifo.Readers) Ready |= 8 | (Events & 4); // pipe_poll: POLLERR, and the buffer takes writes
         else if (Fifo.Writer->WriteSpace(false)) Ready |= Events & 4;
       }
       return Ready;
     }
     const bool WriteEnd = (File.StatusFlags & 3) == 1;
-    if (WriteEnd && File.Socket->Peer.expired()) return 8; // POLLERR
+    // pipe_poll: no readers is POLLERR; the buffer still takes writes.
+    if (WriteEnd && File.Socket->Peer.expired()) return 8 | (Events & 4);
     if (!WriteEnd && File.Socket->Peer.expired()) {
       return 0x10 | (File.Socket->Input.empty() ? 0 : Events & 1);
     }
@@ -5856,6 +8892,13 @@ private:
 
   uint16_t DescriptorEvents(const OpenFile& File) const {
     if (File.Socket) return StreamPoll(File, 7);
+    if (File.AnonName) return AnonymousEvents(File);
+    if (File.PidfdTarget) {
+      // pidfd_poll: readable once the process exited, hung up once reaped.
+      const auto It = Processes.find(File.PidfdTarget);
+      if (It == Processes.end() || It->second.Reaped) return 1 | 0x10;
+      return It->second.Exited ? 1 : 0;
+    }
     const bool InputReady = File.Console == ConsoleStream::None || Terminal.Readable() || TerminalClosed;
     // Files without a poll operation report both directions regardless of
     // the access mode. Terminal output is always writable.
@@ -6249,7 +9292,7 @@ private:
         const auto WriteOption = Synchronous || (File.StatusFlags & DataSyncFlag) ? FsWriteOption_Flush : FsWriteOption_None;
         InvalidateReadCache(File.Inode);
         const auto Error = WithDiskFile(File, FsOpenMode_Write, [&](FsFile& Native) {
-          return SdFileError(fsFileWrite(&Native, Run.BackingOffset, Buffer, Count, WriteOption));
+          return SdFileError(SdRetry(fsFileWrite, &Native, Run.BackingOffset, Buffer, Count, WriteOption));
         });
         if (Error) return Error;
       } else {
@@ -6268,16 +9311,16 @@ private:
       const auto WriteOption = Synchronous || (File.StatusFlags & DataSyncFlag) ? FsWriteOption_Flush : FsWriteOption_None;
       const auto Result = WithDiskFile(File, FsOpenMode_Write | FsOpenMode_Append, [&](FsFile& Native) {
         s64 Size {};
-        if (const auto Error = SdFileError(fsFileGetSize(&Native, &Size)); Error) return Error;
+        if (const auto Error = SdFileError(SdRetry(fsFileGetSize, &Native, &Size)); Error) return Error;
         const auto Logical = LogicalSize(File.Inode);
         const auto Visible = Logical.value_or(Size);
         const auto Written = WriteGuestFileRange(Size, Visible, Offset, {static_cast<const char*>(Buffer), Count},
           [&](uint64_t Begin, uint64_t End) { return ZeroDiskRange(Native, Begin, End); },
           [&](uint64_t Position, std::span<const char> Chunk) {
-            return SdFileError(fsFileWrite(&Native, Position, Chunk.data(), Chunk.size(), WriteOption));
+            return SdFileError(SdRetry(fsFileWrite, &Native, Position, Chunk.data(), Chunk.size(), WriteOption));
           },
           [&](uint64_t Length) {
-            if (R_FAILED(fsFileSetSize(&Native, Length))) {
+            if (R_FAILED(SdRetry(fsFileSetSize, &Native, Length))) {
               WriteLog("Guest write could not restore native allocation after an extending write failure.");
             }
           });
@@ -6300,6 +9343,7 @@ private:
   }
 
   static constexpr uint64_t MaxRWCount = 0x7ffff000, GuestUserLimit = 1ULL << 47;
+  static constexpr size_t VectorStreamWriteLimit = 1 << 20;
 
   static bool IsGuestUserRange(uint64_t Address, uint64_t Count) {
     return Address < GuestUserLimit && Count <= GuestUserLimit - Address;
@@ -6309,19 +9353,28 @@ private:
     if (Offset && *Offset > INT64_MAX) return Invalid;
     auto* File = GetFile(FD);
     if (!File || File->PathOnly()) return BadFile;
-    if (Offset && (File->Socket || File->Console != ConsoleStream::None)) return -29;
+    if (Offset && (File->Socket || File->Console != ConsoleStream::None || File->AnonName)) return -29;
     if (!WriteAccess(File->StatusFlags)) return BadFile;
     if (!IsGuestUserRange(Address, Count)) return Fault;
+    if (File->AnonName) {
+      Count = std::min<uint64_t>(Count, 65536);
+      if (Count && AccessiblePrefix(Address, Count, PF_R) != Count) return Fault;
+      return WriteAnonymous(*File, reinterpret_cast<const char*>(Address), Count);
+    }
     const auto Position = Offset.value_or(File->Offset);
     if (!File->Socket && Count > INT64_MAX - Position) return Invalid;
     if (File->Path == "/dev/null") return std::min(Count, MaxRWCount);
     if (!Count) return 0;
     const bool FileBacked = File->RealFile || File->Memory;
     if (!FileBacked && !File->Socket && File->Console == ConsoleStream::None) return BadFile;
-    Count = std::min<uint64_t>(Count, FileBacked ? MaxRWCount : File->Pipe ? 65536 : 4096);
+    Count = std::min<uint64_t>(Count, FileBacked || File->Socket ? MaxRWCount : 4096);
     const auto Accessible = AccessiblePrefix(Address, Count, PF_R);
     if (!Accessible || (Accessible != Count && !FileBacked)) return Fault;
     const auto* Buffer = reinterpret_cast<const char*>(Address);
+    constexpr uint32_t TerminalStop = 0x100; // TOSTOP
+    if (Interactive && File->Console != ConsoleStream::None && (Terminal.Attributes.Local & TerminalStop)) {
+      if (const auto Access = TerminalAccess(SigTtou)) return Access;
+    }
     if (!Offset) return WriteDescriptor(*File, Buffer, Accessible);
     return WriteFileAt(*File, Buffer, Accessible, Position);
   }
@@ -6342,7 +9395,9 @@ private:
       Filtered = TerminalOutput.Filter(Output);
       Output = Filtered;
     }
-    if (File->Console == ConsoleStream::Error || Logging == LogLevel::Trace) {
+    // Detailed and Trace logs keep the program output, so a console run's
+    // results (such as the suites' TAP lines) reach the downloaded log.
+    if (File->Console == ConsoleStream::Error || Logging != LogLevel::Standard) {
       LogGuestOutput(Output.data(), Output.size());
     }
     if (GraphicsActive) {
@@ -6399,14 +9454,14 @@ private:
     constexpr uint64_t Preserved = 020000000 | 0200000 | NoFollow | 04000 | 02000 | SyncFlag | NoAtimeFlag | 3;
     if (!(Flags & 3) || (Flags & Create)) return Invalid;
     FsFileSystem SdCard {};
-    if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+    if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
     std::string Path;
     auto Error = ResolveSdPath(Directory, Name, SdCard, Path, !(Flags & NoFollow), Resolve);
     FsDirEntryType Type {};
     if (!Error && VirtualMount(Path)) {
       const auto GuestPath = std::string_view(Path).substr(RootPath.size());
       const auto VirtualDir = VirtualDirectory(Path);
-      if (VirtualDir == "/proc") Error = Task->UserIDs[3] ? -13 : -95;
+      if (VirtualDir == "/proc") Error = Task->Creds.Capable(Switch2Guest::CapDacOverride) ? -95 : -13;
       else if (VirtualDir.starts_with("/proc/")) Error = -1;
       else if (VirtualDir == "/dev") Error = -95;
       else if (!ProcLink(Path).empty() || ProcFile(GuestPath) || GuestPath == "/dev/null" ||
@@ -6421,7 +9476,7 @@ private:
     }
     if (!Error && !InodeStoreAvailable) Error = -5;
     if (!Error) {
-      const auto Created = SdFileError(fsFsCreateDirectory(&SdCard, InodeObjects.data()));
+      const auto Created = SdFileError(SdRetry(fsFsCreateDirectory, &SdCard, InodeObjects.data()));
       if (Created && Created != -17) Error = Created;
     }
 
@@ -6431,23 +9486,23 @@ private:
       auto& Record = Inodes[Inode];
       Record.ManagedFile = Record.Unlinked = true;
       const auto ParentInode = SdInode(Path);
-      Record.Owner.emplace(Task->UserIDs[3], (ModeForInode(ParentInode, 0040755) & 02000) ?
-                           InodeOwner(ParentInode).second : Task->GroupIDs[3]);
+      Record.Owner.emplace(Task->Creds.Uid[3], (ModeForInode(ParentInode, 0040755) & 02000) ?
+                           InodeOwner(ParentInode).second : Task->Creds.Gid[3]);
       InitializeInodeMode(Inode, Path, CreationMode, false);
       const auto Now = WallClock();
       Record.Times = InodeTimestamps {Now, Now, Now};
       InodeStoreDirty = true;
       // Record retirement first so a reset cannot strand an unnamed file.
       Error = SaveInodeStore();
-      if (!Error) Error = SdFileError(fsFsCommit(&SdCard));
+      if (!Error) Error = SdFileError(SdRetry(fsFsCommit, &SdCard));
       if (!Error) {
         const auto Object = ObjectPath(Inode);
-        Error = SdFileError(fsFsCreateFile(&SdCard, Object.c_str(), 0, 0));
+        Error = SdFileError(SdRetry(fsFsCreateFile, &SdCard, Object.c_str(), 0, 0));
         if (!Error) {
           File = std::make_shared<OpenFile>();
           const uint32_t Mode = FsOpenMode_Write | FsOpenMode_Append | ((Flags & 3) == 2 ? FsOpenMode_Read : 0);
           FsFile Native {};
-          Error = SdFileError(fsFsOpenFile(&SdCard, Object.c_str(), Mode, &Native));
+          Error = SdFileError(SdRetry(fsFsOpenFile, &SdCard, Object.c_str(), Mode, &Native));
           if (!Error) {
             fsFileClose(&Native);
             File->RealFile = true;
@@ -6502,7 +9557,7 @@ private:
                                  : Flags & (Nonblocking | LargeFile | Append | SyncFlag | NoAtimeFlag | 3);
     {
       FsFileSystem SdCard {};
-      if (const auto Status = fsOpenSdCardFileSystem(&SdCard); R_FAILED(Status)) return SdFileError(Status);
+      if (const auto Status = SdRetry(fsOpenSdCardFileSystem, &SdCard); R_FAILED(Status)) return SdFileError(Status);
       if (const auto Error = ResolveSdPath(Directory, *Name, SdCard, File->Path, !(Flags & NoFollow) && !((Flags & Create) && (Flags & Exclusive)), Resolve); Error < 0) {
         fsFsClose(&SdCard);
         return Error;
@@ -6633,7 +9688,7 @@ private:
         uint32_t Mode = (Flags & 3) == 1 ? 0 : FsOpenMode_Read;
         if ((Flags & 3) || (Flags & Truncate)) Mode |= FsOpenMode_Write | FsOpenMode_Append;
         FsFile Native {};
-        Status = fsFsOpenFile(&SdCard, Backing.c_str(), Mode, &Native);
+        Status = SdRetry(fsFsOpenFile, &SdCard, Backing.c_str(), Mode, &Native);
         File->RealFile = R_SUCCEEDED(Status);
         if (File->RealFile) {
           int64_t Error {};
@@ -6711,7 +9766,9 @@ private:
     if (File->Directory) return Writing ? BadFile : -21;
     if (File->Path == "/dev/null") return Writing ? RequestedTotal : 0;
     const size_t Limit = File->Console != ConsoleStream::None ? (Writing ? 4096 : 65536) :
-                         (File->Socket ? File->Socket->InputCapacity : MaxRWCount);
+                         // Vectored stream writes are gathered into one copy per
+                         // attempt, so they are bounded to keep that copy small.
+                         (File->Socket ? (Writing ? VectorStreamWriteLimit : File->Socket->InputCapacity) : MaxRWCount);
     size_t Total = 0;
     bool BufferFault = false;
     // One backend operation preserves pipe write atomicity and avoids
@@ -6780,9 +9837,15 @@ private:
     if (Offset && *Offset > INT64_MAX) return Invalid;
     auto* File = GetFile(FD);
     if (!File || File->PathOnly()) return BadFile;
-    if (Offset && (File->Socket || File->Console != ConsoleStream::None)) return -29;
+    if (Offset && (File->Socket || File->Console != ConsoleStream::None || File->AnonName)) return -29;
     if (!ReadAccess(File->StatusFlags)) return BadFile;
     if (!IsGuestUserRange(Address, Count)) return Fault;
+    if (File->AnonName) {
+      // Anonymous descriptors check the size themselves; a zero count is not special.
+      Count = std::min<uint64_t>(Count, 65536);
+      if (Count && AccessiblePrefix(Address, Count, PF_W) != Count) return Fault;
+      return ReadAnonymous(*File, reinterpret_cast<char*>(Address), Count);
+    }
     const auto Position = Offset.value_or(File->Offset);
     if (!File->Socket && Count > INT64_MAX - Position) return Invalid;
     if (File->Path == "/dev/null") return 0;
@@ -6800,6 +9863,7 @@ private:
     auto* File = &Descriptor;
     if (Interactive && (File->Console == ConsoleStream::Input || File->Console == ConsoleStream::Terminal)) {
       if (!ReadAccess(File->StatusFlags)) return BadFile;
+      if (const auto Access = TerminalAccess(SigTtin)) return Access;
       return ReadTerminal(Buffer, Count, File->StatusFlags & 04000);
     }
     if (File->Console == ConsoleStream::Input) {
@@ -6838,7 +9902,7 @@ private:
         const auto Result = Extents->ReadBytes(Offset, {static_cast<char*>(Buffer), Count},
           [&](uint64_t Position, std::span<char> Chunk) -> int64_t {
             u64 Received {};
-            const auto Error = SdFileError(fsFileRead(&Native, Position, Chunk.data(), Chunk.size(), FsReadOption_None, &Received));
+            const auto Error = SdFileError(SdRetry(fsFileRead, &Native, Position, Chunk.data(), Chunk.size(), FsReadOption_None, &Received));
             return Error ? Error : static_cast<int64_t>(Received);
           });
         if (Result < 0) return Result;
@@ -6848,7 +9912,7 @@ private:
       uint64_t PhysicalCount = Count;
       if (Logical) {
         s64 Allocated {};
-        if (const auto Error = SdFileError(fsFileGetSize(&Native, &Allocated)); Error) return Error;
+        if (const auto Error = SdFileError(SdRetry(fsFileGetSize, &Native, &Allocated)); Error) return Error;
         PhysicalCount = Offset >= static_cast<uint64_t>(Allocated) ? 0 :
           std::min<uint64_t>(Count, static_cast<uint64_t>(Allocated) - Offset);
       }
@@ -6856,12 +9920,13 @@ private:
       while (Read < PhysicalCount) {
         const auto Chunk = std::min<uint64_t>(PhysicalCount - Read, 65536);
         u64 Received {};
-        const auto Error = SdFileError(fsFileRead(&Native, Offset + Read, Data + Read, Chunk, FsReadOption_None, &Received));
-        if (Error && !Read && !Logical) {
+        const auto Status = SdRetry(fsFileRead, &Native, Offset + Read, Data + Read, Chunk, FsReadOption_None, &Received);
+        if (R_FAILED(Status) && !Read && !Logical) {
           // Horizon rejects reads that start past EOF; Linux reads 0 bytes.
           s64 Size {};
-          if (R_SUCCEEDED(fsFileGetSize(&Native, &Size)) && Offset >= static_cast<uint64_t>(Size)) return int64_t {0};
+          if (R_SUCCEEDED(SdRetry(fsFileGetSize, &Native, &Size)) && Offset >= static_cast<uint64_t>(Size)) return int64_t {0};
         }
+        const auto Error = SdFileError(Status);
         if (Error) return Read ? int64_t {0} : Error;
         Read += Received;
         if (Received < Chunk) break;
@@ -6931,6 +9996,7 @@ private:
 
   int64_t CloseGuest(uint64_t FD) {
     if (!GetFile(FD)) return BadFile;
+    if (!SharedFileViews.empty()) PruneSharedFileViews();
     const auto& File = Descriptors().Files[FD];
     const bool Socket = File->Socket != nullptr;
     const bool Locked = File->Lock != FileLock::None;
@@ -6995,8 +10061,22 @@ private:
     const auto Rounded = Task->Memory.RoundUp(Size);
     if (IsFixed && (Address % GuestPageSize || !Task->Memory.Owns(Address, Rounded, true) || OverlapsHeap(Address, Rounded))) return Invalid;
     const auto Access = PageFlags(Protection);
+    if (!IsAnonymous && (Flags & Shared) && !File->Memory) {
+      // SD files support shared mappings that can never become writable: the
+      // descriptor is read-only, so mprotect cannot add PROT_WRITE either.
+      if (!File->RealFile || (File->StatusFlags & 3) != 0) return -19;
+      if (IsFixed || (Protection & 2) || (Protection & 4)) return (Protection & 2) ? -13 : Invalid;
+      std::shared_ptr<void> Storage {std::aligned_alloc(GuestPageSize, Rounded), &std::free};
+      if (!Storage) return -12;
+      if (const auto Error = FillSharedFileView(*File, Storage.get(), Rounded, Offset); Error) return Error;
+      const auto Base = reinterpret_cast<uint64_t>(Storage.get());
+      if (!Task->Memory.RegisterSharedFile(Base, Rounded, Access, Storage, false)) return -12;
+      PruneSharedFileViews();
+      SharedFileViews.emplace(File->Inode, SharedFileView {Storage, Descriptors().Files[FD], Offset, Rounded});
+      RecordMapping(Base, Rounded, Offset, File->Path);
+      return Base;
+    }
     if (!IsAnonymous && (Flags & Shared)) {
-      if (!File->Memory) return -19;
       auto& Memory = *File->Memory;
       if (!ReadAccess(File->StatusFlags)) return -13;
       const bool MayWrite = (File->StatusFlags & 3) == 2 && !Memory.WritesSealed();
@@ -7057,6 +10137,7 @@ private:
     InvalidateExecutableRange(Frame, Address, Rounded, 0);
     if (!Task->Memory.Set(Address, Rounded, Task->Memory.Unmapped, true)) return Invalid;
     RecordMapping(Address, Rounded, 0, {});
+    if (!SharedFileViews.empty()) PruneSharedFileViews();
     return 0;
   }
 
@@ -7082,7 +10163,7 @@ private:
   static constexpr size_t HeapLimit = 8 * 1024 * 1024;
   std::string RootPath;
   std::string LaunchFolder;
-  std::array<GuestThread, 8> Threads {};
+  std::array<GuestThread, GuestThreadCount> Threads {};
   GuestThread* Current {};
   std::jmp_buf ReturnToHost;
   uint64_t ExitStatus {};
@@ -7101,6 +10182,7 @@ private:
   std::map<std::string, std::weak_ptr<StreamSocket>> SocketNames;
   std::vector<std::weak_ptr<StreamSocket>> SocketRightsReceivers;
   uint64_t NextAnonymousInode {4};
+  uint64_t AnonInode {}; // the shared anonymous inode, allocated on first use
   uint64_t NextSdInode {InodeSnapshot::FirstInode};
   InodeNames SdInodes;
   InodeRecords Inodes;
@@ -7108,6 +10190,16 @@ private:
   FileReadCache ReadCache;
   std::set<uint64_t> DirtyFileData;
   std::vector<std::weak_ptr<OpenFile>> DiskFiles;
+  // Read-only MAP_SHARED views of SD files. Each holds its open file, as a
+  // Linux mapping does, and is refreshed when the file's data changes, so it
+  // stays coherent with writes through any descriptor.
+  struct SharedFileView {
+    std::weak_ptr<void> Storage;
+    std::shared_ptr<OpenFile> File;
+    uint64_t Offset {};
+    size_t Size {};
+  };
+  std::multimap<uint64_t, SharedFileView> SharedFileViews;
   std::map<uint64_t, std::weak_ptr<FifoState>> FifoEndpoints;
   uint64_t InodeGeneration {};
   bool InodeStoreAvailable {};
@@ -7117,8 +10209,21 @@ private:
   std::map<uint32_t, GuestProcess> Processes;
   GuestProcess* Task {};
   uint32_t ForegroundGroup {ProcessID};
+  uint32_t TerminalSession {ProcessID}; // 0: no session controls the console.
   PadState Input {};
   const u64 StartTick {armGetSystemTick()};
+  // Guest CLOCK_REALTIME: the Horizon RTC second at startup, then real elapsed time. Process-global
+  // for this launch; clock_settime and friends change it, never Horizon's clock, and it is not persisted.
+  Switch2Guest::RealtimeBase Realtime {static_cast<int64_t>(time(nullptr)) * 1'000'000'000, MonotonicNs()};
+  // The running quantum of the guest thread: its thread tick count when the dispatch began.
+  uint64_t QuantumStart {};
+  bool InDispatch {};
+  // settimeofday's timezone (gettimeofday reports it) and the NTP state adjtimex reads and writes.
+  int32_t TimezoneMinutesWest {}, TimezoneDstTime {};
+  struct NtpState {
+    int64_t Offset {}, Frequency {}, MaxError {16'000'000}, EstError {16'000'000}, Constant {2}, Tick {10'000};
+    int32_t Status {0x40}; // STA_UNSYNC, as a kernel boots without an NTP daemon
+  } Ntp;
   Framebuffer Video {};
   bool Presented {};
 
@@ -7128,7 +10233,7 @@ private:
 // through the same syscall handler a guest program would reach, on a
 // namespace of its own with no guest running, so permissions, the inode
 // store and overflow paths all behave as they do for guests.
-class GuestFileService final : public FtpFileSystem {
+class GuestFileService final : public FtpFileSystem, public RootfsSetup::RootfsWriter {
 public:
   GuestFileService() {
     Syscalls = std::make_unique<GuestSyscalls>(std::span<const Segment> {}, Root, Root, "/", false, true);
@@ -7139,8 +10244,7 @@ public:
     // There is no user database to log in against. Transfers act with
     // root's access so every file can be reached, like copying files to
     // the SD card directly.
-    Task.UserIDs.fill(0);
-    Task.GroupIDs.fill(0);
+    Task.Creds = Switch2Guest::RootCredentials();
     Task.SupplementaryGroups.clear();
     Buffer = Task.Memory.Allocate(BufferSize + 2 * PathBytes + StatBytes, PF_R | PF_W);
   }
@@ -7247,7 +10351,90 @@ public:
     return Syscalls->UpdateFileTimes(CurrentDirectory, PathAddress(0), StatAddress(), 0, GuestSyscalls::TimeInput::Nanoseconds);
   }
 
+  // RootfsWriter: dpkg's unpack operations through the guest syscalls, so
+  // owners, modes, links and long names land exactly as a guest would
+  // create them. The service acts as root.
+  int64_t MakeDirectory(const std::string& Path, uint32_t Mode, uint32_t Uid, uint32_t Gid) override {
+    FtpEntry Entry {};
+    const auto Existing = Stat(Path, Entry, true);
+    if (!Existing && (Entry.Mode & 0170000) == 0120000) {
+      // dpkg keeps a symlink to a directory (e.g. a merged /usr layout).
+      if (!Stat(Path, Entry, false) && (Entry.Mode & 0170000) == 0040000) return 0;
+      return -17;
+    }
+    if (!Existing && (Entry.Mode & 0170000) != 0040000) return -17;
+    // Like dpkg, an existing directory keeps its owner and mode (this also
+    // covers mount points such as /dev and /proc).
+    if (!Existing) return 0;
+    if (Existing != -2) return Existing;
+    if (const auto Error = SetPath(0, Path)) return Error;
+    if (const auto Error = Syscalls->CreateDirectoryGuest(CurrentDirectory, PathAddress(0), 0700)) return Error;
+    return SetOwnerAndMode(Path, Uid, Gid, Mode);
+  }
+
+  int64_t WriteFile(const std::string& Path, std::span<const uint8_t> Data, uint32_t Mode, uint32_t Uid, uint32_t Gid,
+                    int64_t ModifyTime) override {
+    constexpr uint64_t WriteOnly = 1, Create = 0100, Truncate = 01000, NoFollow = 0400000, CloseOnExec = 02000000;
+    const auto Temporary = Path + ".dpkg-new";
+    if (const auto Error = SetPath(0, Temporary)) return Error;
+    const auto FD = Syscalls->OpenGuest(CurrentDirectory, PathAddress(0), WriteOnly | Create | Truncate | NoFollow | CloseOnExec, 0600);
+    if (FD < 0) return FD;
+    for (size_t Offset = 0; Offset < Data.size();) {
+      const auto Written = Write(FD, Data.data() + Offset, Data.size() - Offset);
+      if (Written <= 0) {
+        Syscalls->CloseGuest(FD);
+        return Written ? Written : -5;
+      }
+      Offset += Written;
+    }
+    if (const auto Error = Syscalls->CloseGuest(FD)) return Error;
+    if (const auto Error = SetOwnerAndMode(Temporary, Uid, Gid, Mode)) return Error;
+    if (const auto Error = SetModifyTime(Temporary, ModifyTime)) return Error;
+    return Rename(Temporary, Path);
+  }
+
+  int64_t Symlink(const std::string& Target, const std::string& Path, uint32_t Uid, uint32_t Gid) override {
+    if (const auto Error = RemoveNonDirectory(Path)) return Error;
+    if (const auto Error = SetPath(0, Path)) return Error;
+    if (const auto Error = SetPath(1, Target)) return Error;
+    if (const auto Error = Syscalls->CreateSymlink(PathAddress(1), CurrentDirectory, PathAddress(0))) return Error;
+    return Syscalls->ChangeOwner(CurrentDirectory, PathAddress(0), Uid, Gid, SymlinkNoFollow);
+  }
+
+  int64_t HardLink(const std::string& Existing, const std::string& Path) override {
+    if (const auto Error = RemoveNonDirectory(Path)) return Error;
+    if (const auto Error = SetPath(0, Existing)) return Error;
+    if (const auto Error = SetPath(1, Path)) return Error;
+    return Syscalls->LinkGuest(CurrentDirectory, PathAddress(0), CurrentDirectory, PathAddress(1), 0);
+  }
+
+  int64_t MakeNode(const std::string& Path, uint32_t Mode, uint64_t Device, uint32_t Uid, uint32_t Gid) override {
+    // The runtime has no device nodes (mknod of a device returns EPERM);
+    // FIFOs work.
+    if (Device) return -1;
+    if (const auto Error = RemoveNonDirectory(Path)) return Error;
+    if (const auto Error = SetPath(0, Path)) return Error;
+    if (const auto Error = Syscalls->MakeNode(CurrentDirectory, PathAddress(0), Mode)) return Error;
+    return SetOwnerAndMode(Path, Uid, Gid, Mode & 07777);
+  }
+
 private:
+  // chown first: it clears set-user-ID and set-group-ID bits.
+  int64_t SetOwnerAndMode(const std::string& Path, uint32_t Uid, uint32_t Gid, uint32_t Mode) {
+    if (const auto Error = SetPath(0, Path)) return Error;
+    if (const auto Error = Syscalls->ChangeOwner(CurrentDirectory, PathAddress(0), Uid, Gid, SymlinkNoFollow)) return Error;
+    return Syscalls->ChangeModeAt(CurrentDirectory, PathAddress(0), Mode & 07777, 0);
+  }
+
+  int64_t RemoveNonDirectory(const std::string& Path) {
+    FtpEntry Entry {};
+    const auto Existing = Stat(Path, Entry, true);
+    if (Existing == -2) return 0;
+    if (Existing) return Existing;
+    if ((Entry.Mode & 0170000) == 0040000) return -21;
+    return Remove(Path);
+  }
+
   static constexpr size_t BufferSize = 256 * 1024;
   static constexpr size_t PathBytes = GuestSyscalls::GuestPathMax;
   static constexpr size_t StatBytes = 256;
@@ -7322,6 +10509,12 @@ std::unique_ptr<FtpFileSystem> OpenGuestFileSystem() {
   return Service;
 }
 
+std::unique_ptr<RootfsSetup::RootfsWriter> OpenGuestRootfsWriter() {
+  auto Service = std::make_unique<GuestFileService>();
+  if (!Service->Ready()) return nullptr;
+  return Service;
+}
+
 void SetLaunchCredentials(std::optional<std::pair<uint32_t, uint32_t>> Credentials) {
   LaunchCredentials = Credentials;
 }
@@ -7372,7 +10565,13 @@ static std::optional<uint64_t> RunGuestOnCurrentThread(uint64_t Entry, std::span
   }
   std::vector<std::string> Argv {std::string {Program}};
   Argv.insert(Argv.end(), Arguments.begin(), Arguments.end());
-  std::vector<std::string> Environment {"PATH=/bin:/usr/bin", "HOME=/", "LANG=C", Interactive ? "TERM=ansi" : "TERM=dumb"};
+  // Debian's login PATHs (login.defs ENV_SUPATH / ENV_PATH): root also
+  // searches the sbin directories, where dpkg expects ldconfig and
+  // start-stop-daemon.
+  const bool Root = LaunchCredentials && LaunchCredentials->first == 0;
+  std::vector<std::string> Environment {Root ? "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                                             : "PATH=/usr/local/bin:/usr/bin:/bin",
+                                        Root ? "HOME=/root" : "HOME=/", "LANG=C", Interactive ? "TERM=ansi" : "TERM=dumb"};
   if (Interactive) {
     Environment.insert(Environment.end(), {"HISTFILE=", "TERMINFO=/lib/terminfo", "PS1=\\[\\e[36m\\]fex\\[\\e[0m\\]:\\w\\$ "});
   }
@@ -7464,12 +10663,12 @@ std::optional<uint64_t> RunGuest(uint64_t Entry, std::span<const Segment> Segmen
 
 Result ReadDirectory(const std::string& Folder, std::vector<DirectoryEntry>& Entries) {
   FsFileSystem SdCard {};
-  Result Status = fsOpenSdCardFileSystem(&SdCard);
+  Result Status = SdRetry(fsOpenSdCardFileSystem, &SdCard);
   if (R_FAILED(Status)) {
     return Status;
   }
   FsDir Directory {};
-  Status = fsFsOpenDirectory(&SdCard, Folder.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles | FsDirOpenMode_NoFileSize, &Directory);
+  Status = SdRetry(fsFsOpenDirectory, &SdCard, Folder.c_str(), FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles | FsDirOpenMode_NoFileSize, &Directory);
   fsFsClose(&SdCard);
   if (R_FAILED(Status)) {
     return Status;
@@ -7478,7 +10677,7 @@ Result ReadDirectory(const std::string& Folder, std::vector<DirectoryEntry>& Ent
   std::array<FsDirectoryEntry, 8> Batch;
   for (;;) {
     s64 Count {};
-    Status = fsDirRead(&Directory, &Count, Batch.size(), Batch.data());
+    Status = SdRetry(fsDirRead, &Directory, &Count, Batch.size(), Batch.data());
     if (R_FAILED(Status) || Count == 0) {
       break;
     }
@@ -7495,3 +10694,4 @@ Result ReadDirectory(const std::string& Folder, std::vector<DirectoryEntry>& Ent
 }
 
 } // namespace Switch2Guest
+

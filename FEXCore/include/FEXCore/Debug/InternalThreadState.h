@@ -124,6 +124,17 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   // Can be reprotected as RO to trigger an interrupt at generated code block entrypoints
   alignas(FEXCore::Utils::FEX_PAGE_SIZE) uint8_t InterruptFaultPage[FEXCore::Utils::FEX_PAGE_SIZE];
 };
+// Preemption polling (Context::SetPollPendingInterrupt). A host thread sets
+// the 64-bit word at InterruptPollRequestOffset in InterruptFaultPage to a
+// nonzero value. The next poll at an entry point or before a backward branch
+// stores the host address to resume at (the entry point or the branch
+// target; never 0) at InterruptPollTargetOffset, spills the static registers
+// and returns from the dispatcher. RestoreRIPFromHostPC maps that address to
+// the guest RIP: with polling on, every guest instruction has a RIP entry. The dispatcher's signal-guarded regions store to offset 0,
+// so these words stay clear of it.
+inline constexpr size_t InterruptPollRequestOffset = 64;
+inline constexpr size_t InterruptPollTargetOffset = 72;
+
 static_assert(std::is_standard_layout_v<FEXCore::Core::InternalThreadState>);
 // Maximum unsigned-offset store range for fault page.
 static_assert(

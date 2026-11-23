@@ -2,6 +2,26 @@
 
 ## Restart checkpoint
 
+- **Status (2026-11-23).** Milestone 2 (processes and events) is
+  **complete** and committed on `nx2`. Console acceptance on 0.13.17-diag:
+  `/bin/process-acceptance.elf` `suite 42, tools 42` (proc-suite 240 passed,
+  0 failed, 8 skipped), interactive Bash checklist including Ctrl+C on a
+  foreground busy loop; 0.13.16-diag: proc-suite-root 246/0/2,
+  filesystem-acceptance `ABI 42, coreutils 0, suite 42`. Native: proc-suite
+  241/0/7 (uid 1000), 245/0/3 (namespace root); fs-suite 81/0/2.
+  The commit is **0.13.18**: the EXPERIMENT SD diagnostics
+  (`SdBufferError`, `SdPathError`) are removed and every Result-returning
+  libnx SD call goes through `SdRetry`, which retries `2001-0106`
+  (InvalidMemoryState, 0xd401) up to two times and logs each retry (the
+  user's decision; the cause stays unknown). 0.13.18 passed the host checks
+  and builds; it has not had its own console run.
+- **Next.** Choose milestone 3 from the backlog below (procfs
+  `/proc/<pid>/{stat,fd,...}` for `ps`/`pgrep` and `event/anon_inode_names`,
+  networking, or desktop IPC); write its plan before code. Graphics stays
+  on `shelf/graphics`. Open minors: rootfs setup should configure
+  base-passwd first; Task 5/6/8 minors in `.superpowers/sdd/progress.md`.
+- **History.** Milestone 2 console runs 0.13.1-0.13.17 follow.
+
 - **Status (2026-11-22).** Milestone 1 (filesystem) is **complete** and
   committed on `nx2`. Console acceptance passed across 0.12.36–0.12.40:
   combined acceptance `ABI 42, coreutils 0, suite 42` and the root suite
@@ -9,14 +29,422 @@
   FTP test, 0 failed (0.12.40). Builds 0.12.38–0.12.40 changed only the
   FTP server. Graphics stays shelved on `shelf/graphics` (snapshot
   `c54852c9b`) until milestones 2 and 3 are done.
-- **Next.** Milestone 2, processes and events (see
-  [Active milestone sequence](#active-milestone-sequence--linux-guest-kernel-compatibility)):
-  process and session lifecycle, signals, credentials, clocks and timers,
-  polling and watches. Start by auditing the routed handlers for those
-  groups and writing a suite like `FsSuite.c` that passes natively.
-  Known carry-overs: `clock_nanosleep` on the process CPU clock and root
-  alarm sleeps return EOPNOTSUPP, and realtime has one-second resolution
-  (see `FilesystemInventory.md`).
+- **Console 0.13.14/0.13.15-diag (2026-11-23).** proc-suite-root and
+  filesystem-acceptance passed. process-acceptance: suite 236/4/7 (the four
+  `/proc/self/fd/N` anon-name readlinks: the guest has no `/proc/<pid>/fd`),
+  tools 1 (`inotifywait_monitor`: fork EAGAIN, 9 live processes against the
+  8-slot thread table); 0.13.14 then crashed the launcher and lost the
+  buffered output. **0.13.15-diag** writes program output to the log at once
+  (`[out]` lines). **0.13.16-diag:** thread table 32 (RLIMIT_NPROC 32); the
+  anon-name checks moved to `event/anon_inode_names`, which skips without
+  `/proc/<pid>/fd`; the suite runs in its own `./proc-suite.XXXXXX`
+  directory (a root run left root-owned `ino-*` directories that broke the
+  user run); `RunPackagedNative.sh` cleans up through the id-mapped
+  namespace (it had left `rootfs/scratch` in the staged bundle). Native:
+  241/0/7 and 245/0/3; packaged root suite then acceptance, twice:
+  `suite 42, tools 42`. The 0.13.14 crash is unexplained; rerun to see
+  whether it recurs.
+- **Console 0.13.16-diag (2026-11-23).** proc-suite 240/0/8, proc-suite-root
+  246/0/2, filesystem-acceptance `ABI 42, coreutils 0, suite 42`; tools 1:
+  `inotifywait_monitor` (the trace shows inotifywait exec'd after the
+  writer subshell started; on the console its startup outran `sleep 0.2`).
+  Interactive Bash passed except Ctrl+C on a foreground `while :; do :;
+  done`: preemption counted terminal input only when another thread waited
+  on the terminal, so the shell's own loop was never preempted and the key
+  never read. **0.13.17-diag:** terminal input always allows preemption in
+  interactive runs; `inotifywait_create`/`_monitor` act only after
+  inotifywait reports "Watches established." Native tools script exits 42.
+- **Next (2026-11-23): console run of 0.13.17-diag** (same checklist). Milestone 2,
+  processes and events ([Milestone2Plan.md](Milestone2Plan.md), inventory in
+  [ProcessInventory.md](ProcessInventory.md), ledger in
+  `.superpowers/sdd/progress.md`, git-ignored). Tasks 1-9 were
+  console-verified on 0.13.13-diag (proc-suite 138/0/7, proc-suite-root
+  143/0/2, fs-suite 81/0/2, fs-suite-root 83/0/0). Tasks 10-18 are now
+  implemented in the working tree, **not yet console-verified**:
+  timers/alarm/itimers/timerfd (10), eventfd (11), signalfd (12), poll,
+  select, ppoll/pselect6 signal masks and epoll (13), inotify with
+  filesystem hooks, fanotify ENOSYS (14), per-process rlimits (15),
+  `ProcessTools.sh` + `process-acceptance.elf` and the Debian packages grep,
+  procps, inotify-tools (16), inventory/README (17), banner 0.13.14-diag (18).
+  Nothing of milestone 2 is committed; it commits once after console
+  acceptance.
+  **Verification (2026-11-23, 0.13.14):**
+  - Host: `cmake --build Source/Switch2/build/guest --target guest_nro`
+    builds; all 16 `check-guest-*` targets of Task 18 pass;
+    `make check-rootfs-setup` 93 packages, 6326 paths match.
+  - Native: `make check-proc-suite-native` 240 passed, 0 failed, 7 skipped
+    (uid 1000) and 244/0/3 (namespace root); `make check-fs-suite-native`
+    81/0/2. Packaged (`RunPackagedNative.sh build/guest/sd/fex/rootfs ...`):
+    `/bin/process-acceptance.elf` prints `suite 42, tools 42`, exit 0;
+    `--root /bin/proc-suite-root.elf` 244/0/3, exit 42;
+    `/bin/filesystem-acceptance.elf` (with its .args) `ABI 42, coreutils 0,
+    suite 42`. `RunPackagedNative.sh` now starts the program in its own
+    session and not as the namespace init, as the launcher does (orphaned
+    process groups need init outside the session).
+  - Console: pending. Artifacts: `Source/Switch2/build/guest/fex-switch2-guest.nro`
+    and `Source/Switch2/build/guest/sd/fex` (merge onto SD `/fex`). The
+    staged `proc-suite*.elf.args` now name all ten groups (written by
+    `StageDebian.py`).
+  **Console checklist:** 1. `/bin/process-acceptance.elf` → `Process
+  acceptance results: suite 42, tools 42`. 2. `/bin/proc-suite-root.elf` →
+  exit 42. 3. `/bin/filesystem-acceptance.elf` → `ABI 42, coreutils 0,
+  suite 42`. 4. Interactive Bash: Ctrl+C on `sleep 100` (`echo $?` 130),
+  Ctrl+Z/`bg`/`jobs`/`fg`, Ctrl+C on `while :; do :; done`,
+  `(while :; do :; done) &` then `echo hi`, `cat` + Ctrl+Z + `kill -9 %1`,
+  `trap 'echo caught' INT`, `stty tostop; echo x &`. 5. On failure send
+  `/fex/fex-switch2-guest.log`. Persistence/recovery pairs skipped (no
+  inode-store or journal changes).
+  Open: the **EXPERIMENT** SD diagnostics (`SdBufferError`, `SdPathError`,
+  0.13.12-diag) stay until `SD result 2001-0106` (seen in 0.13.5 and
+  0.13.11, both after `SaveInodeStore` with the large post-Debian inode
+  store) recurs and is explained, or are reverted before the milestone
+  commit. Rootfs setup follow-up: configure base-passwd first (debootstrap
+  order); a fresh `dpkg --configure -a` needs a second run today.
+  Task 5/6 minors and Task 8 minor (pidfd_getfd ptrace check) are in the
+  ledger. `make debian-sysroot` now unpacks into a staging directory, so
+  re-running it works.
+- **Console 0.13.5 rootfs setup (2026-11-22, failed).** Packages 1-18
+  unpacked (tzdata fell back to snapshot.debian.org after security.debian.org
+  stalled). diffutils stopped at `/usr/share/locale/id/LC_MESSAGES/diffutils.mo`:
+  `SD result 2001-0106 (0x0000d401)`, kernel InvalidMemoryState, then "Guest
+  native move could not finish recovery" (the `.dpkg-new` rename path,
+  `MoveNativeEntry`). The log does not say which SD call failed.
+  **Experiment 0.13.6-diag:** `SdBufferError` logs the call, buffer address,
+  size and `svcQueryMemory` type/attr/perm of the buffer's first and last
+  page for every `fsFileRead`/`fsFileWrite`; `SdPathError` names the call and
+  paths for the inode-file and rename calls in that path; the recovery line
+  reports both error codes and the store's name and inode counts. Revert or
+  keep once the cause is known. Console: run the setup again (it resumes from
+  the cache) and send the log.
+  Also new in this build: a **Root shell** launcher item (Bash with uid and
+  gid 0, the same launch credentials a `.user` sidecar sets), because the
+  console has no other way to run `dpkg --configure -a` as root.
+  Launch PATH now follows Debian's login.defs: root gets
+  `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` and
+  `HOME=/root`, other users `/usr/local/bin:/usr/bin:/bin` (was `/bin:/usr/bin`
+  for everyone, so dpkg as root could not find `ldconfig` and
+  `start-stop-daemon` in `/sbin`).
+  Console 0.13.6-diag Root shell (22:24): uid 0 launch worked, but dpkg
+  still reported `ldconfig`/`start-stop-daemon` missing from PATH; the shell's
+  own output is not in the log, so the copied NRO most likely predates the
+  PATH change (built 22:20). **0.13.7-diag** carries both, and stops logging
+  routine PathNotFound from the inode-slot probes.
+  Console 0.13.7-diag (22:28): root PATH works; `dpkg --configure -a` ran
+  the maintainer scripts but every `#!` file failed in the runtime's execve
+  ("Expected a little-endian x86-64 ... ELF"), so only `#!/bin/sh` scripts
+  worked, through the shell's ENOEXEC fallback. debconf's
+  `#!/usr/bin/perl -w` frontend was then read by sh ("use: not found"),
+  debconf and libc6 postinst failed and the rest stopped on dependencies.
+  **0.13.8-diag:** execve implements binfmt_script (`GuestScript.h`,
+  `make check-guest-script` passes; ProcSuite `proc/exec_interpreter_script`
+  natively passes, full native suite 95 passed, 1 skipped). Console:
+  proc-suite + proc-suite-root 0 failed, then Root shell `dpkg --configure -a`.
+  Console 0.13.8-diag (22:38): perl and debconf scripts now run; all but
+  base-files and bash configured. base-files' postinst `chown root:root`
+  failed because base-passwd (which creates /etc/passwd) was configured after
+  it; debootstrap installs base-passwd first. ldconfig printed "Cannot mmap
+  file" for every library: MAP_SHARED of an SD file returned ENODEV.
+  **0.13.9-diag:** read-only MAP_SHARED of SD files (coherent views,
+  FsSuite `io/shared_readonly_file_mapping`, native 81 passed, 2 skipped).
+  Follow-up: the setup should configure base-passwd first as debootstrap
+  does.
+  Console 0.13.9-diag (user report, 2026-11-22): fs-suite and
+  fs-suite-root pass; Root shell `dpkg --configure -a` completes. The
+  downloaded log on the host was still the 0.13.8-diag run, so this result is
+  the user's observation only.
+  **0.13.10:** experiment reverted (SdBufferError/SdPathError wrappers; the
+  2001-0106 failure did not recur, so there is no evidence for it). The
+  recovery-failure log line keeps both error codes. Open: the 2001-0106
+  (InvalidMemoryState) failure from 0.13.5 is unexplained; if it recurs,
+  rebuild the experiment.
+- **Task 7 (2026-11-22, native done, console pending).** Restart review:
+  `ProcessInventory.md` "Interruption and restart" table; 12
+  `signal/restart_table_*` cases (epoll skips until Task 13). Fixes found:
+  blocking pipe/socket writes now queue every byte (`StreamProgress`;
+  a signal after queued bytes returns their count, `proc/blocking_pipe_write_is_complete`,
+  `signal/interrupted_pipe_write_returns_count`); Unix listen queues
+  backlog + 1 and caps at somaxconn 4096 (was clamp 1..16,
+  `proc/unix_listen_queues_backlog_plus_one`). `make check-proc-suite-native`:
+  110 passed, 0 failed, 1 skipped (uid 1000 and namespace root). NRO 0.13.10
+  builds. Next: Task 8 glue (credentials).
+- **Tasks 8 + 9 (2026-11-22, native done).** Credentials/capabilities glue
+  (Sonnet, `.superpowers/sdd/task-8-report.md`) and clocks glue (Sonnet,
+  `task-9-report.md`). Native `check-proc-suite-native`: uid 1000 140 passed,
+  0 failed, 6 skipped; namespace root 144 passed, 0 failed, 2 skipped.
+  `check-fs-suite-native` 81 passed, 2 skipped. Step-1 headers for Tasks
+  10/13/14 (`GuestTimers.h`, `GuestEpoll.h`, `GuestInotify.h`) pass their
+  host checks.
+- **Console 0.13.11 (staged, pending).** Covers Tasks 7-9. The proc-suite
+  `.args` sidecars now select `proc/ signal/ session/ cred/ clock/`
+  (alarm busy loop still excluded until Task 10). Artifacts:
+  `Source/Switch2/build/guest/fex-switch2-guest.nro`,
+  `Source/Switch2/build/guest/sd/fex`.
+- **Console 0.13.11 (2026-11-22, 23:21).** fs-suite-root exit 42,
+  filesystem-acceptance exit 0, Root shell `id`/`dpkg --audit`/`date`/`sleep`
+  and user `touch`/`rm` ran (screen output not in the log). fs-suite (uid
+  1000) exited 1 after `SD result 2001-0106 (0x0000d401)` and "Guest native
+  creation could not finish recovery" (second occurrence after 0.13.5's
+  diffutils rename; both paths end in `SaveInodeStore`). proc-suite and
+  proc-suite-root exited 1; the log has no TAP lines because Detailed logging
+  did not keep program stdout. Every run also logs `SD result 2002-3005`
+  (unexplained, runs still pass).
+  **0.13.12-diag:** Detailed logs now keep program output; EXPERIMENT: SD
+  buffer/path diagnostics are back (`SdBufferError`, `SdPathError`, error
+  codes in the creation-recovery line) until 2001-0106 is explained.
+- **Console 0.13.12-diag (23:28).** fs-suite 81 passed, 0 failed, 2 skipped
+  (2001-0106 did not recur); proc-suite 137/1/7 (`clock/all_ids_gettime`:
+  pid 1 is the runtime's virtual init, no process to read); proc-suite-root
+  141/2/2 (same, plus `cred/keepcaps_preserves_permitted`: PR_GET_KEEPCAPS and
+  PR_SET_KEEPCAPS rejected the garbage unused arguments glibc's variadic
+  prctl passes; Linux cap_task_prctl ignores them). `2002-3005` is Horizon's
+  out-of-range read past EOF, already mapped to a 0-byte read; it no longer
+  logs. **0.13.13-diag:** both fixes; the clock case reads the parent's CPU
+  clock. Native 140/0/6 and 144/0/2. SD diagnostics experiment still in.
+- **Console 0.13.13-diag (2026-11-22, passed).** proc-suite 138/0/7,
+  proc-suite-root 143/0/2, fs-suite 81/0/2, fs-suite-root 83/0/0;
+  2001-0106 did not recur (user report and log).
+- **Console 0.13.4 rootfs setup (2026-11-22, failed).** Packages 1-11
+  unpacked (the `:` names work). base-files stopped at `/dev` (error 95):
+  the setup chowned and chmodded the existing virtual `/dev`. **0.13.5:**
+  like dpkg, an existing directory keeps its owner and mode; only new
+  directories get the package's metadata. `make check-rootfs-setup` still
+  matches 93 packages, 6326 paths. Console checklist: 0.13.4's with banner
+  `0.13.5`; the setup resumes from the 11 cached packages.
+- **Console 0.13.3 rootfs setup (2026-11-22, failed).** Packages 1-2
+  unpacked; package 3 stopped at `/var/lib/dpkg/info/gcc-12-base:amd64.list`
+  ("Could not write the dpkg database"). Cause: the runtime returned EINVAL
+  for any name containing `:` or `\` (`ResolveSdPath`, `WalkSdPath`), though
+  Linux allows every byte but `/` and NUL. **0.13.4:** names with characters
+  FAT or Horizon reject (control characters, `" * : < > ? \ |`) now go to the
+  inode store like over-long paths (`SdNameUnsafe` in `NeedsOverflow`).
+  New fs-suite case `path/sd_reserved_characters` (files, directory and
+  children, symlink, hard link, renames store<->native both ways, ENOENT for
+  missing reserved names); native fs-suite 80 passed, 2 skipped. Console
+  checklist: 0.13.3's list with banner `0.13.4`, plus `/bin/fs-suite.elf`
+  and `/bin/fs-suite-root.elf` with 0 failed. The setup resumes from the
+  two cached packages.
+- **0.13.3 rebuild (Task 5/6 review fixes, rootfs setup).** The Opus review
+  of Tasks 5/6 (`.superpowers/sdd/task-5-6-review.md`) found C2: a dropped
+  orphaned-group stop signal dispatched a thread with an unfinished sleep or
+  futex wait; threads now dispatch only with no wait pending. I1 (CLONE_PIDFD
+  EMFILE use-after-free), I2 (wait4/waitid rusage now carries the child's CPU
+  time), I3 (pidfds poll readable only once the process exited, POLLHUP once
+  reaped) are fixed, as are the reparent exit signal and a stale foreground
+  group. New cases `proc/pidfd_not_readable_while_running`,
+  `proc/wait4_rusage_reports_child_time`; native 94 passed, 1 skipped, both
+  users. Open review minors are in the ledger.
+  New launcher item **Setup Debian rootfs** (`RootfsSetupHost.cpp`,
+  `GuestRootfsSetup.h`, XZ Embedded v2024-12-30 in `ThirdParty/xz-embedded`):
+  reads `/fex/setup/debian-rootfs.manifest` (from `make rootfs-manifest`,
+  `LinuxRuntime/RootfsManifest.py`: bookworm minbase = required + essential +
+  apt with dependencies, 93 packages, 32.0 MiB, usr-is-merged preferred over
+  usrmerge), downloads each package over HTTP from deb.debian.org or
+  security.debian.org (snapshot.debian.org fallback), checks size and SHA-256,
+  caches it in `/fex/setup/cache`, and unpacks it through the guest
+  filesystem as root (dpkg's .dpkg-new + rename, owners, modes, mtimes,
+  symlinks, hard links), writing `/var/lib/dpkg/status` (install ok unpacked),
+  `info/*.list` and control files, and `/etc/apt/sources.list`. Incomplete,
+  tracked: maintainer scripts do not run (`dpkg --configure -a` from the guest
+  later); device nodes are refused; the manifest is trusted from HTTPS on the
+  host without checking the Release signature. Host: `make check-rootfs-setup`
+  unpacked all 93 packages, 6326 paths match Python's ar/tar readers (type,
+  mode, size, content, mtime, owner, link target, dpkg .list and status).
+  Console checklist for 0.13.3:
+  1. Copy `Source/Switch2/build/guest/sd/fex` over SD `/fex` (it now includes
+     `/fex/setup/debian-rootfs.manifest`) and run
+     `Source/Switch2/build/guest/fex-switch2-guest.nro` (banner `0.13.3`).
+  2. `/bin/proc-suite.elf` and `/bin/proc-suite-root.elf`: 0 failed (95
+     cases, terminal ioctl case passes or skips).
+  3. `/bin/filesystem-acceptance.elf`: `ABI 42, coreutils 0, suite 42`.
+  4. Home > Setup Debian rootfs, A: 93 lines `[n/93] <package> <version>`,
+     then `Unpacked 93 packages...`. Run it a second time: it reuses the cache
+     and finishes without downloading.
+  5. Bash shell: `ls -l /usr/bin/apt /bin/dash /etc/apt/sources.list`,
+     `head -3 /var/lib/dpkg/status`, `/usr/bin/sleep 1; echo $?` (0).
+- **Console 0.13.2 (2026-11-22).** Filesystem acceptance passed.
+  proc-suite 82 passed, 9 failed; root 83 passed, 8 failed; 421/418
+  preemption switches, 0 unresolved. Causes, fixed in 0.13.3:
+  - `waitid` copied 24 siginfo bytes, dropping `si_status` (waitid_wexited_siginfo,
+    clone_pidfd_poll_exit). It now writes the 28 bytes Linux writes.
+  - `getsid`/`getpgid` returned ESRCH as an unsigned value (getsid_esrch).
+  - `execveat(AT_EMPTY_PATH)` used the SD path of the descriptor.
+  - getrlimit reported RLIMIT_NICE unlimited while setpriority enforced 0
+    (priority_rules as uid 1000); it now reports 0.
+  - A SIGCHLD handler interrupted `waitpid` although the child had already
+    exited (sa_nocldstop_suppresses). A woken IO, terminal or lock wait now
+    reruns its syscall before a pending signal is delivered, as Linux rescans
+    before checking signals.
+  - The bundle had no `/bin/sh` or `/bin/sleep` (exec_*, setpgid_after_exec).
+    StageDebian now installs `sleep`, `/usr/bin/timeout`, and Bash as
+    `/bin/sh` (the sysroot has no dash). `inotifywait` and procps `kill` are
+    still missing from the sysroot (Task 17 staging).
+  Console checklist: same as 0.13.2 below with banner `0.13.3`; expect 0
+  failed in both suites.
+- **0.13.2 (Tasks 5 and 6, Task 4 review fixes).** `GuestJobControl.h`
+  (wait statuses, wait option checks, wait4 selector, setpgid/setsid rules,
+  ISIG characters) with `check-guest-job-control`. Runtime:
+  - Lifecycle: `ExitProcess` (Linux do_exit/exit_notify) ends every thread,
+    reparents children to the nearest `PR_SET_CHILD_SUBREAPER` ancestor or a
+    virtual init (pid 1) that reaps at once, sends `PR_SET_PDEATHSIG`, hangs
+    up newly orphaned groups with stopped members (SIGHUP then SIGCONT), hangs
+    up the foreground group when a terminal-owning session leader exits, and
+    notifies the parent (`CLD_EXITED`/`CLD_KILLED`, exit signal; autoreap for
+    SIG_IGN or SA_NOCLDWAIT). The last thread's `exit` ends the process.
+  - Generic wait for `wait4` and `waitid` (P_ALL/PID/PGID/PIDFD, WEXITED,
+    WSTOPPED/WUNTRACED, WCONTINUED, WNOWAIT, WNOHANG, __WCLONE/__WALL),
+    ru_utime from per-process and per-thread CPU ticks, `getrusage`, `times`.
+  - Job control: default stop actions stop the process (`CLD_STOPPED` unless
+    SA_NOCLDSTOP), discarded for an orphaned group except SIGSTOP; SIGCONT
+    generation resumes it (`CLD_CONTINUED`); a stopped process only reacts to
+    SIGKILL. Sessions: `setsid`, `getsid`, Linux `setpgid` rules, the SIGCONT
+    same-session permission. The console is the controlling terminal of the
+    root session: TIOCGPGRP/TIOCSPGRP/TIOCGSID/TIOCSCTTY/TIOCNOTTY, background
+    reads get SIGTTIN, background TCSETS*/TCFLSH/TIOCSPGRP and TOSTOP writes get
+    SIGTTOU (EIO for an orphaned group or an ignored SIGTTIN), and ^C ^\ ^Z
+    signal the foreground group with echo and flush.
+  - Fork family: `clone` flag checks (EINVAL for sharing that separate
+    processes cannot do, EPERM/EINVAL for namespaces), CLONE_PARENT, VFORK
+    (parent waits until exec or exit), PIDFD, SETTLS, PARENT_SETTID, new
+    stack; `vfork`, `clone3`, `pidfd_open`, `pidfd_send_signal` (THREAD,
+    THREAD_GROUP, PROCESS_GROUP flags), `pidfd_getfd`, `execveat`.
+  - `prctl` PDEATHSIG, DUMPABLE, NAME, CHILD_SUBREAPER (others EINVAL),
+    `getpriority`/`setpriority` (Linux permission rules, nice stored only),
+    `personality`, `getcpu`, `sysinfo` thread count; exec sets the name.
+  - Task 4 review fixes: unblocked ignored signals are dropped on return to
+    user (I1); `kill`/`rt_sigqueueinfo` with a non-leader thread id signal
+    its process (I3); sigtimedwait's set no longer counts as blocked (M3);
+    SA_RESETHAND resets only the handler (M4); tkill truncates to pid_t (M5);
+    stored sa_mask drops SIGKILL/SIGSTOP (M7); fork keeps sigaltstack (M8);
+    the restart and pause cases wait for the main thread to block (I4).
+    The inventory is updated (I2); M6 and M9 are tracked there.
+  Host: `make -C Source/Switch2 check-guest-job-control check-guest-signals
+  check-guest-preempt check-guest-credentials check-guest-clocks
+  check-guest-eventfd` all ok; `check-proc-suite-native` 92 passed, 1 skipped
+  (no tty) as uid 1000 and namespace root. NRO 0.13.2 built, bundle staged;
+  both proc-suite `.args` select `proc/`, `signal/`, `session/` and exclude
+  `signal/alarm_interrupts_busy_loop` (Task 10). Console checklist:
+  1. Copy `Source/Switch2/build/guest/sd/fex` over SD `/fex` and run
+     `Source/Switch2/build/guest/fex-switch2-guest.nro` (banner `0.13.2`).
+  2. Run `/bin/proc-suite.elf`. Expect `92 passed, 0 failed` with
+     `session/terminal_job_control_ioctls` passing or skipped (93 cases).
+  3. Run `/bin/proc-suite-root.elf`. Same expectation as root.
+  4. Run `/bin/filesystem-acceptance.elf`. Expect `ABI 42, coreutils 0,
+     suite 42`.
+  5. In the interactive Bash (needs a keyboard that sends ^Z and ^C): `sleep 30 &`, `jobs` (Running), `kill %1`,
+     `jobs` (Terminated); `sleep 30`, then ^Z (`Stopped`), `bg`, `fg`, ^C
+     (prompt returns); `trap 'echo hup' HUP; kill -HUP $$` prints `hup`.
+  6. The log ends with `Guest preemption: N switches, 0 unresolved`.
+- **Console 0.13.0-exp1 (2026-11-22, failed).** Both `/bin/proc-suite.elf`
+  and `/bin/filesystem-acceptance.elf` crashed the app. The log stops right
+  after the forked child's first compiled block (pid 101), before its first
+  syscall, with no `Host fault` line. That is the first point where a second
+  thread exists, so the first preemption. exp1 write-protected the interrupt
+  page from a watchdog and handled the fault in a `--wrap`ped
+  `__libnx_exception_entry` (C code and SVCs in exception state, then
+  `svcReturnFromException` into the dispatcher stop handler). The failure
+  bypassed libnx's logging handler, so that path was removed rather than
+  debugged blind.
+- **Console 0.13.1 (2026-11-22).** Filesystem acceptance passed. proc-suite
+  and proc-suite-root (`proc/`, `signal/` minus `kill_zombie_succeeds`): 38
+  passed, 1 failed each. The failure is `signal/alarm_interrupts_busy_loop`
+  (timeout): `alarm` is Task 10. All Task 3 and Task 4 cases passed,
+  including `busy_child_is_killable` and both preempted-loop cases.
+  `Guest preemption: 796 switches, 0 unresolved` (root run 799).
+- **0.13.1 (Task 4 signal model).** `GuestSignals.h`
+  (default actions, 128-byte siginfo, `SignalQueue`: standard signals
+  collapse, realtime signals queue in order) with `check-guest-signals`.
+  Runtime: per-thread `Pending` and per-process `SharedPending` queues;
+  `SendSignal` (Linux prepare_signal: ignored-and-unblocked signals dropped,
+  SIGCONT/stop discard each other), `CanSignal` (kill_ok_by_cred; CAP_KILL =
+  euid 0 until Task 8, SIGCONT session rule waits for Task 6), `kill` for
+  every pid form, `tkill`, `tgkill`, `rt_sigqueueinfo`,
+  `rt_tgsigqueueinfo`, `rt_sigpending` (sizes up to 8), `pause`,
+  `rt_sigsuspend`, `rt_sigtimedwait`, `restart_syscall` (EINTR: no restart
+  blocks yet). `DeliverSignals` stacks one frame per caught signal like the
+  kernel's exit-to-user loop, passes the full siginfo, runs terminate/core
+  defaults on every thread of the process (wait status never has the core
+  flag: no dump is written), and ends waits with Linux restart rules
+  (`SA_RESTART` reruns read/write/wait4/lock/accept/connect and untimed futex
+  waits; sleeps, polls and signal waits give EINTR). getrlimit reports
+  RLIMIT_SIGPENDING 4096, the queue limit. Incomplete, tracked: default stop
+  actions leave the signal pending (Task 6). Native probes overrode the plan:
+  SIGPIPE carries `si_pid` = writer, `si_uid` = its real uid; Linux rejects
+  any `sigaction` act for SIGKILL/SIGSTOP, SIG_DFL included; realtime
+  handlers that block only their own signal run +1(7), +1(8), RTMIN(5).
+  Host: `make -C Source/Switch2 check-guest-signals` ok;
+  `check-proc-suite-native` 40 passed as uid 1000 and namespace root. NRO
+  0.13.1 built; bundle staged; both proc-suite `.args` select `proc/`,
+  `signal/` and exclude `signal/kill_zombie_succeeds` (needs waitid, Task 5).
+- **Console 0.13.0-exp4 (2026-11-22).** Filesystem acceptance passed.
+  proc-suite: `busy_threads_share_cpu`, `preempted_register_loop_is_exact`
+  and `getpid_matches_gettid_in_main_thread` ok; `preempted_call_loop_is_exact`
+  hit the 10 s harness timeout, but its child later ran `exit_group(0)`, so
+  its result check passed and only the 30M-call loop was too slow. The count
+  is now 3M. `Guest preemption: 1892 switches, 0 unresolved`. The harness's
+  SIGKILL got EOPNOTSUPP (fixed by Task 4).
+- **0.13.0-exp4 (Task 3 review fixes).** The Task 3 review
+  found two resume-RIP bugs that exp3's tests could not see:
+  - An entry-point poll resumed at the multiblock head (`GetGuestBlockEntry`),
+    so a poll at a call-return entry re-ran the code before the call.
+  - Back-edge targets map through RIP entries, which existed only at
+    instructions with side effects, so a register-only loop resumed at an
+    earlier instruction.
+  Fixes: every poll stores the host address of its resume point (an
+  `EntryLabel` bound at each entry point, or the branch target), resolved only
+  through `RestoreRIPFromHostPC`. `GenerateIR` records a RIP entry for every
+  instruction when `PollPendingInterrupt` is on. `OpenPreemptWindow` clears
+  the target word, so a stop that is not a poll is never resumed. The hints
+  use `Ready()` and are refreshed after every syscall. Only the instance that
+  started the watchdog stops it. New suite cases
+  `proc/preempted_register_loop_is_exact` and
+  `proc/preempted_call_loop_is_exact` pass natively (6/6 with the others).
+  `check-guest-preempt` and `check-guest-signals` pass. NRO and bundle are
+  built, and the staged `proc-suite.elf.args` selects the two new cases,
+  `busy_threads_share_cpu` and `getpid_matches_gettid_in_main_thread`.
+- **Console 0.13.0-exp3 (2026-11-22, passed).** `/bin/proc-suite.elf`
+  (`.args`: `proc/busy_threads_share_cpu`,
+  `proc/getpid_matches_gettid_in_main_thread`) exited 42 and the log reported
+  `Guest preemption: 22 switches, 0 unresolved`. Filesystem acceptance passed
+  on exp2 with the same preemption runtime. The Task 3 gate is passed.
+- **Console 0.13.0-exp2 (2026-11-22).** `/bin/filesystem-acceptance.elf`
+  passed (`ABI 42, coreutils 0, suite 42`) with preemption active.
+  `/bin/proc-suite.elf` hung: the log shows one preemption (`Preempted
+  tid=101 at rip=0x5740524353`, a block entry), the child resumed and
+  completed six syscalls, then nothing. Cause: `CondJump`
+  (`FEXCore/Source/Interface/Core/JIT/BranchOps.cpp`) emitted conditional
+  backward branches directly, without a poll, so a loop closed by a
+  conditional jump (`while (!Stop) n++;`) never saw the request.
+- **0.13.0-exp3.** With polls enabled, a conditional backward branch is
+  emitted as "inverted branch over; poll; `b` target", so every back-edge
+  polls. NRO built; the bundle is unchanged since exp1. Run the exp2
+  checklist below with banner `0.13.0-exp3`.
+- **Experiment 0.13.0-exp2 (Task 3, preemption gate).** No exceptions:
+  with `Context::SetPollPendingInterrupt(true)` the JIT loads the word at
+  `InterruptPollRequestOffset` (64) of `InterruptFaultPage` at every block
+  entry and before every backward branch. When it is nonzero it stores the
+  branch target's host address (0 at a block entry) at
+  `InterruptPollTargetOffset` (72), restores `sp` from
+  `ReturningStackLocation` and jumps to `Pointers.ThreadStopHandlerSpillSRA`,
+  the same exit FEX's HLT path uses, so `ExecuteThread` returns.
+  `Dispatch` rebuilds the guest RIP (`RestoreRIPFromHostPC` or
+  `GetGuestBlockEntry`). The watchdog thread (`PreemptWatchdog`) only writes
+  that word, after a 10 ms quantum when another thread could run.
+  `sched_yield` yields. Host: `make -C Source/Switch2 check-guest-preempt`
+  passed; `check-proc-suite-native` 4 passed as uid 1000 and namespace root;
+  NRO built. The FEX Linux build was not checked (this checkout lacks the
+  `External/jemalloc_glibc` and `External/rpmalloc` submodules). Console
+  checklist:
+  1. Copy `Source/Switch2/build/guest/sd/fex` over SD `/fex` and run
+     `Source/Switch2/build/guest/fex-switch2-guest.nro` (banner
+     `0.13.0-exp2`).
+  2. Run `/bin/proc-suite.elf` (its staged `.args` selects
+     `proc/busy_threads_share_cpu` and `proc/getpid_matches_gettid_in_main_thread`).
+     Expect `ok` for both and `2 passed, 0 failed`. Without preemption
+     `busy_threads_share_cpu` hangs.
+  3. Run `/bin/filesystem-acceptance.elf`. Expect `ABI 42, coreutils 0,
+     suite 42`.
+  4. The log must contain `Guest preemption: N switches, 0 unresolved`
+     with N > 0 after step 2, and `Preempted tid=... at rip=...` lines.
 - **Console 0.12.40 (2026-11-22).** The user reported that all FTP tests
   pass on the console.
 - **Console 0.12.36 (log of 2026-11-22).** Acceptance printed `ABI 42,
@@ -384,6 +812,22 @@ host execution and Switch 2 execution separately. Batch console checks
 until hardware evidence is required, then allow the requested 90-second
 response window before continuing. Increase the NRO version only when
 preparing a build for a new physical Switch 2 run.
+
+### Milestone 2 feature outline and acceptance
+
+| Group | Required behavior | Combined suite coverage |
+| --- | --- | --- |
+| Processes and sessions | fork/vfork/clone/clone3 lifecycles, exec variants, exit and exit_group, wait4/waitid selectors and states, reparenting, rusage and times, process groups and sessions, controlling terminal, pidfds, rlimits, priority, prctl subset | `proc/`, `session/` cases, Bash pipelines and job control |
+| Signals | Process and thread pending sets, default actions (terminate, core, ignore, stop, continue), queued realtime signals with siginfo, masks, suspend/wait/timedwait, restart semantics, alternate stacks, signalfd, pidfd signals | `signal/` cases, Bash traps, `kill`, `timeout` |
+| Credentials and capabilities | set*id transition rules, supplementary groups, filesystem IDs, capability sets and their transitions across set*id and exec | `cred/` cases run as uid 1000 and root |
+| Clocks and timers | All clock IDs incl. CPU and per-pid CPU clocks, resolution, settable realtime for root, sleeps, alarm, itimers, POSIX timers with overrun, timerfd | `clock/`, `timer/` cases, `sleep`, `timeout` |
+| Polling and watches | poll/select/pselect/ppoll readiness with signal masks, epoll (LT/ET/ONESHOT, nesting, description lifetime), eventfd, inotify events and watch lifetime | `poll/`, `epoll/`, `event/`, `inotify/` cases, `inotifywait` |
+
+Use one combined acceptance program: `/bin/process-acceptance.elf` is a
+wrapper that runs `proc-suite.elf` and `ProcessTools.sh`. Pair the
+console run with an interactive job-control checklist. Report host
+execution and Switch 2 execution separately, and track every syscall in
+[ProcessInventory.md](ProcessInventory.md).
 
 ### Filesystem implementation in progress
 

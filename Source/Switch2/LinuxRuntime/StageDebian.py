@@ -14,7 +14,7 @@ def elf_info(path, *options):
 
 
 def stage(source, output, probe, glibc_probe, process_probe, filesystem_probe=None, fs_suite=None,
-          name_limit_probe=None):
+          name_limit_probe=None, proc_suite=None, rootfs_manifest=None, process_acceptance=None):
     root = output / "fex/rootfs"
     library_dirs = ["lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu"]
     installed = set()
@@ -47,6 +47,11 @@ def stage(source, output, probe, glibc_probe, process_probe, filesystem_probe=No
     for executable in ("ls", "bash"):
         install(source / "bin" / executable, root / "bin" / executable)
     install(source / "bin/true", root / "bin/true")
+    # Job-control tools for milestone 2. The sysroot has no dash, so Bash
+    # (which runs in POSIX mode as sh) provides /bin/sh.
+    install(source / "bin/sleep", root / "bin/sleep")
+    install(source / "usr/bin/timeout", root / "usr/bin/timeout")
+    install(source / "bin/bash", root / "bin/sh")
     install(probe, output / "fex/games/thread-ipc.elf")
     install(glibc_probe, output / "fex/games/glibc-probe.elf")
     install(process_probe, output / "fex/games/process-probe.elf")
@@ -112,8 +117,32 @@ def stage(source, output, probe, glibc_probe, process_probe, filesystem_probe=No
         install(fs_suite, root / "bin/fs-suite-root.elf")
         (root / "bin/fs-suite-root.elf.user").write_text("0 0\n", encoding="utf-8")
 
+    if proc_suite:
+        # Like fs-suite: default user plus a root variant via the sidecar.
+        install(proc_suite, root / "bin/proc-suite.elf")
+        install(proc_suite, root / "bin/proc-suite-root.elf")
+        (root / "bin/proc-suite-root.elf.user").write_text("0 0\n", encoding="utf-8")
+        # Name every group so a stale filter on the SD card is replaced.
+        groups = "".join(f"{group}/\n" for group in (
+            "proc", "signal", "session", "cred", "clock", "timer", "event", "poll", "epoll", "inotify"))
+        for name in ("proc-suite.elf.args", "proc-suite-root.elf.args"):
+            (root / "bin" / name).write_text(groups, encoding="utf-8")
+
+    if process_acceptance:
+        # Debian tools for the milestone 2 acceptance script.
+        for tool in ("bin/cat", "bin/date", "bin/grep", "bin/kill", "bin/mkdir", "bin/rm", "bin/touch",
+                     "usr/bin/head", "usr/bin/seq", "usr/bin/tr", "usr/bin/wc", "usr/bin/inotifywait"):
+            install(source / tool, root / tool)
+        shutil.copyfile(Path(__file__).with_name("ProcessTools.sh"), root / "bin/process-tools.sh")
+        install(process_acceptance, root / "bin/process-acceptance.elf")
+
     if name_limit_probe:
         install(name_limit_probe, root / "bin/name-limit-probe.elf")
+
+    if rootfs_manifest:
+        setup = output / "fex/setup"
+        setup.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(rootfs_manifest, setup / "debian-rootfs.manifest")
 
 
 
@@ -127,6 +156,9 @@ if __name__ == "__main__":
     parser.add_argument("--filesystem-probe", type=Path, help="Include filesystem and coreutils tests")
     parser.add_argument("--fs-suite", type=Path, help="Include the filesystem compatibility suite")
     parser.add_argument("--name-limit-probe", type=Path, help="Include the name length probe")
+    parser.add_argument("--proc-suite", type=Path, help="Include the process and event compatibility suite")
+    parser.add_argument("--rootfs-manifest", type=Path, help="Stage the Debian rootfs download manifest")
+    parser.add_argument("--process-acceptance", type=Path, help="Include the process acceptance wrapper and tools")
     args = parser.parse_args()
     stage(
         args.source.resolve(), args.output.resolve(), args.probe.resolve(),
@@ -134,4 +166,7 @@ if __name__ == "__main__":
         args.filesystem_probe.resolve() if args.filesystem_probe else None,
         args.fs_suite.resolve() if args.fs_suite else None,
         args.name_limit_probe.resolve() if args.name_limit_probe else None,
+        args.proc_suite.resolve() if args.proc_suite else None,
+        args.rootfs_manifest.resolve() if args.rootfs_manifest else None,
+        args.process_acceptance.resolve() if args.process_acceptance else None,
     )

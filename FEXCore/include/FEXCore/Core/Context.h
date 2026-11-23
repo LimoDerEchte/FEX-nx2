@@ -67,6 +67,10 @@ public:
    * @return true if we loaded code
    */
   FEX_DEFAULT_VISIBILITY virtual bool InitCore() = 0;
+  // Poll InterruptFaultPage for a preemption request at block entries and
+  // backward branches (see InterruptPollRequestOffset). Must be called
+  // before InitCore. Off by default.
+  FEX_DEFAULT_VISIBILITY virtual void SetPollPendingInterrupt(bool Enabled) = 0;
 
   /**
    * @brief Executes the supplied thread context on the current thread until a return is requested

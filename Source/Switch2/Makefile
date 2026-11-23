@@ -218,9 +218,16 @@ debian-sysroot:
 	python3 -I LinuxRuntime/FetchDebian.py "$(DEBIAN_ROOT)"
 
 FILESYSTEM_TEST_DIR ?= $(BUILD)/guest/sd
+.PHONY: rootfs-manifest
+rootfs-manifest: $(BUILD)/debian-rootfs.manifest
+
+$(BUILD)/debian-rootfs.manifest: LinuxRuntime/RootfsManifest.py LinuxRuntime/FetchDebian.py
+	@mkdir -p $(BUILD)
+	python3 -I LinuxRuntime/RootfsManifest.py $@
+
 .PHONY: filesystem-runtime
-filesystem-runtime: $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf
-	python3 LinuxRuntime/StageDebian.py "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 1,3,$^) --filesystem-probe $(word 4,$^) --fs-suite $(word 5,$^) --name-limit-probe $(word 6,$^)
+filesystem-runtime: $(BUILD)/debian-rootfs.manifest $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf
+	python3 LinuxRuntime/StageDebian.py "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 2,4,$^) --filesystem-probe $(word 5,$^) --fs-suite $(word 6,$^) --name-limit-probe $(word 7,$^) --proc-suite $(word 8,$^) --process-acceptance $(word 9,$^) --rootfs-manifest $(word 1,$^)
 
 # Filesystem compatibility suite: the Debian guest ELF and a native reference
 # run on the host kernel, as the current user and, where user namespaces
@@ -247,13 +254,35 @@ check-fs-suite-native: $(BUILD)/fs-suite-host
 		echo "Skipping the namespace-root run: unshare --map-auto is unavailable"; \
 	fi
 
+# Process and event compatibility suite: same layout as the filesystem suite.
+.PHONY: proc-suite check-proc-suite-native
+proc-suite: $(BUILD)/proc-suite-debian.elf
+
+$(BUILD)/proc-suite.o: LinuxRuntime/ProcSuite.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/process-acceptance.o: LinuxRuntime/ProcessAcceptance.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/proc-suite-host: LinuxRuntime/ProcSuite.c | $(BUILD)
+	$(HOST_X86_CC) -std=gnu11 -O2 -Wall -Wextra -Werror $< -o $@
+
+check-proc-suite-native: $(BUILD)/proc-suite-host
+	mkdir -p $(BUILD)/proc-suite-native
+	cd $(BUILD)/proc-suite-native && { ../proc-suite-host; test $$? -eq 42; }
+	if unshare --map-root-user --map-auto true 2>/dev/null; then \
+		cd $(BUILD)/proc-suite-native && { unshare --map-root-user --map-auto ../proc-suite-host; test $$? -eq 42; }; \
+	else \
+		echo "Skipping the namespace-root run: unshare --map-auto is unavailable"; \
+	fi
+
 .PHONY: filesystem-probe
 filesystem-probe: $(BUILD)/filesystem-probe-debian.elf
 
 $(BUILD)/filesystem-probe.o: LinuxRuntime/FilesystemProbe.c | $(BUILD)
 	$(HOST_X86_CC) -m64 -march=x86-64 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
 
-$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
+$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
 	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(DEBIAN_LIBS)" \
 		"$(DEBIAN_CRT)/Scrt1.o" "$(DEBIAN_CRT)/crti.o" $< "$(DEBIAN_LIBS)/libc.so.6" "$(DEBIAN_CRT)/crtn.o" -o $@
 
@@ -307,3 +336,89 @@ check-guest-file-punch: $(BUILD)/guest-file-punch-test
 
 $(BUILD)/guest-file-punch-test: LinuxRuntime/GuestFilePunchTest.cpp GuestFilePunch.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-preempt
+check-guest-preempt: $(BUILD)/guest-preempt-test
+	$<
+
+$(BUILD)/guest-preempt-test: LinuxRuntime/GuestPreemptTest.cpp GuestPreempt.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-credentials
+check-guest-credentials: $(BUILD)/guest-credentials-test
+	$<
+
+$(BUILD)/guest-credentials-test: LinuxRuntime/GuestCredentialsTest.cpp GuestCredentials.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-clocks
+check-guest-clocks: $(BUILD)/guest-clocks-test
+	$<
+
+$(BUILD)/guest-clocks-test: LinuxRuntime/GuestClocksTest.cpp GuestClocks.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-eventfd
+check-guest-eventfd: $(BUILD)/guest-eventfd-test
+	$<
+
+$(BUILD)/guest-eventfd-test: LinuxRuntime/GuestEventFdTest.cpp GuestEventFd.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-signals
+check-guest-signals: $(BUILD)/guest-signals-test
+	$<
+
+$(BUILD)/guest-signals-test: LinuxRuntime/GuestSignalsTest.cpp GuestSignals.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-job-control
+check-guest-job-control: $(BUILD)/guest-job-control-test
+	$<
+
+$(BUILD)/guest-job-control-test: LinuxRuntime/GuestJobControlTest.cpp GuestJobControl.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-inotify
+check-guest-inotify: $(BUILD)/guest-inotify-test
+	$<
+
+$(BUILD)/guest-inotify-test: LinuxRuntime/GuestInotifyTest.cpp GuestInotify.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-epoll
+check-guest-epoll: $(BUILD)/guest-epoll-test
+	$<
+
+$(BUILD)/guest-epoll-test: LinuxRuntime/GuestEpollTest.cpp GuestEpoll.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-timers
+check-guest-timers: $(BUILD)/guest-timers-test
+	$<
+
+$(BUILD)/guest-timers-test: LinuxRuntime/GuestTimersTest.cpp GuestTimers.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-script
+check-guest-script: $(BUILD)/guest-script-test
+	$<
+
+$(BUILD)/guest-script-test: LinuxRuntime/GuestScriptTest.cpp GuestScript.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+# Debian rootfs setup (launcher menu): unpacker checks against Python's
+# ar/tar readers on every package of the manifest.
+XZ_EMBEDDED := ThirdParty/xz-embedded
+XZ_DEFINES := -DXZ_USE_CRC64 -DXZ_USE_SHA256 -DXZ_DEC_X86 -DXZ_DEC_CONCATENATED
+XZ_SOURCES := $(addprefix $(XZ_EMBEDDED)/,xz_crc32.c xz_crc64.c xz_sha256.c xz_dec_stream.c xz_dec_lzma2.c xz_dec_bcj.c)
+
+$(BUILD)/guest-rootfs-setup-test: LinuxRuntime/GuestRootfsSetupTest.cpp GuestRootfsSetup.h $(XZ_SOURCES) | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror -I. $(XZ_DEFINES) -c LinuxRuntime/GuestRootfsSetupTest.cpp -o $@.o
+	$(foreach Source,$(XZ_SOURCES),cc -std=gnu11 -O2 -I$(XZ_EMBEDDED) $(XZ_DEFINES) -c $(Source) -o $(BUILD)/$(notdir $(Source:.c=.o)) &&) true
+	$(HOST_CXX) $@.o $(addprefix $(BUILD)/,$(notdir $(XZ_SOURCES:.c=.o))) -o $@
+
+.PHONY: check-rootfs-setup
+check-rootfs-setup: $(BUILD)/guest-rootfs-setup-test $(BUILD)/debian-rootfs.manifest
+	$(BUILD)/guest-rootfs-setup-test
+	python3 -I LinuxRuntime/CheckRootfsSetup.py $(BUILD)/debian-rootfs.manifest $(BUILD)/rootfs-manifest-cache $(BUILD)/guest-rootfs-setup-test $(BUILD)/rootfs-setup-native

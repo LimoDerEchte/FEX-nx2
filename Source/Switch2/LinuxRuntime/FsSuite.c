@@ -316,6 +316,29 @@ TEST(io, read_write_roundtrip) {
   CHECK(write(FD, "", 0) == 0);
 }
 
+TEST(io, shared_readonly_file_mapping) {
+  // ldconfig maps libraries with PROT_READ, MAP_SHARED on a read-only
+  // descriptor; the mapping follows later writes through other descriptors.
+  int Writer, Reader;
+  OK(Writer = Create("mapped", "abcdef"));
+  OK(Reader = openat(Dir, "mapped", O_RDONLY | O_CLOEXEC));
+  char *Map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, Reader, 0);
+  CHECK(Map != MAP_FAILED);
+  if (Map == MAP_FAILED) return;
+  CHECK(!memcmp(Map, "abcdef", 6) && Map[6] == 0);
+  CHECK(pwrite(Writer, "XY", 2, 1) == 2);
+  CHECK(!memcmp(Map, "aXYdef", 6));
+  CHECK(close(Reader) == 0); // the mapping keeps the file
+  CHECK(pwrite(Writer, "Z", 1, 5) == 1);
+  CHECK(!memcmp(Map, "aXYdeZ", 6));
+  FAILS(mprotect(Map, 4096, PROT_READ | PROT_WRITE), EACCES);
+  CHECK(munmap(Map, 4096) == 0);
+  OK(Reader = openat(Dir, "mapped", O_RDONLY | O_CLOEXEC));
+  FAILS(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, Reader, 0) == MAP_FAILED ? -1 : 0, EACCES);
+  close(Reader);
+  close(Writer);
+}
+
 TEST(io, positional_io_keeps_offset) {
   int FD;
   char Buffer[4] = {0};
@@ -695,6 +718,65 @@ TEST(path, name_too_long) {
            getcwd(Where, sizeof(Where)) ? Where : "?");
     Fail(__LINE__, "MakeFile(255-byte name)", -1, Error, 0);
   }
+}
+
+// Linux names may hold any byte but '/' and NUL; FAT and Horizon reject
+// " * : < > ? \ | and control characters (dpkg writes "libc6:amd64.list").
+static int HasEntry(const char *Name) {
+  const int FD = openat(Dir, ".", O_RDONLY | O_DIRECTORY);
+  DIR *Stream = FD < 0 ? NULL : fdopendir(FD);
+  int Found = 0;
+  for (struct dirent *Entry; Stream && (Entry = readdir(Stream));) Found |= !strcmp(Entry->d_name, Name);
+  if (Stream) closedir(Stream);
+  return Found;
+}
+
+TEST(path, sd_reserved_characters) {
+  static const char *const Names[] = {"pkg:amd64.list", "q?mark", "star*", "quote\"", "lt<gt>", "pipe|", "back\\slash", "ctl\001x"};
+  for (size_t Index = 0; Index < sizeof(Names) / sizeof(Names[0]); ++Index) {
+    int FD;
+    OK(FD = openat(Dir, Names[Index], O_RDWR | O_CREAT | O_EXCL, 0640));
+    CHECK(write(FD, "named", 5) == 5);
+    OK(close(FD));
+    struct stat Info;
+    OK(fstatat(Dir, Names[Index], &Info, 0));
+    CHECK(S_ISREG(Info.st_mode) && Info.st_size == 5 && (Info.st_mode & 07777) == 0640);
+    CHECK(HasEntry(Names[Index]));
+  }
+  // Missing reserved names are ENOENT, not a backend error.
+  FAILS(openat(Dir, "missing:file", O_RDONLY), ENOENT);
+  FAILS(unlinkat(Dir, "missing:file", 0), ENOENT);
+  FAILS(mkdirat(Dir, "missing:dir/child", 0755), ENOENT);
+  // Directories, their children, links and renames in both directions.
+  OK(mkdirat(Dir, "dir:x", 0750));
+  OK(MakeFile("dir:x/a:b", "inside"));
+  OK(MakeFile("dir:x/plain", "plain"));
+  OK(symlinkat("target:t", Dir, "link:l"));
+  char Target[32] = {0};
+  CHECK(readlinkat(Dir, "link:l", Target, sizeof(Target)) == 8 && !strcmp(Target, "target:t"));
+  OK(linkat(Dir, "pkg:amd64.list", Dir, "hard:link", 0));
+  struct stat Info;
+  OK(fstatat(Dir, "hard:link", &Info, 0));
+  CHECK(Info.st_nlink == 2);
+  OK(renameat(Dir, "pkg:amd64.list", Dir, "native-name"));
+  OK(renameat(Dir, "native-name", Dir, "back:again"));
+  char Buffer[8] = {0};
+  int FD;
+  OK(FD = openat(Dir, "back:again", O_RDONLY));
+  CHECK(read(FD, Buffer, 5) == 5 && !memcmp(Buffer, "named", 5));
+  OK(close(FD));
+  OK(renameat(Dir, "dir:x", Dir, "dir-plain"));
+  OK(fstatat(Dir, "dir-plain/a:b", &Info, 0));
+  OK(renameat(Dir, "dir-plain", Dir, "dir:y"));
+  OK(fstatat(Dir, "dir:y/plain", &Info, 0));
+  for (size_t Index = 1; Index < sizeof(Names) / sizeof(Names[0]); ++Index) OK(unlinkat(Dir, Names[Index], 0));
+  OK(unlinkat(Dir, "back:again", 0));
+  OK(unlinkat(Dir, "hard:link", 0));
+  OK(unlinkat(Dir, "link:l", 0));
+  OK(unlinkat(Dir, "dir:y/a:b", 0));
+  OK(unlinkat(Dir, "dir:y/plain", 0));
+  OK(unlinkat(Dir, "dir:y", AT_REMOVEDIR));
+  CHECK(!HasEntry("dir:y"));
 }
 
 TEST(path, mkdir_rmdir) {

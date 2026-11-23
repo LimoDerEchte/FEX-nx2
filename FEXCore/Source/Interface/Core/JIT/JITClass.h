@@ -637,7 +637,7 @@ private:
   void EmitDivllu(ARMEmitter::Register Quotient, ARMEmitter::Register Remainder, ARMEmitter::Register Upper, ARMEmitter::Register Lower,
                   ARMEmitter::Register Divisor);
 
-  void EmitSuspendInterruptCheck();
+  void EmitSuspendInterruptCheck(const ARMEmitter::BackwardLabel* ResumeTarget);
 
   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
 

@@ -824,7 +824,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 #endif
   // Generate IR + Meta Info
   auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
-    GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
+    GenerateIR(Thread, GuestRIP, Config.GDBSymbols() || Config.PollPendingInterrupt, MaxInst);
 #ifdef __SWITCH2__
   FEXCore::Switch2::TraceGuest("IR complete", GuestRIP, TotalInstructions);
 #endif
