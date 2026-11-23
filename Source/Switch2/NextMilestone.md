@@ -15,11 +15,15 @@
   (InvalidMemoryState, 0xd401) up to two times and logs each retry (the
   user's decision; the cause stays unknown). 0.13.18 passed the host checks
   and builds; it has not had its own console run.
-- **Next.** Choose milestone 3 from the backlog below (procfs
-  `/proc/<pid>/{stat,fd,...}` for `ps`/`pgrep` and `event/anon_inode_names`,
-  networking, or desktop IPC); write its plan before code. Graphics stays
-  on `shelf/graphics`. Open minors: rootfs setup should configure
-  base-passwd first; Task 5/6/8 minors in `.superpowers/sdd/progress.md`.
+- **Next.** Milestone 3, memory and communication (virtual memory, pipes
+  and IPC, sockets; see
+  [Active milestone sequence](#active-milestone-sequence--linux-guest-kernel-compatibility)).
+  Write its plan and inventory before code. procfs (`/proc/<pid>/stat`,
+  `/fd` for `ps`/`pgrep` and `event/anon_inode_names`), devfs, ioctls and
+  the 137 entries outside the three groups are reconciled after milestone 3.
+  Graphics stays on `shelf/graphics`. Open minors: rootfs setup should
+  configure base-passwd first; Task 5/6/8 minors in
+  `.superpowers/sdd/progress.md`.
 - **History.** Milestone 2 console runs 0.13.1-0.13.17 follow.
 
 - **Status (2026-11-22).** Milestone 1 (filesystem) is **complete** and
