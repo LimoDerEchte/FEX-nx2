@@ -32,6 +32,17 @@ APP_AUTHOR := FEX Switch 2 fork
 .PHONY: all clean
 all: $(TARGET).nro
 
+# Milestone 3 SDK probe: memory, faults, threads and sockets on the console.
+M3PROBE := $(BUILD)/fex-switch2-m3probe
+.PHONY: m3-probe
+m3-probe: $(M3PROBE).nro
+$(M3PROBE).elf: $(BUILD)/Milestone3Probe.o Makefile
+	$(LD) $(LDFLAGS) $(BUILD)/Milestone3Probe.o $(OVERLAY_LIBPATHS) $(LIBPATHS) -lnx -o $@
+$(M3PROBE).nacp: APP_TITLE := FEX Switch 2 M3 Probe
+$(M3PROBE).nacp: | $(BUILD)
+$(M3PROBE).nro: $(M3PROBE).elf $(M3PROBE).nacp $(APP_ICON)
+$(M3PROBE).nro: NROFLAGS = --icon=$(APP_ICON) --nacp=$(M3PROBE).nacp
+
 ifneq ($(FMT_HEADERS),)
 $(FMT_HEADERS): | $(BUILD)
 	mkdir -p $(@D)
@@ -51,6 +62,7 @@ $(TARGET).nro: $(TARGET).elf $(TARGET).nacp $(APP_ICON)
 $(TARGET).nro: NROFLAGS = --icon=$(APP_ICON) --nacp=$(TARGET).nacp
 
 clean:
+	$(RM) $(BUILD)/Milestone3Probe.o $(BUILD)/Milestone3Probe.d $(M3PROBE).elf $(M3PROBE).nacp $(M3PROBE).nro
 	$(RM) $(BUILD)/JitProbe.o $(BUILD)/JitProbe.d $(TARGET).elf $(TARGET).nacp $(TARGET).nro $(FMT_HEADERS) $(BUILD)/fex-hello.o $(BUILD)/fex-hello.elf
 	$(RM) $(BUILD)/maze-start.o $(BUILD)/maze.o $(MAZE_DIR)/sd-maze.elf $(MAZE_DIR)/sd-maze.elf.args $(MAZE_DIR)/data/maze.txt
 	$(RM) $(BUILD)/texture-start.o $(BUILD)/texture-demo.o $(GRAPHICS_DIR)/texture-demo.elf $(GRAPHICS_DIR)/data/sprite.rgba

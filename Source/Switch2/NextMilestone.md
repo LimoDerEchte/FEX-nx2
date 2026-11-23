@@ -18,7 +18,13 @@
 - **Next.** Milestone 3, memory and communication (virtual memory, pipes
   and IPC, sockets; see
   [Active milestone sequence](#active-milestone-sequence--linux-guest-kernel-compatibility)).
-  Write its plan and inventory before code. procfs (`/proc/<pid>/stat`,
+  The plan is [Milestone3Plan.md](Milestone3Plan.md) (written
+  2026-11-23): 5 Sonnet work packages, 5 Sonnet reviewers, then an Opus
+  final pass with the suite and console run. Phase A has not started.
+  SDK risks and the EXPERIMENT
+  probe (`make m3-probe`, `build/fex-switch2-m3probe.nro`, log
+  `sdmc:/fex/m3probe.log`) are in [Milestone3Sdk.md](Milestone3Sdk.md);
+  its console results feed the plan. procfs (`/proc/<pid>/stat`,
   `/fd` for `ps`/`pgrep` and `event/anon_inode_names`), devfs, ioctls and
   the 137 entries outside the three groups are reconciled after milestone 3.
   Graphics stays on `shelf/graphics`. Open minors: rootfs setup should
