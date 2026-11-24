@@ -24,10 +24,17 @@
   months, else `%b %e  %Y`). Host: `make -C Source/Switch2 check-guest-ftp`
   0 failed. Console 0.14.3: FileZilla lists, browses, downloads and uploads
   with correct names and paths.
-- **Next.** Reconcile the 137 syscall entries outside the three
-  groups and kernel-visible interfaces (procfs `/proc/<pid>/stat` and
-  `/fd`, devfs, ioctls) before claiming full coverage. Graphics stays on
-  `shelf/graphics` until then.
+- **Next.** Milestone 4, containers and scheduling
+  ([Milestone4Plan.md](Milestone4Plan.md)): namespaces, mounts,
+  `pivot_root`/`chroot`, seccomp, `sched_*`, and Linux errors for the
+  machine-wide calls. Then milestone 5, 32-bit guests
+  ([Milestone5Plan.md](Milestone5Plan.md)), and milestone 6, `/proc`,
+  `/sys`, `/dev` and input ([Milestone6Plan.md](Milestone6Plan.md)). The
+  90 uninventoried syscalls and the open rows of milestones 1–3 are in
+  [RemainingSyscalls.md](RemainingSyscalls.md). Process for each
+  milestone (AGENTS.md): sequential Sonnet task agents, one Sonnet review
+  of the whole milestone, then Opus writes the suite and runs console
+  debugging. `ptrace` is future work; graphics is in no milestone.
 - **Status (2026-11-23).** Milestone 2 (processes and events) is
   **complete** and committed on `nx2`. Console acceptance on 0.13.17-diag:
   `/bin/process-acceptance.elf` `suite 42, tools 42` (proc-suite 240 passed,

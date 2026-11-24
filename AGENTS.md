@@ -26,6 +26,13 @@ software on Switch 2 through the normal launcher.
 
 - Work on `nx2`; commit once per completed milestone after its console
   acceptance passes.
+- Milestone process: write a plan split into a small number of tasks.
+  One Sonnet agent implements each task, one task after another, never
+  in parallel. Then one Sonnet agent reviews the whole milestone. Then
+  the Opus orchestrator fixes review findings, writes the test suite and
+  hands the user console runs to debug until acceptance passes.
+- Graphics is in no milestone: it needs its own
+  architecture planning first.
 - Start from the [restart checkpoint](Source/Switch2/NextMilestone.md#restart-checkpoint):
   run `git status --short --branch` and review diffs and untracked files
   first. Preserve the user's in-progress changes.
