@@ -14,7 +14,7 @@ def elf_info(path, *options):
 
 
 def stage(source, output, probe, glibc_probe, process_probe, filesystem_probe=None, fs_suite=None,
-          name_limit_probe=None, proc_suite=None, rootfs_manifest=None, process_acceptance=None):
+          name_limit_probe=None, proc_suite=None, rootfs_manifest=None, process_acceptance=None, comm_suite=None, comm_acceptance=None):
     root = output / "fex/rootfs"
     library_dirs = ["lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu"]
     installed = set()
@@ -136,6 +136,26 @@ def stage(source, output, probe, glibc_probe, process_probe, filesystem_probe=No
         shutil.copyfile(Path(__file__).with_name("ProcessTools.sh"), root / "bin/process-tools.sh")
         install(process_acceptance, root / "bin/process-acceptance.elf")
 
+    if comm_suite:
+        # Memory and communication suite: default user plus a root variant.
+        install(comm_suite, root / "bin/comm-suite.elf")
+        install(comm_suite, root / "bin/comm-suite-root.elf")
+        (root / "bin/comm-suite-root.elf.user").write_text("0 0\n", encoding="utf-8")
+
+    if comm_acceptance:
+        # Debian tools for the milestone 3 acceptance script.
+        for tool in ("bin/cat", "bin/mkdir", "bin/rm", "bin/grep", "bin/sleep", "usr/bin/head", "usr/bin/seq",
+                     "usr/bin/tr", "usr/bin/wc", "usr/bin/timeout", "usr/bin/sort",
+                     "usr/bin/sha256sum", "usr/bin/mkfifo", "usr/bin/xz", "usr/bin/getent"):
+            file = source / tool
+            if not file.is_file():
+                file = source / ("usr/bin" if tool.startswith("bin/") else "bin") / Path(tool).name
+            install(file, root / tool)
+        # Debian's nc is the netcat-openbsd alternative.
+        install(source / "bin/nc.openbsd", root / "bin/nc")
+        shutil.copyfile(Path(__file__).with_name("CommTools.sh"), root / "bin/comm-tools.sh")
+        install(comm_acceptance, root / "bin/comm-acceptance.elf")
+
     if name_limit_probe:
         install(name_limit_probe, root / "bin/name-limit-probe.elf")
 
@@ -159,6 +179,8 @@ if __name__ == "__main__":
     parser.add_argument("--proc-suite", type=Path, help="Include the process and event compatibility suite")
     parser.add_argument("--rootfs-manifest", type=Path, help="Stage the Debian rootfs download manifest")
     parser.add_argument("--process-acceptance", type=Path, help="Include the process acceptance wrapper and tools")
+    parser.add_argument("--comm-suite", type=Path, help="Include the memory and communication compatibility suite")
+    parser.add_argument("--comm-acceptance", type=Path, help="Include the communication acceptance wrapper and tools")
     args = parser.parse_args()
     stage(
         args.source.resolve(), args.output.resolve(), args.probe.resolve(),
@@ -169,4 +191,6 @@ if __name__ == "__main__":
         args.proc_suite.resolve() if args.proc_suite else None,
         args.rootfs_manifest.resolve() if args.rootfs_manifest else None,
         args.process_acceptance.resolve() if args.process_acceptance else None,
+        args.comm_suite.resolve() if args.comm_suite else None,
+        args.comm_acceptance.resolve() if args.comm_acceptance else None,
     )

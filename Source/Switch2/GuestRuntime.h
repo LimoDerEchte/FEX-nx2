@@ -21,6 +21,8 @@ extern LogLevel Logging;
 extern bool GraphicsActive;
 
 void WriteLog(const char* Text);
+// Returns all guest arena memory and the loader's heap size; call once before the launcher exits.
+void ShutdownGuestArena();
 void WriteGuestOutput(const char* Text);
 void PrintStage(const char* Text);
 void WriteRunCheckpoint(const char* Text);

@@ -8,6 +8,7 @@
 // /fex/setup/cache so an interrupted setup resumes without downloading again.
 #include "GuestRootfsSetup.h"
 #include "GuestRuntime.h"
+#include "HostNet.h"
 
 #include <switch.h>
 
@@ -288,11 +289,11 @@ void RunRootfsSetup(PadState& Pad, const std::string& InodeLayoutError) {
   std::string Result;
   if (!Nifm || R_FAILED(nifmGetCurrentIpAddress(&HostAddress)) || !HostAddress) {
     Result = "The console is not connected to a network.";
-  } else if (R_FAILED(socketInitializeDefault())) {
+  } else if (!Switch2Guest::HostNet::Acquire()) {
     Result = "Could not start the network socket service.";
   } else {
     Result = Install(View, List);
-    socketExit();
+    Switch2Guest::HostNet::Release();
   }
   if (Nifm) nifmExit();
   View.Add(Result);

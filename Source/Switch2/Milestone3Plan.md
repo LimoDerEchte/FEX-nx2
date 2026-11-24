@@ -764,7 +764,11 @@ int LinuxErrno(int BsdErrno);   // identity for g_bsdErrno (probe: Linux numberi
   - **`bind`:**
     - Translate the address.
     - Port < 1024 without CAP_NET_BIND_SERVICE → EACCES (Linux, `ip_unprivileged_port_start` 1024).
-    - INADDR_ANY and loopback pass through. Host errno → Linux.
+    - Loopback passes through. Host errno → Linux.
+    - **INADDR_ANY (0.0.0.0) passes straight to the host.** The bind probe (`BindProbe.cpp`, console-verified 2026-11-24) showed Horizon allows binding 0.0.0.0 for TCP and UDP (port 0/40001/1337, with and without SO_REUSEADDR; connect/accept and UDP via 127.0.0.1 and the console IP; a LAN peer reaches a 0.0.0.0 listener). The earlier "Horizon forbids 0.0.0.0" note was wrong.
+    - The implicit bind before `listen`/`sendto` on an unbound socket binds 0.0.0.0 too. `connect`/`sendto` to 0.0.0.0 still means 127.0.0.1, as on Linux.
+    - `getsockname` reports what the host reports; no guest/host address split and no loopback redirect.
+    - Host-test the remaining address logic in `GuestInetTest.cpp`.
   - **`listen`:** backlog capped at 4096.
   - **`connect`:**
     - Host connect is nonblocking. EINPROGRESS on a blocking guest socket → wait `Net` for POLLOUT, then read `SO_ERROR` and return it (0 or -errno).
@@ -927,7 +931,7 @@ Guest-only expectations (deliberate differences) are selected at run time by `ac
 
 ### Task C5: Reconcile and commit
 
-- [ ] Reconcile `CommunicationInventory.md`, record the console evidence, and update `NextMilestone.md` (status, commands with results, artifacts).
+- [x] Reconcile `CommunicationInventory.md`, record the console evidence, and update `NextMilestone.md` (status, commands with results, artifacts).
 - [ ] Commit the milestone once on `nx2` after console acceptance.
 
 ## Dependency order

@@ -24,7 +24,7 @@ fi
 # Remove the mount points and scratch directory afterwards so the staged
 # bundle stays identical to what is copied to the SD card.
 created=()
-for entry in proc dev scratch; do
+for entry in proc dev scratch etc; do
     [[ -e $rootfs/$entry ]] || created+=("$rootfs/$entry")
 done
 cleanup() {
@@ -43,6 +43,15 @@ unshare --map-root-user --map-auto --mount --pid --fork --kill-child -- \
         mount -t proc proc "$rootfs/proc"
         [[ -e $rootfs/dev/null ]] || touch "$rootfs/dev/null"
         mount --bind /dev/null "$rootfs/dev/null"
+        # The launcher provides /dev/shm as a sticky tmpfs.
+        mkdir -p "$rootfs/dev/shm"
+        mount -t tmpfs -o mode=1777 tmpfs "$rootfs/dev/shm"
+        # Network files like the launcher writes for the guest (hosts, resolver).
+        if [[ ! -e $rootfs/etc ]]; then
+            mkdir -p "$rootfs/etc"
+            printf "127.0.0.1\tlocalhost\n" > "$rootfs/etc/hosts"
+            [[ -r /etc/resolv.conf ]] && cp /etc/resolv.conf "$rootfs/etc/resolv.conf" || true
+        fi
         # Scratch data lives in a writable directory owned by the test user.
         mkdir -p "$rootfs/scratch"
         chown "$user:$user" "$rootfs/scratch"

@@ -90,7 +90,14 @@ Fill in the **Console result** column from `sdmc:/fex/m3probe.log`.
      (`nifmGetCurrentIpConfigInfo`). UDP to the outside network must work.
    - The probe resolves `deb.debian.org` and reports the elapsed time,
      which shows network health.
-10. **Resource limits.**
+10. **Wildcard bind works.**
+    - Horizon on Switch 2 allows binding 0.0.0.0 (console-verified
+      2026-11-24 with `BindProbe.cpp`: TCP and UDP, port 0/40001/1337, with
+      and without SO_REUSEADDR, loopback, console IP and LAN peers). The
+      earlier "forbidden" note was wrong.
+    - Guest INADDR_ANY passes straight to the host. See WP5 `bind` in
+      [Milestone3Plan.md](Milestone3Plan.md).
+11. **Resource limits.**
     - `socketInitialize` has a fixed session count; the launcher uses 3.
       Each session serves one blocking call at a time.
     - The service has a socket table limit and fixed TCP/UDP buffer
@@ -98,7 +105,7 @@ Fill in the **Console result** column from `sdmc:/fex/m3probe.log`.
     - The probe measures how many sockets one process can open and
       whether 8 sessions are accepted. It also reports default buffer
       sizes and 16 MiB loopback throughput.
-11. **Memory budget.**
+12. **Memory budget.**
     - The probe reports `TotalMemorySize`/`UsedMemorySize`, the largest
       single `malloc`, and the total reachable in 16 MiB blocks.
     - These bound guest `MaxTotal` and `RLIMIT_AS`/`overcommit`

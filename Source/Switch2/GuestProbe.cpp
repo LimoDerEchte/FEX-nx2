@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "GuestRuntime.h"
+#include "HostNet.h"
 #include "GuestRootFS.h"
 #include "GuestFileExtents.h"
 #include "GuestLogBuffer.h"
@@ -376,19 +377,8 @@ void RunFtpServer(PadState& Pad) {
     char Text[INET_ADDRSTRLEN] {};
     if (inet_ntop(AF_INET, &Host, Text, sizeof(Text))) Address = Text;
   }
-  constexpr u32 SocketBuffer = 65536;
-  static const SocketInitConfig SocketConfig = {
-    .tcp_tx_buf_size = 8 * SocketBuffer,
-    .tcp_rx_buf_size = 8 * SocketBuffer,
-    .tcp_tx_buf_max_size = 16 * SocketBuffer,
-    .tcp_rx_buf_max_size = 16 * SocketBuffer,
-    .udp_tx_buf_size = 0x2400,
-    .udp_rx_buf_size = 0xA500,
-    .sb_efficiency = 8,
-    .num_bsd_sessions = 3,
-    .bsd_service_type = BsdServiceType_User,
-  };
-  const bool Network = Problem.empty() && R_SUCCEEDED(socketInitialize(&SocketConfig));
+  // One socket-service reference counted with the guest runtime's (HostNet.cpp): 4 BSD sessions.
+  const bool Network = Problem.empty() && Switch2Guest::HostNet::Acquire();
   if (Problem.empty() && !Network) Problem = "Could not start the network socket service.";
   if (Problem.empty() && !InodeLayoutError.empty()) Problem = InodeLayoutError;
   if (Problem.empty() && !(Files = Switch2Guest::OpenGuestFileSystem())) Problem = "Could not reserve transfer memory.";
@@ -436,7 +426,7 @@ void RunFtpServer(PadState& Pad) {
   }
   Server.reset();
   Files.reset(); // Saves the guest inode store.
-  if (Network) socketExit();
+  if (Network) Switch2Guest::HostNet::Release();
   if (Nifm) nifmExit();
   WriteLog("FTP server stopped.");
 }
@@ -920,7 +910,7 @@ void __libnx_exception_handler(ThreadExceptionDump* Dump) {
 int main() {
   using namespace Switch2Guest;
   const Result LogStatus = OpenLog();
-  WriteLog("--- FEX Switch 2 launcher 0.13.18 started ---");
+  WriteLog("--- FEX Switch 2 launcher 0.14.2 started ---");
   WriteLog("Initializing console...");
   consoleInit(nullptr);
   if (R_FAILED(LogStatus)) {
@@ -960,6 +950,7 @@ int main() {
   }
 
   WriteLog("Closing guest probe.");
+  ShutdownGuestArena();
   LogMan::Throw::UnInstallHandler();
   LogMan::Msg::UnInstallHandler();
   FEXCore::Config::Shutdown();

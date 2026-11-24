@@ -2,6 +2,28 @@
 
 ## Restart checkpoint
 
+- **Status (2026-11-24).** Milestone 3 (memory and communication) is
+  **complete** and committed on `nx2` as launcher **0.14.2**. Console
+  acceptance on 0.14.2: `/bin/comm-acceptance.elf` `Communication
+  acceptance results: suite 42, tools 42` (comm-suite 124 passed, 0 failed,
+  1 skipped); `/bin/comm-suite-root.elf` 124/0/1, exit 42;
+  `/bin/filesystem-acceptance.elf` `ABI 42, coreutils 0, suite 42`. On
+  0.14.1: `/bin/process-acceptance.elf` `suite 42, tools 42`, interactive
+  Bash with `nc -l 0.0.0.0 40002` reached from a LAN PC. The launcher
+  replaces `__libnx_initheap` (HostArena.cpp): it shrinks the loader heap to
+  2 GiB so the guest arena gets a 6144 MiB commit limit, and gives the heap
+  back at exit. SD data reads and writes bounce through a 64 KiB heap
+  buffer. Horizon allows binding 0.0.0.0 (EXPERIMENT `BindProbe.cpp`,
+  `make bind-probe`), so INADDR_ANY passes through. Native: comm-suite
+  122/0/3 as uid 1000 and namespace root; packaged comm-acceptance
+  `suite 42, tools 42`. Host: the 8 `check-guest-*` targets of milestone 3
+  pass. Evidence per interface: [CommunicationInventory.md](CommunicationInventory.md).
+- **Next.** 1. FTP server fix (separate commit): directory listings show
+  file names prefixed with their time, so clients build wrong paths (LIST
+  line format). 2. Reconcile the 137 syscall entries outside the three
+  groups and kernel-visible interfaces (procfs `/proc/<pid>/stat` and
+  `/fd`, devfs, ioctls) before claiming full coverage. Graphics stays on
+  `shelf/graphics` until then.
 - **Status (2026-11-23).** Milestone 2 (processes and events) is
   **complete** and committed on `nx2`. Console acceptance on 0.13.17-diag:
   `/bin/process-acceptance.elf` `suite 42, tools 42` (proc-suite 240 passed,
@@ -15,12 +37,69 @@
   (InvalidMemoryState, 0xd401) up to two times and logs each retry (the
   user's decision; the cause stays unknown). 0.13.18 passed the host checks
   and builds; it has not had its own console run.
-- **Next.** Milestone 3, memory and communication (virtual memory, pipes
+- **Milestone 3 history.** Milestone 3, memory and communication (virtual memory, pipes
   and IPC, sockets; see
   [Active milestone sequence](#active-milestone-sequence--linux-guest-kernel-compatibility)).
   The plan is [Milestone3Plan.md](Milestone3Plan.md) (written
   2026-11-23): 5 Sonnet work packages, 5 Sonnet reviewers, then an Opus
-  final pass with the suite and console run. Phase A has not started.
+  final pass with the suite and console run. Phase A: WP1 (memory arena,
+  mapping calls, limits) is implemented in the working tree with host checks
+  (`make -C Source/Switch2 check-guest-arena check-guest-memory`) and the
+  `guest_nro` build passing; no console run yet. WP2 (futex, robust lists, futex2) is implemented in the
+  working tree (`make -C Source/Switch2 check-guest-futex` and `guest_nro`
+  passing, no console run). WP3 (pipes, System V IPC, POSIX message queues, `/dev/shm`) is implemented in the
+  working tree (`make -C Source/Switch2 check-guest-sysv-ipc check-guest-mqueue check-guest-pipe` and `guest_nro`
+  passing, no console run). WP4 (AF_UNIX stream, datagram and seqpacket, filesystem socket
+  nodes, getsockname/getpeername, socket options, sendmmsg/recvmmsg) is implemented in the working tree
+  (`make -C Source/Switch2 check-guest-socket` and `guest_nro` passing, no console run).
+  WP5 (AF_INET TCP and UDP over nonblocking host BSD sockets: `GuestInet.h`,
+  `HostNet.cpp`, `WaitKind::Net`, `/etc/resolv.conf` from nifm) is implemented in the working tree
+  (`make -C Source/Switch2 check-guest-inet check-guest-socket check-guest-memory` and `guest_nro`
+  passing, no console run); INADDR_ANY passes straight to the host (0.0.0.0 bind allowed, console-verified 2026-11-24 via BindProbe.cpp)
+  (Milestone3Sdk.md item 10). Phase B review done 2026-11-24: merged
+  `.superpowers/sdd/m3-review.md` (3 blocker, 13 major, 46 minor; per WP in
+  `m3-review-wpN.md`). Next: Phase C1 (Opus) fixes, blockers first (all three
+  are CPU-fault paths: mremap grow-in-place overflow, MAP_FIXED/Remap FIXED
+  commit failure leaving R/W uncommitted pages, recvmsg Unix name write one
+  byte past the check), then C2 CommSuite.c, C3, C4 console build 0.14.0.
+  C1 done (`.superpowers/sdd/m3-c1-report.md`). C2+C3 done 2026-11-24
+  (Sonnet, `.superpowers/sdd/m3-c2c3-report.md`): `LinuxRuntime/CommSuite.c`
+  (125 cases), `CommTools.sh`, `CommAcceptance.c`, staged by
+  `make -C Source/Switch2 filesystem-runtime`. Guest-unverified native-adjusted
+  asserts: second connect after nonblocking connect (0 then EISCONN),
+  abstract names per socket type, `mq_open("/")` ENOENT, oversized mremap
+  EINVAL. MREMAP_DONTUNMAP on shared anon stays EINVAL on guest (inventory
+  row 25). **C4: console 0.14.0 failed: "Guest arena ... commit limit 0 MiB", "Could not allocate the guest stack" (loader heap override held all memory). Fixed in 0.14.1: HostArena.cpp overrides `__libnx_initheap`, shrinks the loader heap to 2 GiB, restores it at exit (`ShutdownGuestArena`); log line `Heap: loader override=...`. Console run of 0.14.1 pending.**
+  **Console 0.14.1 ran: 9 failures (inet connect/poll/FIONREAD, membarrier registrations, mremap EINVAL, unix dgram EPERM, unix MSG_WAITALL at EOF, SD InvalidMemoryState in xz). Fixed in 0.14.2 (see .superpowers/sdd/m3-console1-report.md); console rerun of comm-acceptance, comm-suite-root and process/filesystem acceptance pending.**
+  Verified 2026-11-24 (orchestrator): 8 `check-guest-*` exit 0;
+  `guest_nro` 0 warnings; packaged native `/bin/comm-acceptance.elf` →
+  `Communication acceptance results: suite 42, tools 42`;
+  `/bin/process-acceptance.elf` → `suite 42, tools 42`; `--root
+  /bin/comm-suite-root.elf` 122/0/3, exit 42.
+  Artifacts: `Source/Switch2/build/guest/fex-switch2-guest.nro` and
+  `Source/Switch2/build/guest/sd/fex` (merge onto SD `/fex`).
+  Console 0.14.1 (2026-11-24): heap fix OK (`Heap: ... 9090 MiB -> 2049 MiB`,
+  commit limit 6144 MiB); process `suite 42, tools 42`; filesystem `ABI 42,
+  coreutils 0, suite 42`; Bash/nc PC test OK; FTP not yet checked. comm:
+  suite 116/8/1, tools `xz_threads_roundtrip` SD 0xd401 EIO. 0.14.2 fixes all
+  nine (`.superpowers/sdd/m3-console1-report.md`); SD data read/write now
+  bounce through a 64 KiB heap buffer.
+  **Console checklist 0.14.2** (copy NRO and merge `sd/fex`; only changed
+  areas): 1. Banner `launcher 0.14.2`. 2. `/bin/comm-acceptance.elf` →
+  `Communication acceptance results: suite 42, tools 42`. 3.
+  `/bin/comm-suite-root.elf` → exit 42. 4. `/bin/filesystem-acceptance.elf`
+  → `ABI 42, coreutils 0, suite 42` (SD path changed). 5. FTP on 1337:
+  connect, list, upload.
+  Bind probe result (`build/fex-switch2-bindprobe.nro`, 2026-11-24): Horizon
+  allows 0.0.0.0 bind; the console-address redirect was removed. C5 after console pass:
+  reconcile inventory/checkpoint, commit on `nx2`.
+  Orchestrator ledger and per-WP reports and concerns:
+  `.superpowers/sdd/progress.md`, `.superpowers/sdd/m3-wp1..5-report.md`.
+  Verified 2026-11-24 (orchestrator rerun): `make -C Source/Switch2
+  check-guest-inet check-guest-socket check-guest-sysv-ipc check-guest-mqueue check-guest-pipe
+  check-guest-futex check-guest-arena check-guest-memory` exit 0. Rows
+  and deliberate differences are in
+  [CommunicationInventory.md](CommunicationInventory.md).
   SDK risks and the EXPERIMENT
   probe (`make m3-probe`, `build/fex-switch2-m3probe.nro`, log
   `sdmc:/fex/m3probe.log`) are in [Milestone3Sdk.md](Milestone3Sdk.md);

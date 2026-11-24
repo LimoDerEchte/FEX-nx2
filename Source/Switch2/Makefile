@@ -43,6 +43,17 @@ $(M3PROBE).nacp: | $(BUILD)
 $(M3PROBE).nro: $(M3PROBE).elf $(M3PROBE).nacp $(APP_ICON)
 $(M3PROBE).nro: NROFLAGS = --icon=$(APP_ICON) --nacp=$(M3PROBE).nacp
 
+# Wildcard-bind probe: does Horizon forbid bind(0.0.0.0)? Log: sdmc:/switch/fex-bindprobe.log
+BINDPROBE := $(BUILD)/fex-switch2-bindprobe
+.PHONY: bind-probe
+bind-probe: $(BINDPROBE).nro
+$(BINDPROBE).elf: $(BUILD)/BindProbe.o Makefile
+	$(LD) $(LDFLAGS) $(BUILD)/BindProbe.o $(OVERLAY_LIBPATHS) $(LIBPATHS) -lnx -o $@
+$(BINDPROBE).nacp: APP_TITLE := FEX Switch 2 Bind Probe
+$(BINDPROBE).nacp: | $(BUILD)
+$(BINDPROBE).nro: $(BINDPROBE).elf $(BINDPROBE).nacp $(APP_ICON)
+$(BINDPROBE).nro: NROFLAGS = --icon=$(APP_ICON) --nacp=$(BINDPROBE).nacp
+
 ifneq ($(FMT_HEADERS),)
 $(FMT_HEADERS): | $(BUILD)
 	mkdir -p $(@D)
@@ -63,6 +74,7 @@ $(TARGET).nro: NROFLAGS = --icon=$(APP_ICON) --nacp=$(TARGET).nacp
 
 clean:
 	$(RM) $(BUILD)/Milestone3Probe.o $(BUILD)/Milestone3Probe.d $(M3PROBE).elf $(M3PROBE).nacp $(M3PROBE).nro
+	$(RM) $(BUILD)/BindProbe.o $(BUILD)/BindProbe.d $(BINDPROBE).elf $(BINDPROBE).nacp $(BINDPROBE).nro
 	$(RM) $(BUILD)/JitProbe.o $(BUILD)/JitProbe.d $(TARGET).elf $(TARGET).nacp $(TARGET).nro $(FMT_HEADERS) $(BUILD)/fex-hello.o $(BUILD)/fex-hello.elf
 	$(RM) $(BUILD)/maze-start.o $(BUILD)/maze.o $(MAZE_DIR)/sd-maze.elf $(MAZE_DIR)/sd-maze.elf.args $(MAZE_DIR)/data/maze.txt
 	$(RM) $(BUILD)/texture-start.o $(BUILD)/texture-demo.o $(GRAPHICS_DIR)/texture-demo.elf $(GRAPHICS_DIR)/data/sprite.rgba
@@ -191,7 +203,7 @@ ifneq ($(strip $(STOCK_CRT_DIR)),)
 STOCK_PROBE := $(BUILD)/glibc-probe-baseline.elf
 endif
 
-.PHONY: stock-glibc check-guest-memory
+.PHONY: stock-glibc check-guest-memory check-guest-arena
 stock-glibc: $(STOCK_PROBE)
 	python3 LinuxRuntime/StageRootFS.py $(STOCK_DIR)/fex "$(STOCK_TRUE)" "$<" "$(HOST_X86_CC)" "$(STOCK_LIB_DIR)"
 
@@ -205,14 +217,20 @@ $(BUILD)/glibc-probe-baseline.elf: $(BUILD)/glibc-probe-baseline.o $(STOCK_CRT_D
 	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(STOCK_LIB_DIR)" \
 		"$(STOCK_CRT_DIR)/Scrt1.o" "$(STOCK_CRT_DIR)/crti.o" $< "$(STOCK_LIB_DIR)/libc.so.6" "$(STOCK_CRT_DIR)/crtn.o" -o $@
 
+check-guest-arena: $(BUILD)/guest-arena-test
+	$<
+
+$(BUILD)/guest-arena-test: LinuxRuntime/GuestArenaTest.cpp GuestArena.h GuestElf.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
 check-guest-memory: $(BUILD)/guest-address-space-test $(BUILD)/guest-memory-file-test
 	$(BUILD)/guest-address-space-test
 	$(BUILD)/guest-memory-file-test
 
-$(BUILD)/guest-memory-file-test: LinuxRuntime/GuestMemoryFileTest.cpp GuestMemoryFile.h GuestFilePunch.h GuestAddressSpace.h | $(BUILD)
+$(BUILD)/guest-memory-file-test: LinuxRuntime/GuestMemoryFileTest.cpp GuestMemoryFile.h GuestFilePunch.h GuestAddressSpace.h GuestArena.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
 
-$(BUILD)/guest-address-space-test: LinuxRuntime/AddressSpaceTest.cpp GuestAddressSpace.h GuestElf.h | $(BUILD)
+$(BUILD)/guest-address-space-test: LinuxRuntime/AddressSpaceTest.cpp GuestAddressSpace.h GuestArena.h GuestElf.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
 
 # Populate with `make debian-sysroot` (Debian 12 amd64 packages).
@@ -238,8 +256,8 @@ $(BUILD)/debian-rootfs.manifest: LinuxRuntime/RootfsManifest.py LinuxRuntime/Fet
 	python3 -I LinuxRuntime/RootfsManifest.py $@
 
 .PHONY: filesystem-runtime
-filesystem-runtime: $(BUILD)/debian-rootfs.manifest $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf
-	python3 LinuxRuntime/StageDebian.py "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 2,4,$^) --filesystem-probe $(word 5,$^) --fs-suite $(word 6,$^) --name-limit-probe $(word 7,$^) --proc-suite $(word 8,$^) --process-acceptance $(word 9,$^) --rootfs-manifest $(word 1,$^)
+filesystem-runtime: $(BUILD)/debian-rootfs.manifest $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf
+	python3 LinuxRuntime/StageDebian.py "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 2,4,$^) --filesystem-probe $(word 5,$^) --fs-suite $(word 6,$^) --name-limit-probe $(word 7,$^) --proc-suite $(word 8,$^) --process-acceptance $(word 9,$^) --comm-suite $(word 10,$^) --comm-acceptance $(word 11,$^) --rootfs-manifest $(word 1,$^)
 
 # Filesystem compatibility suite: the Debian guest ELF and a native reference
 # run on the host kernel, as the current user and, where user namespaces
@@ -288,13 +306,36 @@ check-proc-suite-native: $(BUILD)/proc-suite-host
 		echo "Skipping the namespace-root run: unshare --map-auto is unavailable"; \
 	fi
 
+# Memory and communication suite (milestone 3): same layout as the process
+# suite. The native reference needs no network beyond 127.0.0.1.
+.PHONY: comm-suite check-comm-suite-native
+comm-suite: $(BUILD)/comm-suite-debian.elf
+
+$(BUILD)/comm-suite.o: LinuxRuntime/CommSuite.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -pthread -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/comm-acceptance.o: LinuxRuntime/CommAcceptance.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/comm-suite-host: LinuxRuntime/CommSuite.c | $(BUILD)
+	$(HOST_X86_CC) -std=gnu11 -O2 -pthread -Wall -Wextra -Werror $< -o $@
+
+check-comm-suite-native: $(BUILD)/comm-suite-host
+	mkdir -p $(BUILD)/comm-suite-native
+	cd $(BUILD)/comm-suite-native && { ../comm-suite-host; test $$? -eq 42; }
+	if unshare --map-root-user --map-auto true 2>/dev/null; then \
+		cd $(BUILD)/comm-suite-native && { unshare --map-root-user --map-auto ../comm-suite-host; test $$? -eq 42; }; \
+	else \
+		echo "Skipping the namespace-root run: unshare --map-auto is unavailable"; \
+	fi
+
 .PHONY: filesystem-probe
 filesystem-probe: $(BUILD)/filesystem-probe-debian.elf
 
 $(BUILD)/filesystem-probe.o: LinuxRuntime/FilesystemProbe.c | $(BUILD)
 	$(HOST_X86_CC) -m64 -march=x86-64 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
 
-$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
+$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
 	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(DEBIAN_LIBS)" \
 		"$(DEBIAN_CRT)/Scrt1.o" "$(DEBIAN_CRT)/crti.o" $< "$(DEBIAN_LIBS)/libc.so.6" "$(DEBIAN_CRT)/crtn.o" -o $@
 
@@ -375,6 +416,48 @@ check-guest-eventfd: $(BUILD)/guest-eventfd-test
 	$<
 
 $(BUILD)/guest-eventfd-test: LinuxRuntime/GuestEventFdTest.cpp GuestEventFd.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-inet
+check-guest-inet: $(BUILD)/guest-inet-test
+	$<
+
+$(BUILD)/guest-inet-test: LinuxRuntime/GuestInetTest.cpp GuestInet.h GuestSocket.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-futex
+check-guest-futex: $(BUILD)/guest-futex-test
+	$<
+
+$(BUILD)/guest-futex-test: LinuxRuntime/GuestFutexTest.cpp GuestFutex.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-pipe
+check-guest-pipe: $(BUILD)/guest-pipe-packet-test
+	$<
+
+$(BUILD)/guest-pipe-packet-test: LinuxRuntime/GuestPipePacketTest.cpp GuestSocket.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-socket
+check-guest-socket: $(BUILD)/guest-socket-test
+	$<
+
+$(BUILD)/guest-socket-test: LinuxRuntime/GuestSocketTest.cpp GuestSocket.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-sysv-ipc
+check-guest-sysv-ipc: $(BUILD)/guest-sysv-ipc-test
+	$<
+
+$(BUILD)/guest-sysv-ipc-test: LinuxRuntime/GuestSysvIpcTest.cpp GuestSysvIpc.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-mqueue
+check-guest-mqueue: $(BUILD)/guest-mqueue-test
+	$<
+
+$(BUILD)/guest-mqueue-test: LinuxRuntime/GuestMqueueTest.cpp GuestMqueue.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
 
 .PHONY: check-guest-signals

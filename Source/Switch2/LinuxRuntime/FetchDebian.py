@@ -27,6 +27,8 @@ PACKAGES = (
     "libacl1", "libattr1", "libselinux1", "libpcre2-8-0", "libgmp10", "libcap2",
     # Milestone 2 tool acceptance: grep, /bin/kill (procps) and inotifywait.
     "grep", "procps", "libproc2-0", "inotify-tools", "libinotifytools0",
+    # Milestone 3 tool acceptance: getent, nc and xz.
+    "libc-bin", "netcat-openbsd", "libbsd0", "libmd0", "xz-utils", "liblzma5",
 )
 
 
