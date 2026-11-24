@@ -910,7 +910,7 @@ void __libnx_exception_handler(ThreadExceptionDump* Dump) {
 int main() {
   using namespace Switch2Guest;
   const Result LogStatus = OpenLog();
-  WriteLog("--- FEX Switch 2 launcher 0.14.2 started ---");
+  WriteLog("--- FEX Switch 2 launcher 0.14.3 started ---");
   WriteLog("Initializing console...");
   consoleInit(nullptr);
   if (R_FAILED(LogStatus)) {

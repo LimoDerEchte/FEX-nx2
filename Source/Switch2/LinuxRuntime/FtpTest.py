@@ -15,6 +15,7 @@ timestamps and Linux error replies. Exits 0 when every check passes.
 """
 import ftplib
 import io
+import re
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,9 @@ def run(host, port, password, user, expected_uid):
     listing = []
     ftp.retrlines("LIST", listing.append)
     check(len(listing) == 1 and listing[0].startswith("-") and listing[0].endswith(name), "LIST shows the file")
+    fields = listing[0].split(None, 8)
+    check(len(fields) == 9 and fields[8] == name and re.fullmatch(r"\d\d:\d\d", fields[7]) is not None,
+          "LIST has the ls -l fields (recent file: month, day, time, name)")
     names = ftp.nlst()
     check(names == [name], "NLST names the file")
     facts = list(ftp.mlsd())
@@ -108,6 +112,11 @@ def run(host, port, password, user, expected_uid):
 
     check(ftp.sendcmd("MFMT 20200102030405 " + name).startswith("213"), "MFMT sets the modification time")
     check(ftp.sendcmd("MDTM " + name) == "213 20200102030405", "MDTM reads it back")
+    listing = []
+    ftp.retrlines("LIST", listing.append)
+    fields = listing[0].split(None, 8) if len(listing) == 1 else []
+    check(len(fields) == 9 and fields[5:8] == ["Jan", "2", "2020"] and fields[8] == name,
+          "LIST shows the year for an old file and keeps the name intact")
 
     # Rename across the limit in both directions.
     ftp.rename(name, "/ftp-test/shallow")

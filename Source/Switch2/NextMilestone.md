@@ -18,9 +18,13 @@
   122/0/3 as uid 1000 and namespace root; packaged comm-acceptance
   `suite 42, tools 42`. Host: the 8 `check-guest-*` targets of milestone 3
   pass. Evidence per interface: [CommunicationInventory.md](CommunicationInventory.md).
-- **Next.** 1. FTP server fix (separate commit): directory listings show
-  file names prefixed with their time, so clients build wrong paths (LIST
-  line format). 2. Reconcile the 137 syscall entries outside the three
+- **FTP (2026-11-24, launcher 0.14.3).** LIST printed `%b %d %Y %H:%M`
+  (one field too many), so clients took the time as part of the name.
+  `GuestFtp.h` `ListTime` prints `ls -l` dates (`%b %e %H:%M` within six
+  months, else `%b %e  %Y`). Host: `make -C Source/Switch2 check-guest-ftp`
+  0 failed. Console 0.14.3: FileZilla lists, browses, downloads and uploads
+  with correct names and paths.
+- **Next.** Reconcile the 137 syscall entries outside the three
   groups and kernel-visible interfaces (procfs `/proc/<pid>/stat` and
   `/fd`, devfs, ioctls) before claiming full coverage. Graphics stays on
   `shelf/graphics` until then.

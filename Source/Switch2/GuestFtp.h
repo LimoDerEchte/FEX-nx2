@@ -371,6 +371,15 @@ private:
     return true;
   }
 
+  // The date columns of `ls -l`, which clients parse by field count: three
+  // fields, the time of day within six months of now, else the year.
+  static std::string ListTime(int64_t Seconds) {
+    constexpr int64_t SixMonths = 15778476;
+    const int64_t Now = time(nullptr);
+    const bool Recent = Seconds > Now - SixMonths && Seconds < Now + SixMonths;
+    return TimeText(Seconds, Recent ? "%b %e %H:%M" : "%b %e  %Y");
+  }
+
   static std::string ListLine(const FtpEntry& Entry) {
     static constexpr char Types[] = "?pc?d?b?-?l?s???";
     std::string Mode(10, '-');
@@ -385,7 +394,7 @@ private:
     char Prefix[128];
     std::snprintf(Prefix, sizeof(Prefix), "%s %3llu %-8u %-8u %12llu %s ", Mode.c_str(),
                   static_cast<unsigned long long>(Entry.Links), Entry.User, Entry.Group,
-                  static_cast<unsigned long long>(Entry.Size), TimeText(Entry.ModifySeconds, "%b %d %Y %H:%M").c_str());
+                  static_cast<unsigned long long>(Entry.Size), ListTime(Entry.ModifySeconds).c_str());
     return Prefix + Entry.Name + "\r\n";
   }
 
