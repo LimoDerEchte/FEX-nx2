@@ -27,14 +27,15 @@ int main() {
     CHECK(SetResUid(R, 1000, 1000, 1000) == 0 && R.CapPermitted == 0 && R.CapEffective == 0);
     auto K = RootCredentials();
     K.Securebits = SecbitKeepCaps;
-    CHECK(SetResUid(K, 1000, 1000, 1000) == 0 && K.CapPermitted == CapFull && K.CapEffective == 0);
+    CHECK(SetResUid(K, 1000, 1000, 1000) == 0 && K.CapPermitted == CapInitialRoot && K.CapEffective == 0);
     CHECK(SetUid(C, NoId) == -22);
   }
   CHECK(CapFull == 0x1ffffffffffull);
+  CHECK(MachineWideCaps == 0xc404530000ull && CapInitialRoot == (CapFull & ~MachineWideCaps));
   {
     auto R = RootCredentials();
-    CHECK(R.Uid[0] == 0 && R.Uid[3] == 0 && R.Gid[2] == 0 && R.CapEffective == CapFull && R.CapPermitted == CapFull &&
-          R.CapBounding == CapFull && R.Capable(CapKill));
+    CHECK(R.Uid[0] == 0 && R.Uid[3] == 0 && R.Gid[2] == 0 && R.CapEffective == CapInitialRoot && R.CapPermitted == CapInitialRoot &&
+          R.CapBounding == CapInitialRoot && R.Capable(CapKill));
   }
   // setuid
   {
@@ -104,7 +105,7 @@ int main() {
     CHECK(SetUid(G, 9) == -1);
     // gid changes never touch caps
     auto R = RootCredentials();
-    CHECK(SetResGid(R, 5, 5, 5) == 0 && R.CapPermitted == CapFull && R.CapEffective == CapFull);
+    CHECK(SetResGid(R, 5, 5, 5) == 0 && R.CapPermitted == CapInitialRoot && R.CapEffective == CapInitialRoot);
   }
   // FixCapsAfterUidChange
   {
@@ -120,7 +121,7 @@ int main() {
     auto OldE = E.Uid;
     E.Uid = {0, 1000, 0, 0};
     FixCapsSetxuid(E, OldE);
-    CHECK(E.CapEffective == 0 && E.CapPermitted == CapFull);
+    CHECK(E.CapEffective == 0 && E.CapPermitted == CapInitialRoot);
 
     auto F = RootCredentials(); // old euid nonzero -> 0: effective = permitted
     F.Uid = {0, 1000, 0, 1000};
@@ -128,18 +129,18 @@ int main() {
     auto OldF = F.Uid;
     F.Uid = {0, 0, 0, 0};
     FixCapsSetxuid(F, OldF);
-    CHECK(F.CapEffective == CapFull);
+    CHECK(F.CapEffective == CapInitialRoot);
 
     auto G = RootCredentials(); // fsuid 0 -> nonzero clears fs caps only
     auto OldG = G.Uid;
     G.Uid = {0, 0, 0, 1000};
     FixCapsFs(G, OldG);
     CHECK(!G.Capable(CapChown) && !G.Capable(CapDacOverride) && !G.Capable(2) && !G.Capable(3) && !G.Capable(4) &&
-          !G.Capable(9) && !G.Capable(27) && !G.Capable(32) && G.Capable(CapKill) && G.CapPermitted == CapFull);
+          !G.Capable(9) && !G.Capable(27) && !G.Capable(32) && G.Capable(CapKill) && G.CapPermitted == CapInitialRoot);
 
     auto H = RootCredentials(); // fsuid nonzero -> 0 restores fs caps from permitted
     H.Uid = {0, 0, 0, 1000};
-    H.CapEffective = CapFull & ~0x1ull;
+    H.CapEffective = CapInitialRoot & ~0x1ull;
     auto OldH = H.Uid;
     H.Uid = {0, 0, 0, 0};
     FixCapsFs(H, OldH);
@@ -151,20 +152,20 @@ int main() {
     auto OldK = K.Uid;
     K.Uid = {1, 1, 1, 1};
     FixCapsSetxuid(K, OldK);
-    CHECK(K.CapPermitted == CapFull && K.CapEffective == 0);
+    CHECK(K.CapPermitted == CapInitialRoot && K.CapEffective == 0);
     CHECK(K.CapAmbient == 0); // finding 1: ambient cleared even with KEEP_CAPS
   }
   // ApplyExecCaps
   {
     auto C = User(1000, 1000, 1000);
-    C.CapPermitted = CapFull;
-    C.CapEffective = CapFull;
+    C.CapPermitted = CapInitialRoot;
+    C.CapEffective = CapInitialRoot;
     C.CapAmbient = 1ull << CapKill;
     ApplyExecCaps(C, std::nullopt, false);
     CHECK(C.CapPermitted == (1ull << CapKill) && C.CapEffective == (1ull << CapKill));
 
     auto R = RootCredentials();
-    R.CapBounding = CapFull & ~(1ull << CapSetpcap);
+    R.CapBounding = CapInitialRoot & ~(1ull << CapSetpcap);
     R.CapPermitted = R.CapEffective = 0;
     R.Securebits = SecbitKeepCaps | SecbitKeepCapsLocked;
     ApplyExecCaps(R, std::nullopt, false);
@@ -172,7 +173,7 @@ int main() {
 
     auto S = User(1000, 1000, 1000);
     ApplyExecCaps(S, 0u, false);
-    CHECK(S.Uid[1] == 0 && S.Uid[0] == 1000 && S.CapPermitted == CapFull && S.CapEffective == CapFull);
+    CHECK(S.Uid[1] == 0 && S.Uid[0] == 1000 && S.CapPermitted == CapInitialRoot && S.CapEffective == CapInitialRoot);
 
     auto N = User(1000, 1000, 1000);
     ApplyExecCaps(N, 0u, true);
@@ -180,17 +181,17 @@ int main() {
 
     auto RR = User(0, 1000, 0); // real root, euid dropped: permitted full, effective only ambient
     ApplyExecCaps(RR, std::nullopt, false);
-    CHECK(RR.CapPermitted == CapFull && RR.CapEffective == 0);
+    CHECK(RR.CapPermitted == CapInitialRoot && RR.CapEffective == 0);
 
     auto NR = RootCredentials(); // NoNewPrivs does not strip real root
     ApplyExecCaps(NR, std::nullopt, true);
-    CHECK(NR.CapPermitted == CapFull && NR.CapEffective == CapFull);
+    CHECK(NR.CapPermitted == CapInitialRoot && NR.CapEffective == CapInitialRoot);
   }
   // findings 2,3,4,6,7
   {
     auto R = RootCredentials(); // 2: NO_SETUID_FIXUP
     R.Securebits = SecbitNoSetuidFixup;
-    CHECK(SetResUid(R, 1000, 1000, 1000) == 0 && R.CapPermitted == CapFull && R.CapEffective == CapFull);
+    CHECK(SetResUid(R, 1000, 1000, 1000) == 0 && R.CapPermitted == CapInitialRoot && R.CapEffective == CapInitialRoot);
     auto F = RootCredentials();
     F.Securebits = SecbitNoSetuidFixup;
     CHECK(SetFsUid(F, 1000) == 0 && F.Uid[3] == 1000 && F.Capable(CapChown));
@@ -232,7 +233,7 @@ int main() {
 
     auto Z = RootCredentials(); // 6: setresuid(1000,1000,-1) keeps suid 0, permitted, clears effective
     CHECK(SetResUid(Z, 1000, 1000, NoId) == 0 && Z.Uid == (std::array<uint32_t, 4> {1000, 1000, 0, 1000}) &&
-          Z.CapPermitted == CapFull && Z.CapEffective == 0);
+          Z.CapPermitted == CapInitialRoot && Z.CapEffective == 0);
 
     auto M = RootCredentials(); // 6: capset ambient intersection
     M.CapAmbient = 0xF;
@@ -266,6 +267,17 @@ int main() {
     Q.CapPermitted = Q.CapEffective = 1ull << CapSetpcap;
     Q.CapBounding = 1ull << CapSetpcap;
     CHECK(CapSet(Q, Q.CapEffective, Q.CapPermitted, 1ull << CapChown) == -1);
+  }
+  // Launch identity (console 1, item 5): a root launch carries uid 0 in its auxiliary vector (AT_EUID), not the
+  // default 1000, and root's capability sets; a user launch has none.
+  {
+    const auto Root = LaunchCredentialsFor(0, 0);
+    CHECK(AuxvIds(Root) == (std::array<uint32_t, 4> {0, 0, 0, 0}));
+    CHECK(Root.CapEffective == CapInitialRoot && Root.Uid[3] == 0 && Root.Gid[2] == 0);
+    const auto Other = LaunchCredentialsFor(1000, 100);
+    CHECK(AuxvIds(Other) == (std::array<uint32_t, 4> {1000, 1000, 100, 100}));
+    CHECK(Other.CapEffective == 0 && Other.Uid[2] == 1000 && Other.Gid[3] == 100);
+    CHECK(AuxvIds(Credentials {}) == (std::array<uint32_t, 4> {1000, 1000, 1000, 1000}));
   }
   std::puts("GuestCredentials: OK");
 }

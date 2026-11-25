@@ -81,7 +81,7 @@ needs `restart_syscall` (219).
 | ---: | --- | --- | --- |
 | 24 | `sched_yield` | Routed | Ends the thread's time slice; the scheduler picks the next ready thread. |
 | 39 | `getpid` | Routed |  |
-| 56 | `clone` | Partial | Threads need CLONE_VM|FS|FILES|SIGHAND|THREAD. Process clones support exit signals 0..64, CLONE_PARENT, CLONE_VFORK (with CLONE_VM), CLONE_PIDFD, CLONE_SETTLS, CLONE_PARENT_SETTID, CHILD_SETTID/CLEARTID and a new stack. Processes cannot share memory, filesystem state, descriptor tables or handlers: CLONE_VM without VFORK, CLONE_FS, CLONE_FILES and CLONE_SIGHAND return EINVAL. Namespace flags return EPERM without root, EINVAL as root. |
+| 56 | `clone` | Partial | Threads need CLONE_VM|FS|FILES|SIGHAND|THREAD. Process clones support exit signals 0..64, CLONE_PARENT, CLONE_VFORK (with CLONE_VM), CLONE_PIDFD, CLONE_SETTLS, CLONE_PARENT_SETTID, CHILD_SETTID/CLEARTID and a new stack. Processes cannot share memory or handlers: CLONE_VM without VFORK and CLONE_SIGHAND return EINVAL. CLONE_FS, CLONE_FILES, CLONE_SYSVSEM and the namespace flags (user, UTS, IPC, PID, cgroup, mount placeholder) are supported since milestone 4 task 2; see [ContainerInventory.md](ContainerInventory.md). |
 | 57 | `fork` | Routed |  |
 | 58 | `vfork` | Partial | The child gets a copy of memory, not a shared one; the parent waits (killable only) until the child execs or exits, as in Linux. |
 | 59 | `execve` | Routed | `#!` scripts as Linux binfmt_script: 256-byte line, one argument, four rewrites then ELOOP, setuid bits of scripts ignored. `/dev/fd/N` names given to interpreters of descriptor-relative scripts need a `/dev/fd` the runtime does not have yet. |
@@ -112,7 +112,7 @@ needs `restart_syscall` (219).
 | 309 | `getcpu` | Routed | Always CPU 0, node 0 (one host thread runs the guest). |
 | 322 | `execveat` | Routed | AT_EMPTY_PATH needs a descriptor opened by path. |
 | 434 | `pidfd_open` | Routed | PIDFD_NONBLOCK accepted; pidfds cannot be polled yet (Task 12). |
-| 435 | `clone3` | Partial | As clone; set_tid returns EPERM/EINVAL (no PID namespaces), CLONE_INTO_CGROUP EINVAL. |
+| 435 | `clone3` | Partial | As clone (flags per [ContainerInventory.md](ContainerInventory.md)); set_tid still returns EPERM/EINVAL (not implemented), CLONE_INTO_CGROUP EINVAL. |
 | 438 | `pidfd_getfd` | Partial | Permission is same real and effective uid or CAP_SYS_PTRACE (no ptrace access model). |
 
 ## Signals
@@ -226,5 +226,5 @@ needs `restart_syscall` (219).
 - File capabilities (`security.capability`) are not modelled: exec never grants capabilities from a file, only the root rules and ambient set apply.
 - `PR_GET_SECUREBITS`/`PR_SET_SECUREBITS` return EINVAL; the bits themselves exist (NOROOT, NO_SETUID_FIXUP, KEEP_CAPS, NO_CAP_AMBIENT_RAISE) but only KEEP_CAPS can be changed, through `PR_SET_KEEPCAPS`.
 - `mknod` of device nodes returns EPERM for every caller, with or without `CAP_MKNOD` (no device nodes exist).
-- There are no user namespaces: capabilities are always global and `CLONE_NEW*` flags fail with EPERM (without `CAP_SYS_ADMIN`) or EINVAL.
+- User namespaces exist since milestone 4 task 2: capabilities are per user namespace, and the checks that name a namespace owner use it; every other capability check is against the initial namespace (see [ContainerInventory.md](ContainerInventory.md#namespaces)).
 - Launch credentials: `<program>.user` and the Root shell item give uid 0 `RootCredentials()` (all capabilities); any other uid starts with no capabilities.

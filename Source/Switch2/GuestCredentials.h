@@ -9,6 +9,14 @@ namespace Switch2Guest {
 constexpr uint32_t NoId = UINT32_MAX;
 constexpr uint32_t CapLast = 40; // CAP_CHECKPOINT_RESTORE
 constexpr uint64_t CapFull = (uint64_t {1} << (CapLast + 1)) - 1;
+// Capabilities whose operations are machine-wide: reboot and kexec (SYS_BOOT 22), kernel modules (SYS_MODULE 16),
+// I/O ports (SYS_RAWIO 17), process accounting (SYS_PACCT 20), vhangup (SYS_TTY_CONFIG 26), the kernel log
+// (SYSLOG 34), perf (PERFMON 38) and BPF (BPF 39). The guest is not the machine's owner, so these are absent from
+// every capability set, root's included (see CapInitialRoot).
+constexpr uint64_t MachineWideCaps = (1ull << 16) | (1ull << 17) | (1ull << 20) | (1ull << 22) | (1ull << 26) | (1ull << 34) |
+                                     (1ull << 38) | (1ull << 39);
+// Root's sets and the bounding set of every guest process: all capabilities but the machine-wide ones.
+constexpr uint64_t CapInitialRoot = CapFull & ~MachineWideCaps;
 constexpr uint32_t CapChown = 0, CapDacOverride = 1, CapKill = 5, CapSetgid = 6, CapSetuid = 7, CapSetpcap = 8,
                    CapSysNice = 23, CapSysTime = 25, CapWakeAlarm = 35;
 
@@ -22,9 +30,19 @@ constexpr uint32_t SecbitNoRoot = 1u << 0, SecbitNoRootLocked = 1u << 1, SecbitN
 struct Credentials {
   std::array<uint32_t, 4> Uid {1000, 1000, 1000, 1000}; // real, effective, saved, fs
   std::array<uint32_t, 4> Gid {1000, 1000, 1000, 1000};
-  uint64_t CapEffective {}, CapPermitted {}, CapInheritable {}, CapBounding {CapFull}, CapAmbient {};
+  uint64_t CapEffective {}, CapPermitted {}, CapInheritable {}, CapBounding {CapInitialRoot}, CapAmbient {};
   uint32_t Securebits {};
-  bool Capable(uint32_t Cap) const { return CapEffective >> Cap & 1; }
+  // The user namespace these credentials live in (Milestone 4 task 2). Ids and capabilities are kernel ids and
+  // capabilities of that namespace. InitialNs is true in the initial user namespace; RootUid is the kernel id that
+  // namespace maps to its uid 0 (NoId when none), the id that gets root's capability treatment.
+  bool InitialNs {true};
+  uint32_t RootUid {0};
+  // The capability in this credential's own user namespace (ns_capable(current_user_ns(), Cap)): setuid and
+  // setgid, capset, securebits and the bounding set.
+  bool OwnCapable(uint32_t Cap) const { return CapEffective >> Cap & 1; }
+  // capable(Cap): the capability in the initial user namespace, which every operation on a machine-wide object
+  // (files, the clock, resource limits, scheduling) is checked against. False inside a child user namespace.
+  bool Capable(uint32_t Cap) const { return InitialNs && OwnCapable(Cap); }
   bool Secure(uint32_t Bit) const { return Securebits & Bit; }
 };
 
@@ -32,9 +50,21 @@ inline Credentials RootCredentials() {
   Credentials C;
   C.Uid = {0, 0, 0, 0};
   C.Gid = {0, 0, 0, 0};
-  C.CapEffective = C.CapPermitted = CapFull;
+  C.CapEffective = C.CapPermitted = CapInitialRoot;
   return C;
 }
+
+// The credentials a launch starts with: root's full sets for uid 0, an unprivileged user otherwise, with every id of
+// the given uid and gid.
+inline Credentials LaunchCredentialsFor(uint32_t Uid, uint32_t Gid) {
+  Credentials C = Uid == 0 ? RootCredentials() : Credentials {};
+  C.Uid.fill(Uid);
+  C.Gid.fill(Gid);
+  return C;
+}
+
+// The ids an ELF's auxiliary vector carries (AT_UID, AT_EUID, AT_GID, AT_EGID) for a process with these credentials.
+inline std::array<uint32_t, 4> AuxvIds(const Credentials& C) { return {C.Uid[0], C.Uid[1], C.Gid[0], C.Gid[1]}; }
 
 namespace Detail {
 // CAP_CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH, FOWNER, FSETID, LINUX_IMMUTABLE, MKNOD, MAC_OVERRIDE
@@ -49,15 +79,16 @@ inline bool IsOneOf(uint32_t V, const std::array<uint32_t, 4>& Ids, bool Include
 // cap_task_fix_setuid for LSM_SETID_RE/ID/RES (setuid/setreuid/setresuid): cap_emulate_setxuid.
 inline void FixCapsSetxuid(Credentials& C, const std::array<uint32_t, 4>& Old) {
   if (C.Secure(SecbitNoSetuidFixup)) return;
-  const bool OldHadRoot = Old[0] == 0 || Old[1] == 0 || Old[2] == 0;
-  const bool NewHasRoot = C.Uid[0] == 0 || C.Uid[1] == 0 || C.Uid[2] == 0;
+  const auto Root = C.RootUid;
+  const bool OldHadRoot = Old[0] == Root || Old[1] == Root || Old[2] == Root;
+  const bool NewHasRoot = C.Uid[0] == Root || C.Uid[1] == Root || C.Uid[2] == Root;
   if (OldHadRoot && !NewHasRoot && !C.Secure(SecbitKeepCaps)) {
     C.CapPermitted = C.CapEffective = 0;
   }
   if (!NewHasRoot) C.CapAmbient = 0;
-  if (Old[1] == 0 && C.Uid[1] != 0) {
+  if (Old[1] == Root && C.Uid[1] != Root) {
     C.CapEffective = 0;
-  } else if (Old[1] != 0 && C.Uid[1] == 0) {
+  } else if (Old[1] != Root && C.Uid[1] == Root) {
     C.CapEffective = C.CapPermitted;
   }
 }
@@ -65,9 +96,9 @@ inline void FixCapsSetxuid(Credentials& C, const std::array<uint32_t, 4>& Old) {
 // cap_task_fix_setuid for LSM_SETID_FS (setfsuid only): drop/raise the fs capability set.
 inline void FixCapsFs(Credentials& C, const std::array<uint32_t, 4>& Old) {
   if (C.Secure(SecbitNoSetuidFixup)) return;
-  if (Old[3] == 0 && C.Uid[3] != 0) {
+  if (Old[3] == C.RootUid && C.Uid[3] != C.RootUid) {
     C.CapEffective &= ~Detail::FsCaps;
-  } else if (Old[3] != 0 && C.Uid[3] == 0) {
+  } else if (Old[3] != C.RootUid && C.Uid[3] == C.RootUid) {
     C.CapEffective |= C.CapPermitted & Detail::FsCaps;
   }
 }
@@ -75,7 +106,7 @@ inline void FixCapsFs(Credentials& C, const std::array<uint32_t, 4>& Old) {
 inline int64_t SetUid(Credentials& C, uint32_t Uid) {
   if (Uid == NoId) return -22;
   const auto Old = C.Uid;
-  if (C.Capable(CapSetuid)) {
+  if (C.OwnCapable(CapSetuid)) {
     C.Uid = {Uid, Uid, Uid, Uid};
   } else if (Uid == C.Uid[0] || Uid == C.Uid[2]) {
     C.Uid[1] = C.Uid[3] = Uid;
@@ -87,7 +118,7 @@ inline int64_t SetUid(Credentials& C, uint32_t Uid) {
 }
 
 inline int64_t SetReUid(Credentials& C, uint32_t Real, uint32_t Effective) {
-  const bool Privileged = C.Capable(CapSetuid);
+  const bool Privileged = C.OwnCapable(CapSetuid);
   const auto Old = C.Uid;
   if (!Privileged) {
     if (Real != NoId && Real != Old[0] && Real != Old[1]) return -1;
@@ -103,7 +134,7 @@ inline int64_t SetReUid(Credentials& C, uint32_t Real, uint32_t Effective) {
 
 inline int64_t SetResUid(Credentials& C, uint32_t Real, uint32_t Effective, uint32_t Saved) {
   const auto Old = C.Uid;
-  if (!C.Capable(CapSetuid)) {
+  if (!C.OwnCapable(CapSetuid)) {
     for (auto V : {Real, Effective, Saved}) {
       if (V != NoId && !Detail::IsOneOf(V, Old, false)) return -1;
     }
@@ -119,7 +150,7 @@ inline int64_t SetResUid(Credentials& C, uint32_t Real, uint32_t Effective, uint
 // Returns the old fsuid; an unpermitted or invalid change is silently ignored.
 inline int64_t SetFsUid(Credentials& C, uint32_t Uid) {
   const auto Old = C.Uid;
-  if (Uid != NoId && (C.Capable(CapSetuid) || Detail::IsOneOf(Uid, Old, true))) {
+  if (Uid != NoId && (C.OwnCapable(CapSetuid) || Detail::IsOneOf(Uid, Old, true))) {
     C.Uid[3] = Uid;
     FixCapsFs(C, Old);
   }
@@ -128,7 +159,7 @@ inline int64_t SetFsUid(Credentials& C, uint32_t Uid) {
 
 inline int64_t SetGid(Credentials& C, uint32_t Gid) {
   if (Gid == NoId) return -22;
-  if (C.Capable(CapSetgid)) {
+  if (C.OwnCapable(CapSetgid)) {
     C.Gid = {Gid, Gid, Gid, Gid};
   } else if (Gid == C.Gid[0] || Gid == C.Gid[2]) {
     C.Gid[1] = C.Gid[3] = Gid;
@@ -140,7 +171,7 @@ inline int64_t SetGid(Credentials& C, uint32_t Gid) {
 
 inline int64_t SetReGid(Credentials& C, uint32_t Real, uint32_t Effective) {
   const auto Old = C.Gid;
-  if (!C.Capable(CapSetgid)) {
+  if (!C.OwnCapable(CapSetgid)) {
     if (Real != NoId && Real != Old[0] && Real != Old[1]) return -1;
     if (Effective != NoId && !Detail::IsOneOf(Effective, Old, false)) return -1;
   }
@@ -153,7 +184,7 @@ inline int64_t SetReGid(Credentials& C, uint32_t Real, uint32_t Effective) {
 
 inline int64_t SetResGid(Credentials& C, uint32_t Real, uint32_t Effective, uint32_t Saved) {
   const auto Old = C.Gid;
-  if (!C.Capable(CapSetgid)) {
+  if (!C.OwnCapable(CapSetgid)) {
     for (auto V : {Real, Effective, Saved}) {
       if (V != NoId && !Detail::IsOneOf(V, Old, false)) return -1;
     }
@@ -167,7 +198,7 @@ inline int64_t SetResGid(Credentials& C, uint32_t Real, uint32_t Effective, uint
 
 inline int64_t SetFsGid(Credentials& C, uint32_t Gid) {
   const auto Old = C.Gid[3];
-  if (Gid != NoId && (C.Capable(CapSetgid) || Detail::IsOneOf(Gid, C.Gid, true))) C.Gid[3] = Gid;
+  if (Gid != NoId && (C.OwnCapable(CapSetgid) || Detail::IsOneOf(Gid, C.Gid, true))) C.Gid[3] = Gid;
   return Old;
 }
 
@@ -194,8 +225,8 @@ inline void ApplyExecCaps(Credentials& C, std::optional<uint32_t> SetUidOwner, b
   uint64_t Permitted = 0;
   bool Effective = false;
   if (!C.Secure(SecbitNoRoot)) {
-    if (C.Uid[1] == 0 || C.Uid[0] == 0) Permitted = C.CapBounding | C.CapInheritable;
-    if (C.Uid[1] == 0) Effective = true;
+    if (C.Uid[1] == C.RootUid || C.Uid[0] == C.RootUid) Permitted = C.CapBounding | C.CapInheritable;
+    if (C.Uid[1] == C.RootUid) Effective = true;
   }
   Permitted |= C.CapAmbient;
   C.CapPermitted = Permitted;
@@ -206,7 +237,7 @@ inline void ApplyExecCaps(Credentials& C, std::optional<uint32_t> SetUidOwner, b
 // capset(2) permission rules only (no pid/version ABI handling).
 inline int64_t CapSet(Credentials& C, uint64_t Effective, uint64_t Permitted, uint64_t Inheritable) {
   if (Inheritable & ~(C.CapInheritable | C.CapBounding)) return -1;
-  if (!C.Capable(CapSetpcap) && (Inheritable & ~(C.CapInheritable | C.CapPermitted))) return -1;
+  if (!C.OwnCapable(CapSetpcap) && (Inheritable & ~(C.CapInheritable | C.CapPermitted))) return -1;
   if (Permitted & ~C.CapPermitted) return -1;
   if (Effective & ~Permitted) return -1;
   C.CapEffective = Effective;

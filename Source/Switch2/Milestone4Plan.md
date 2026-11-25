@@ -151,8 +151,11 @@ calls answered with a Linux error. Graphics is out of scope.
   `bubblewrap`, util-linux `unshare`/`nsenter`/`chrt`/`taskset`/`ionice`,
   `hostname`; `container-acceptance.elf` printing `Container acceptance
   results: suite 42, tools 42`.
-- Tools cases at least: `bwrap --unshare-all --ro-bind / / --dev /dev
-  --proc /proc --tmpfs /tmp --hostname box true`; `bwrap` with
+- Tools cases at least: `bwrap --unshare-all --share-net --ro-bind / /
+  --dev /dev --proc /proc --tmpfs /tmp --hostname box true` (Steam's
+  pressure-vessel shares the network; a network namespace needs a
+  loopback device configured over rtnetlink and is future work in
+  RemainingSyscalls.md); `bwrap` with
   `--seccomp` from a compiled filter; `unshare -Urm` mount of a tmpfs;
   `nsenter` into a running namespace; `chrt`, `taskset`, `ionice`.
 - Native: passes as uid 1000 and as namespace root. Console: the

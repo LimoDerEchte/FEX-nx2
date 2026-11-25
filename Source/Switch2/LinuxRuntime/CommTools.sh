@@ -18,8 +18,8 @@ filled() { for _ in $(seq 150); do [ "$(wc -c < "$1" 2>/dev/null || echo 0)" -ge
 tcp_client() { for _ in $(seq 100); do nc -N "$@" && return 0; sleep 0.2; done; return 1; }
 
 # 1. Threaded xz: worker threads synchronize through futexes.
-# The guest has no /dev/urandom, so test data comes from seq with the digits
-# permuted (deterministic, not trivially compressible).
+# Test data comes from seq with the digits permuted (deterministic, so a failing
+# run repeats, and not trivially compressible), not from /dev/urandom.
 # 8 MiB in 1 MiB blocks at -1 still gives each of the 4 threads several
 # blocks; the guest runs them on one host thread, so size is kept small.
 seq 1 1300000 | tr 0-9 5381940276 | head -c 8388608 > data.bin

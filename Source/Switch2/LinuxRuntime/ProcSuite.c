@@ -43,7 +43,10 @@
 #include <stdlib.h>
 #include <termios.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/epoll.h>
+#include <sys/sysmacros.h>
+#include <sys/utsname.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
 #include <sys/file.h>
@@ -4824,4 +4827,87 @@ TEST(event, anon_inode_names) {
     snprintf(Link, sizeof(Link), "/proc/self/fd/%d", Cases[Index].Fd);
     CHECK(readlink(Link, Target, sizeof(Target) - 1) > 0 && !strcmp(Target, Cases[Index].Name));
   }
+}
+
+// The character devices of /dev and the /proc/sys files a container tool reads at start (bwrap reads overflowuid).
+TEST(dev, char_devices) {
+  const struct {
+    const char *Path;
+    unsigned Major, Minor;
+  } Devices[] = {{"/dev/null", 1, 3}, {"/dev/zero", 1, 5}, {"/dev/full", 1, 7}, {"/dev/random", 1, 8}, {"/dev/urandom", 1, 9}, {"/dev/tty", 5, 0}};
+  for (size_t Index = 0; Index < sizeof(Devices) / sizeof(Devices[0]); ++Index) {
+    struct stat Info;
+    CHECK(stat(Devices[Index].Path, &Info) == 0 && S_ISCHR(Info.st_mode) && (Info.st_mode & 07777) == 0666);
+    CHECK(major(Info.st_rdev) == Devices[Index].Major && minor(Info.st_rdev) == Devices[Index].Minor);
+  }
+  char Buffer[64];
+  const int Zero = open("/dev/zero", O_RDWR);
+  CHECK(Zero >= 0);
+  memset(Buffer, 0xaa, sizeof(Buffer));
+  CHECK(read(Zero, Buffer, sizeof(Buffer)) == (ssize_t)sizeof(Buffer) && Buffer[0] == 0 && Buffer[63] == 0);
+  CHECK(write(Zero, "abc", 3) == 3 && lseek(Zero, 100, SEEK_SET) == 0);
+  close(Zero);
+  const int Full = open("/dev/full", O_RDWR);
+  CHECK(Full >= 0);
+  CHECK(write(Full, "x", 1) == -1 && errno == ENOSPC);
+  CHECK(write(Full, "", 0) == -1 && errno == ENOSPC);
+  CHECK(read(Full, Buffer, 4) == 4 && Buffer[0] == 0);
+  close(Full);
+  const char *const RandomPaths[] = {"/dev/urandom", "/dev/random"};
+  for (size_t Which = 0; Which < 2; ++Which) {
+    const char *Path = RandomPaths[Which];
+    char First[32] = {0}, Second[32] = {0};
+    const int Random = open(Path, O_RDONLY);
+    CHECK(Random >= 0);
+    CHECK(read(Random, First, sizeof(First)) == (ssize_t)sizeof(First) && read(Random, Second, sizeof(Second)) == (ssize_t)sizeof(Second));
+    CHECK(memcmp(First, Second, sizeof(First)) != 0);
+    struct pollfd Poll = {Random, POLLIN, 0};
+    CHECK(poll(&Poll, 1, 0) == 1 && (Poll.revents & POLLIN));
+    close(Random);
+  }
+  // Without a controlling terminal /dev/tty exists but cannot be opened (the console run has none).
+  const int Terminal = open("/dev/tty", O_RDWR);
+  const int TerminalError = errno;
+  if (Terminal >= 0) close(Terminal);
+  else CHECK(TerminalError == ENXIO);
+}
+
+TEST(proc, sys_files) {
+  const struct {
+    const char *Path;
+    const char *Value;
+  } Files[] = {{"/proc/sys/kernel/overflowuid", "65534\n"}, {"/proc/sys/kernel/overflowgid", "65534\n"}, {"/proc/sys/kernel/ostype", "Linux\n"}};
+  for (size_t Index = 0; Index < sizeof(Files) / sizeof(Files[0]); ++Index) {
+    char Buffer[64] = {0};
+    const int Fd = open(Files[Index].Path, O_RDONLY);
+    CHECK(Fd >= 0 && read(Fd, Buffer, sizeof(Buffer) - 1) == (ssize_t)strlen(Files[Index].Value) && !strcmp(Buffer, Files[Index].Value));
+    if (Fd >= 0) close(Fd);
+  }
+  struct utsname Name;
+  CHECK(uname(&Name) == 0);
+  char Text[128] = {0};
+  int Fd = open("/proc/sys/kernel/hostname", O_RDONLY);
+  CHECK(Fd >= 0 && read(Fd, Text, sizeof(Text) - 1) > 0);
+  Text[strcspn(Text, "\n")] = 0;
+  CHECK(!strcmp(Text, Name.nodename));
+  if (Fd >= 0) close(Fd);
+  memset(Text, 0, sizeof(Text));
+  Fd = open("/proc/sys/kernel/osrelease", O_RDONLY);
+  CHECK(Fd >= 0 && read(Fd, Text, sizeof(Text) - 1) > 0);
+  Text[strcspn(Text, "\n")] = 0;
+  CHECK(!strcmp(Text, Name.release));
+  if (Fd >= 0) close(Fd);
+  memset(Text, 0, sizeof(Text));
+  Fd = open("/proc/sys/user/max_user_namespaces", O_RDONLY);
+  CHECK(Fd >= 0 && read(Fd, Text, sizeof(Text) - 1) > 0 && Text[0] >= '1' && Text[0] <= '9');
+  if (Fd >= 0) close(Fd);
+  // the directories list and stat as directories
+  struct stat Info;
+  CHECK(stat("/proc/sys/kernel", &Info) == 0 && S_ISDIR(Info.st_mode));
+  DIR *Directory = opendir("/proc/sys/kernel");
+  CHECK(Directory != NULL);
+  int SawUid = 0;
+  for (struct dirent *Entry; Directory && (Entry = readdir(Directory));) SawUid |= !strcmp(Entry->d_name, "overflowuid");
+  CHECK(SawUid);
+  if (Directory) closedir(Directory);
 }

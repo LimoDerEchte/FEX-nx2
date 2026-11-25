@@ -5,7 +5,7 @@
 # Usage: RunPackagedNative.sh <bundle>/fex/rootfs [--root] <program> [arguments...]
 #
 # The rootfs is entered through user, mount and PID namespaces with a fresh
-# /proc and a bound /dev/null, mirroring the guest namespace. Programs run as
+# /proc and the launcher's character devices, mirroring the guest namespace. Programs run as
 # uid 1000 like the launcher's default user, or as root with --root (the
 # equivalent of a "<program>.user" file containing "0 0"). Subordinate IDs
 # from /etc/subuid let root switch to unrelated users inside the namespace.
@@ -41,8 +41,11 @@ unshare --map-root-user --map-auto --mount --pid --fork --kill-child -- \
         shift 2
         mkdir -p "$rootfs/proc" "$rootfs/dev"
         mount -t proc proc "$rootfs/proc"
-        [[ -e $rootfs/dev/null ]] || touch "$rootfs/dev/null"
-        mount --bind /dev/null "$rootfs/dev/null"
+        # The character devices the launcher provides.
+        for device in null zero full random urandom tty; do
+            [[ -e $rootfs/dev/$device ]] || touch "$rootfs/dev/$device"
+            mount --bind "/dev/$device" "$rootfs/dev/$device"
+        done
         # The launcher provides /dev/shm as a sticky tmpfs.
         mkdir -p "$rootfs/dev/shm"
         mount -t tmpfs -o mode=1777 tmpfs "$rootfs/dev/shm"

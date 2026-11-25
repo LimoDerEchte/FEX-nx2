@@ -30,6 +30,10 @@ and input. `ptrace` stays EPERM (future work below).
 - **`ptrace`** returns EPERM until there is a way to debug on the Switch 2
   (it would serve gdb, strace and crash reporters). Revisit when console
   debugging access exists.
+- **Network namespaces** (`CLONE_NEWNET`) give EPERM. bubblewrap's
+  `--unshare-net` (Flatpak apps without network access, Chromium's
+  namespace sandbox) needs a namespace with its own loopback device and an
+  `AF_NETLINK` route socket to bring it up.
 - **Graphics** is in no milestone; it needs its own architecture plan
   (shelved work on `shelf/graphics`).
 

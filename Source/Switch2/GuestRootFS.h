@@ -9,22 +9,19 @@ namespace Switch2Guest {
 inline constexpr char Root[] = "/fex/rootfs";
 
 // Inode metadata and its recovery journal live in one hidden folder so they
-// do not clutter /fex. Each name also has the flat path used before 0.12.33.
+// do not clutter /fex. Launchers before 0.15.1 used /fex/.inode; its
+// contents are not migrated.
 namespace InodeFiles {
-inline constexpr char Directory[] = "/fex/.inode";
-inline constexpr char Objects[] = "/fex/.inode/objects";
-inline constexpr char DirectoryIntent[] = "/fex/.inode/dir-intent";
-inline constexpr char DirectoryBackup[] = "/fex/.inode/dir-backup";
-inline constexpr char IntentStaging[] = "/fex/.inode/intent-stage";
-inline constexpr char Promotion[] = "/fex/.inode/promotion";
-inline constexpr const char* Stores[] {"/fex/.inode/store-0", "/fex/.inode/store-1"};
-struct Move { const char* Legacy; const char* Current; };
-inline constexpr Move LegacyMoves[] {
-  {"/fex/.inode-store-0", Stores[0]}, {"/fex/.inode-store-1", Stores[1]},
-  {"/fex/.inode-objects", Objects}, {"/fex/.inode-dir-intent", DirectoryIntent},
-  {"/fex/.inode-dir-backup", DirectoryBackup}, {"/fex/.inode-intent-stage", IntentStaging},
-  {"/fex/.inode-promotion", Promotion},
-};
+inline constexpr char Directory[] = "/fex/.inode_store";
+inline constexpr char Objects[] = "/fex/.inode_store/objects";
+inline constexpr char DirectoryIntent[] = "/fex/.inode_store/dir-intent";
+inline constexpr char DirectoryBackup[] = "/fex/.inode_store/dir-backup";
+inline constexpr char IntentStaging[] = "/fex/.inode_store/intent-stage";
+inline constexpr char Promotion[] = "/fex/.inode_store/promotion";
+// A staging entry left without its journal intent is moved here, never
+// deleted, so a launch that crashed mid-operation cannot lose data.
+inline constexpr char Orphans[] = "/fex/.inode_store/orphans";
+inline constexpr const char* Stores[] {"/fex/.inode_store/store-0", "/fex/.inode_store/store-1"};
 } // namespace InodeFiles
 
 // Absolute Linux paths live inside the rootfs. Relative paths retain the ELF's

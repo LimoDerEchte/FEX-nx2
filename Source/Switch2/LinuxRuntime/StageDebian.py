@@ -14,7 +14,7 @@ def elf_info(path, *options):
 
 
 def stage(source, output, probe, glibc_probe, process_probe, filesystem_probe=None, fs_suite=None,
-          name_limit_probe=None, proc_suite=None, rootfs_manifest=None, process_acceptance=None, comm_suite=None, comm_acceptance=None):
+          name_limit_probe=None, proc_suite=None, rootfs_manifest=None, process_acceptance=None, comm_suite=None, comm_acceptance=None, container_suite=None, container_acceptance=None):
     root = output / "fex/rootfs"
     library_dirs = ["lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu"]
     installed = set()
@@ -156,6 +156,27 @@ def stage(source, output, probe, glibc_probe, process_probe, filesystem_probe=No
         shutil.copyfile(Path(__file__).with_name("CommTools.sh"), root / "bin/comm-tools.sh")
         install(comm_acceptance, root / "bin/comm-acceptance.elf")
 
+    if container_suite:
+        # Container suite: default user plus a root variant.
+        install(container_suite, root / "bin/container-suite.elf")
+        install(container_suite, root / "bin/container-suite-root.elf")
+        (root / "bin/container-suite-root.elf.user").write_text("0 0\n", encoding="utf-8")
+
+    if container_acceptance:
+        # Debian tools for the milestone 4 acceptance script.
+        for tool in ("bin/cat", "bin/mkdir", "bin/rm", "bin/grep", "bin/sleep", "bin/mount", "bin/kill",
+                     "bin/hostname", "bin/ls", "usr/bin/unshare", "usr/bin/nsenter", "usr/bin/chrt",
+                     "usr/bin/taskset", "usr/bin/ionice", "usr/bin/bwrap", "usr/bin/wc", "usr/bin/head",
+                     "usr/bin/id", "usr/bin/printf", "usr/bin/tr", "usr/bin/seq", "usr/bin/timeout"):
+            file = source / tool
+            if not file.is_file():
+                file = source / ("usr/bin" if tool.startswith("bin/") else "bin") / Path(tool).name
+            install(file, root / tool)
+        shutil.copyfile(Path(__file__).with_name("ContainerTools.sh"), root / "bin/container-tools.sh")
+        install(container_acceptance, root / "bin/container-acceptance.elf")
+        # bubblewrap mounts its tmpfs on /tmp, which base-files would provide.
+        (root / "tmp").mkdir(exist_ok=True)
+
     if name_limit_probe:
         install(name_limit_probe, root / "bin/name-limit-probe.elf")
 
@@ -181,6 +202,8 @@ if __name__ == "__main__":
     parser.add_argument("--process-acceptance", type=Path, help="Include the process acceptance wrapper and tools")
     parser.add_argument("--comm-suite", type=Path, help="Include the memory and communication compatibility suite")
     parser.add_argument("--comm-acceptance", type=Path, help="Include the communication acceptance wrapper and tools")
+    parser.add_argument("--container-suite", type=Path, help="Include the container and scheduling compatibility suite")
+    parser.add_argument("--container-acceptance", type=Path, help="Include the container acceptance wrapper and tools")
     args = parser.parse_args()
     stage(
         args.source.resolve(), args.output.resolve(), args.probe.resolve(),
@@ -193,4 +216,6 @@ if __name__ == "__main__":
         args.process_acceptance.resolve() if args.process_acceptance else None,
         args.comm_suite.resolve() if args.comm_suite else None,
         args.comm_acceptance.resolve() if args.comm_acceptance else None,
+        args.container_suite.resolve() if args.container_suite else None,
+        args.container_acceptance.resolve() if args.container_acceptance else None,
     )

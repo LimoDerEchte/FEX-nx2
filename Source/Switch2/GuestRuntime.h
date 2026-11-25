@@ -60,7 +60,7 @@ std::unique_ptr<FtpFileSystem> OpenGuestFileSystem();
 // for the Debian rootfs setup. Null if guest memory could not be reserved.
 std::unique_ptr<RootfsSetup::RootfsWriter> OpenGuestRootfsWriter();
 // The launcher's "Setup Debian rootfs" screen (RootfsSetupHost.cpp).
-void RunRootfsSetup(PadState& Pad, const std::string& InodeLayoutError);
+void RunRootfsSetup(PadState& Pad);
 
 std::optional<uint64_t> RunGuest(uint64_t Entry, std::span<const Segment> Segments, const std::string& Folder = "/",
                                  std::string_view Program = "probe", std::span<const std::string> Arguments = {},

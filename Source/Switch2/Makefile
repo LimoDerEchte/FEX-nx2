@@ -256,8 +256,8 @@ $(BUILD)/debian-rootfs.manifest: LinuxRuntime/RootfsManifest.py LinuxRuntime/Fet
 	python3 -I LinuxRuntime/RootfsManifest.py $@
 
 .PHONY: filesystem-runtime
-filesystem-runtime: $(BUILD)/debian-rootfs.manifest $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf
-	python3 LinuxRuntime/StageDebian.py "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 2,4,$^) --filesystem-probe $(word 5,$^) --fs-suite $(word 6,$^) --name-limit-probe $(word 7,$^) --proc-suite $(word 8,$^) --process-acceptance $(word 9,$^) --comm-suite $(word 10,$^) --comm-acceptance $(word 11,$^) --rootfs-manifest $(word 1,$^)
+filesystem-runtime: $(BUILD)/debian-rootfs.manifest $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf
+	python3 LinuxRuntime/StageDebian.py "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 2,4,$^) --filesystem-probe $(word 5,$^) --fs-suite $(word 6,$^) --name-limit-probe $(word 7,$^) --proc-suite $(word 8,$^) --process-acceptance $(word 9,$^) --comm-suite $(word 10,$^) --comm-acceptance $(word 11,$^) --container-suite $(word 12,$^) --container-acceptance $(word 13,$^) --rootfs-manifest $(word 1,$^)
 
 # Filesystem compatibility suite: the Debian guest ELF and a native reference
 # run on the host kernel, as the current user and, where user namespaces
@@ -329,13 +329,36 @@ check-comm-suite-native: $(BUILD)/comm-suite-host
 		echo "Skipping the namespace-root run: unshare --map-auto is unavailable"; \
 	fi
 
+# Container and scheduling suite (milestone 4): same layout as the
+# communication suite.
+.PHONY: container-suite check-container-suite-native
+container-suite: $(BUILD)/container-suite-debian.elf
+
+$(BUILD)/container-suite.o: LinuxRuntime/ContainerSuite.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -pthread -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/container-acceptance.o: LinuxRuntime/ContainerAcceptance.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/container-suite-host: LinuxRuntime/ContainerSuite.c | $(BUILD)
+	$(HOST_X86_CC) -std=gnu11 -O2 -pthread -Wall -Wextra -Werror $< -o $@
+
+check-container-suite-native: $(BUILD)/container-suite-host
+	mkdir -p $(BUILD)/container-suite-native
+	cd $(BUILD)/container-suite-native && { ../container-suite-host; test $$? -eq 42; }
+	if unshare --map-root-user --map-auto true 2>/dev/null; then \
+		cd $(BUILD)/container-suite-native && { unshare --map-root-user --map-auto ../container-suite-host; test $$? -eq 42; }; \
+	else \
+		echo "Skipping the namespace-root run: unshare --map-auto is unavailable"; \
+	fi
+
 .PHONY: filesystem-probe
 filesystem-probe: $(BUILD)/filesystem-probe-debian.elf
 
 $(BUILD)/filesystem-probe.o: LinuxRuntime/FilesystemProbe.c | $(BUILD)
 	$(HOST_X86_CC) -m64 -march=x86-64 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
 
-$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
+$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
 	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(DEBIAN_LIBS)" \
 		"$(DEBIAN_CRT)/Scrt1.o" "$(DEBIAN_CRT)/crti.o" $< "$(DEBIAN_LIBS)/libc.so.6" "$(DEBIAN_CRT)/crtn.o" -o $@
 
@@ -423,6 +446,34 @@ check-guest-inet: $(BUILD)/guest-inet-test
 	$<
 
 $(BUILD)/guest-inet-test: LinuxRuntime/GuestInetTest.cpp GuestInet.h GuestSocket.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-sched
+check-guest-sched: $(BUILD)/guest-sched-test
+	$<
+
+$(BUILD)/guest-sched-test: LinuxRuntime/GuestSchedTest.cpp GuestSched.h GuestCredentials.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-namespaces
+check-guest-namespaces: $(BUILD)/guest-namespaces-test
+	$<
+
+$(BUILD)/guest-namespaces-test: LinuxRuntime/GuestNamespacesTest.cpp GuestNamespaces.h GuestCredentials.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-mounts
+check-guest-mounts: $(BUILD)/guest-mounts-test
+	$<
+
+$(BUILD)/guest-mounts-test: LinuxRuntime/GuestMountsTest.cpp GuestMounts.h GuestNamespaces.h GuestCredentials.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: check-guest-seccomp
+check-guest-seccomp: $(BUILD)/guest-seccomp-test
+	$<
+
+$(BUILD)/guest-seccomp-test: LinuxRuntime/GuestSeccompTest.cpp GuestSeccomp.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $< -o $@
 
 .PHONY: check-guest-futex

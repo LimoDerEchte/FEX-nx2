@@ -29,6 +29,9 @@ PACKAGES = (
     "grep", "procps", "libproc2-0", "inotify-tools", "libinotifytools0",
     # Milestone 3 tool acceptance: getent, nc and xz.
     "libc-bin", "netcat-openbsd", "libbsd0", "libmd0", "xz-utils", "liblzma5",
+    # Milestone 4 tool acceptance: bwrap, unshare, nsenter, chrt, taskset, ionice.
+    # Their libraries (libselinux1, libcap2) are already listed.
+    "bubblewrap", "util-linux", "mount", "hostname", "libmount1", "libblkid1",
 )
 
 

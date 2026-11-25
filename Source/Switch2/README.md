@@ -242,13 +242,12 @@ so the next launch must roll it back or forward; the bundle stages it for
 the two `filesystem-recover-*-write.elf` probes.
 
 Guest inode metadata (ownership, modes, links, xattrs) and its recovery
-journal live in `/fex/.inode/`. Horizon limits a whole SD path to 257
+journal live in `/fex/.inode_store/`. Horizon limits a whole SD path to 257
 bytes, so entries whose path is longer, and everything below them, are
 kept there as well: directories as overflow records and files as objects
-in `/fex/.inode/objects`. They do not appear under `/fex/rootfs` on the
-SD card; use the FTP server to copy them. Launchers before 0.12.33 kept them as
-`/fex/.inode-*`; the launcher moves those on startup and refuses to run
-guests if an entry exists in both places.
+in `/fex/.inode_store/objects`. They do not appear under `/fex/rootfs` on the
+SD card; use the FTP server to copy them. Launchers before 0.15.1 used
+`/fex/.inode/`; it is not migrated (delete it by hand).
 
 ## Graphics (shelved)
 

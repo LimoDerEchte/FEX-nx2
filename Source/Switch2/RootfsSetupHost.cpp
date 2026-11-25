@@ -260,13 +260,12 @@ std::string Install(Screen& View, const Manifest& List) {
 } // namespace
 
 namespace Switch2Guest {
-void RunRootfsSetup(PadState& Pad, const std::string& InodeLayoutError) {
+void RunRootfsSetup(PadState& Pad) {
   Screen View(Pad);
   std::vector<uint8_t> Text;
   Manifest List;
   std::string Problem;
-  if (!InodeLayoutError.empty()) Problem = InodeLayoutError;
-  else if (!ReadSdFile(ManifestPath, Text)) Problem = "Missing /fex/setup/debian-rootfs.manifest. Copy the full SD bundle.";
+  if (!ReadSdFile(ManifestPath, Text)) Problem = "Missing /fex/setup/debian-rootfs.manifest. Copy the full SD bundle.";
   else if (const auto* Error = ParseManifest({reinterpret_cast<const char*>(Text.data()), Text.size()}, List)) Problem = Error;
   if (!Problem.empty()) {
     View.Add(Problem);

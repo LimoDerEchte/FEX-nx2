@@ -47,38 +47,6 @@ Result EnsureDirectory(FsFileSystem& SdCard, const char* Path) {
   return R_SUCCEEDED(fsFsGetEntryType(&SdCard, Path, &Type)) && Type == FsDirEntryType_Dir ? 0 : Status;
 }
 
-// Launchers before 0.12.33 kept inode metadata as flat /fex/.inode-* entries.
-// Each entry is renamed into /fex/.inode before the guest runtime reads it.
-// A launch interrupted mid-way finishes the remaining entries next time.
-// Guest launches are refused while this is set, so the runtime never starts
-// from empty metadata while the real metadata sits at a legacy path.
-std::string InodeLayoutError;
-
-void MoveLegacyInodeFiles(FsFileSystem& SdCard) {
-  for (const auto& Move : Switch2Guest::InodeFiles::LegacyMoves) {
-    char Legacy[FS_MAX_PATH], Current[FS_MAX_PATH];
-    std::snprintf(Legacy, sizeof(Legacy), "%s", Move.Legacy);
-    std::snprintf(Current, sizeof(Current), "%s", Move.Current);
-    FsDirEntryType Type {};
-    if (R_FAILED(fsFsGetEntryType(&SdCard, Legacy, &Type))) continue;
-    FsDirEntryType Existing {};
-    Result Status = 0;
-    // Never overwrite metadata already in the new layout.
-    if (R_SUCCEEDED(fsFsGetEntryType(&SdCard, Current, &Existing))) {
-      InodeLayoutError = std::string("Inode metadata exists at both ") + Legacy + " and " + Current + ". Remove one.";
-      return;
-    }
-    Status = Type == FsDirEntryType_Dir ? fsFsRenameDirectory(&SdCard, Legacy, Current) :
-                                          fsFsRenameFile(&SdCard, Legacy, Current);
-    if (R_FAILED(Status)) {
-      char Message[160];
-      std::snprintf(Message, sizeof(Message), "Could not move %s to %s (0x%08x).", Legacy, Current, Status);
-      InodeLayoutError = Message;
-      return;
-    }
-  }
-}
-
 Result OpenLog() {
   FsFileSystem SdCard {};
   Result Status = fsOpenSdCardFileSystem(&SdCard);
@@ -104,7 +72,6 @@ Result OpenLog() {
       return Status;
     }
   }
-  MoveLegacyInodeFiles(SdCard);
 
   constexpr u32 Mode = FsOpenMode_Write | FsOpenMode_Append;
   Status = fsFsOpenFile(&SdCard, LogPath, Mode, &LogFile);
@@ -173,7 +140,7 @@ void WriteGuestOutput(const char* Text) {
 }
 
 void WriteRunCheckpoint(const char* Text) {
-  char Line[256];
+  char Line[640];
   const auto Length = std::snprintf(Line, sizeof(Line), "%s\n", Text);
   if (Length > 0 && WriteLogBytes({Line, std::min<size_t>(Length, sizeof(Line) - 1)})) FlushLogFile();
 }
@@ -380,7 +347,6 @@ void RunFtpServer(PadState& Pad) {
   // One socket-service reference counted with the guest runtime's (HostNet.cpp): 4 BSD sessions.
   const bool Network = Problem.empty() && Switch2Guest::HostNet::Acquire();
   if (Problem.empty() && !Network) Problem = "Could not start the network socket service.";
-  if (Problem.empty() && !InodeLayoutError.empty()) Problem = InodeLayoutError;
   if (Problem.empty() && !(Files = Switch2Guest::OpenGuestFileSystem())) Problem = "Could not reserve transfer memory.";
   char Password[8];
   std::snprintf(Password, sizeof(Password), "%06u", static_cast<unsigned>(randomGet64() % 1000000));
@@ -785,10 +751,6 @@ private:
       }
     }
     // An optional "<program>.user" file holds "uid gid" for the launch.
-    if (!InodeLayoutError.empty()) {
-      ShowElfResult(InodeLayoutError);
-      return;
-    }
     std::optional<std::pair<uint32_t, uint32_t>> Credentials;
     if (ShellLaunch && RootShell) {
       Credentials.emplace(0, 0);
@@ -910,13 +872,12 @@ void __libnx_exception_handler(ThreadExceptionDump* Dump) {
 int main() {
   using namespace Switch2Guest;
   const Result LogStatus = OpenLog();
-  WriteLog("--- FEX Switch 2 launcher 0.14.3 started ---");
+  WriteLog("--- FEX Switch 2 launcher 0.15.12 started ---");
   WriteLog("Initializing console...");
   consoleInit(nullptr);
   if (R_FAILED(LogStatus)) {
     std::printf("Could not open SD log %s (0x%08x)\n", LogPath, LogStatus);
   }
-  if (!InodeLayoutError.empty()) PrintStage(InodeLayoutError.c_str());
   WriteLog("Initializing FEXCore configuration...");
   FEXCore::Config::Initialize();
   LogMan::Msg::InstallHandler([](LogMan::DebugLevels Level, const char* Message) {
@@ -943,7 +904,7 @@ int main() {
     }
     if (Menu.Update(Buttons)) {
       if (Menu.TakeFtpRequest()) RunFtpServer(Pad);
-      if (Menu.TakeRootfsRequest()) Switch2Guest::RunRootfsSetup(Pad, InodeLayoutError);
+      if (Menu.TakeRootfsRequest()) Switch2Guest::RunRootfsSetup(Pad);
       Menu.Draw();
     }
     consoleUpdate(nullptr);

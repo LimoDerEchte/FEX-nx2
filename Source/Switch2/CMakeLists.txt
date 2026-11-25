@@ -85,7 +85,7 @@ set(GUEST_NACP "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nacp")
 set(GUEST_NRO "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nro")
 set(GUEST_ICON "${CMAKE_CURRENT_SOURCE_DIR}/FexIcon.jpg")
 add_custom_command(OUTPUT "${GUEST_NACP}"
-  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Team, Limo (nx2)" "0.14.3" "${GUEST_NACP}"
+  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Team, Limo (nx2)" "0.15.12" "${GUEST_NACP}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   VERBATIM)
 add_custom_command(OUTPUT "${GUEST_NRO}"
