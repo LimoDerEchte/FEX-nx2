@@ -4487,6 +4487,11 @@ private:
     FEXCore::HostFeatures Features {};
     Features.ProcessFeatures.Is64BitMode = true;
     Features.DCacheLineLog2 = 4;
+    // The console's Cortex-A78C runs LSE atomics, RCPC (LDAPR) and LRCPC2 (LDAPUR/STLUR); mtprobe 3 executed all three
+    // (docs/MultithreadingSdk.md). With RCPC, FEX's x86 memory-ordering (TSO) loads and stores cost about 9 % instead of 8x.
+    Features.SupportsAtomics = true;
+    Features.SupportsRCPC = true;
+    Features.SupportsTSOImm9 = true;
     Process.Context = ContextType::CreateNewContext(Features);
     Process.Context->SetSignalDelegator(&Process.Signals);
     Process.Context->SetSyscallHandler(this);

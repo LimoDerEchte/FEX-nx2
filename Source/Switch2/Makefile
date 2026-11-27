@@ -74,6 +74,12 @@ $(DLPROBE).nacp: | $(BUILD)
 $(DLPROBE).nro: $(DLPROBE).elf $(DLPROBE).nacp $(APP_ICON)
 $(DLPROBE).nro: NROFLAGS = --icon=$(APP_ICON) --nacp=$(DLPROBE).nacp
 
+# EXPERIMENT multithreading probe (docs/MultithreadingPlan.md Task 0): links FEXCore, so it builds in the launcher tree.
+# `make mt-probe` -> build/guest/fex-switch2-mtprobe.nro, log sdmc:/fex/mtprobe.log.
+.PHONY: mt-probe
+mt-probe:
+	cmake --build build/guest --target mtprobe_nro
+
 # EXPERIMENT UI probe: Vulkan on OunceVK behind the ui/platform and ui/render interfaces (ounce-hbmenu's approach).
 # `make ui-probe` -> build/fex-switch2-uiprobe.nro, log sdmc:/switch/fex-uiprobe.log.
 # `make ui-probe-host` -> build/fex-uiprobe-host (same probe, headless Vulkan on the Linux GPU, writes a PNG).

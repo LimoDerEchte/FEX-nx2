@@ -132,7 +132,7 @@ set(GUEST_NACP "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nacp")
 set(GUEST_NRO "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nro")
 set(GUEST_ICON "${CMAKE_CURRENT_SOURCE_DIR}/launcher/FexIcon.jpg")
 add_custom_command(OUTPUT "${GUEST_NACP}"
-  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Team, Limo (nx2)" "0.17.16" "${GUEST_NACP}"
+  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Team, Limo (nx2)" "0.17.17" "${GUEST_NACP}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   VERBATIM)
 add_custom_command(OUTPUT "${GUEST_NRO}"
@@ -141,3 +141,27 @@ add_custom_command(OUTPUT "${GUEST_NRO}"
   DEPENDS fex-switch2-guest "${GUEST_NACP}" "${GUEST_ICON}"
   VERBATIM)
 add_custom_target(guest_nro ALL DEPENDS "${GUEST_NRO}")
+
+# EXPERIMENT (multithreading milestone, Task 0): the multithreading probe NRO (`make mt-probe`; log sdmc:/fex/mtprobe.log).
+# Its x86 test code (probes/MultithreadBlobs.S) is assembled with the build machine's x86-64 `as` into a generated header.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(MT_GEN "${CMAKE_BINARY_DIR}/mtprobe-gen")
+add_custom_command(OUTPUT "${MT_GEN}/MtBlobs.h"
+  COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/probes/MakeMultithreadBlobs.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/probes/MultithreadBlobs.S" "${MT_GEN}" "${MT_GEN}/MtBlobs.h"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/probes/MultithreadBlobs.S" "${CMAKE_CURRENT_SOURCE_DIR}/probes/MakeMultithreadBlobs.py"
+  VERBATIM)
+add_executable(fex-switch2-mtprobe probes/MultithreadProbe.cpp "${MT_GEN}/MtBlobs.h")
+target_include_directories(fex-switch2-mtprobe PRIVATE "${MT_GEN}" "${CMAKE_BINARY_DIR}/include")
+target_link_directories(fex-switch2-mtprobe PRIVATE "${DKP}/portlibs/switch2/lib" "${DKP}/portlibs/switch/lib" "${DKP}/libounce/lib")
+target_link_libraries(fex-switch2-mtprobe PRIVATE fex_switch2_host FEXCore FEXCore_Base JemallocLibs xxHash::xxhash kaihen m nx)
+set_target_properties(fex-switch2-mtprobe PROPERTIES SUFFIX ".elf")
+set(MT_NACP "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-mtprobe.nacp")
+set(MT_NRO "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-mtprobe.nro")
+add_custom_command(OUTPUT "${MT_NACP}"
+  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX Switch 2 MT Probe" "FEX Team, Limo (nx2)" "mtprobe 3" "${MT_NACP}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt" VERBATIM)
+add_custom_command(OUTPUT "${MT_NRO}"
+  COMMAND "${DKP}/tools/bin/elf2nro" $<TARGET_FILE:fex-switch2-mtprobe> "${MT_NRO}" "--icon=${GUEST_ICON}" "--nacp=${MT_NACP}"
+  DEPENDS fex-switch2-mtprobe "${MT_NACP}" "${GUEST_ICON}" VERBATIM)
+add_custom_target(mtprobe_nro DEPENDS "${MT_NRO}")

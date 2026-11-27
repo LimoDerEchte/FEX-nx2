@@ -2,6 +2,28 @@
 
 ## Restart checkpoint
 
+### 0.17.17 console (2026-11-27): FEX gets the console's CPU features (accepted, committed)
+Console (log `.superpowers/sdd/console-0.17.17.log`): perl array loop 1m43.8s -> 1m38.3s, xz -9 1m8.6s -> 1m7.3s;
+comm 124/0/1, fs 81/0/2, pty 43/0/0, proc 241/2/6, container 53/1/0. The 3 failures (`proc/rlimit_inherited_by_fork_and_exec`,
+`timer/alarm_survives_exec`, `seccomp/filter_inherited_and_kept_across_exec`) are not from this change: they re-exec
+`/proc/self/exe`, which names the card path `/fex/games/<suite>.elf`, and the guest cannot reach the card by absolute
+path (execve ENOENT). They passed at M4, when the suites ran from the RootFS `/bin`. Next: that fix, then Task 1.
+Previous entry text:
+`InitializeProcessContext` (`runtime/GuestRuntime.cpp`) passes `SupportsAtomics`, `SupportsRCPC`, `SupportsTSOImm9`
+(LSE, LDAPR, LDAPUR/STLUR; mtprobe 3 ran all three). TSO stays on for every process until multithreading Task 1
+(user decision: TSO from the second thread on). Host: guest_nro 0 warnings, filesystem-runtime ok; codegen runs only on
+the console. NRO `.superpowers/sdd/fex-switch2-guest-0.17.17.nro`. Console: suites (proc, comm, fs, pty, container,
+thread-ipc) plus a speed comparison with 0.17.16 (perl array loop, xz). Then its own commit, then Task 1.
+
+### Multithreading Task 0: probe runs 1-3 done, Task 0 complete (results `docs/MultithreadingSdk.md`, logs `.superpowers/sdd/mtprobe-{1,2,3}.log`); TSO default decision with the user pending (2026-11-27)
+EXPERIMENT `make mt-probe` -> `build/guest/fex-switch2-mtprobe.nro` (copy `.superpowers/sdd/fex-switch2-mtprobe-1.nro`), sources
+`probes/MultithreadProbe.cpp`, `probes/MultithreadBlobs.S` (x86 test code, assembled on the PC by
+`probes/MakeMultithreadBlobs.py`), CMake target `mtprobe_nro`. Log `sdmc:/fex/mtprobe.log`. Checks in order: info,
+thread_limit, core_scaling, wake_latency, jit_parallel (gate), poll_stop, smc_cross_thread (gate), tso_litmus, tso_cost,
+thread_memory, exec_stack (last; may crash by design). Run 1 log `.superpowers/sdd/mtprobe-1.log`: gates pass, crash in exec_stack at 1 MiB. Probe 2 (`.superpowers/sdd/fex-switch2-mtprobe-2.nro`) re-runs core placement (all-cores mask), pinned jit_parallel and a logged stack ladder; sidecar `sdmc:/fex/mtprobe.full` runs every check. Decisions and plan: `docs/MultithreadingPlan.md`. Next: results into
+`docs/MultithreadingSdk.md`, TSO default decision with the user, then Task 1. Host: probe and guest_nro build, 0 warnings;
+nothing of it runs on the host.
+
 ### 0.17.16 console (2026-11-27): launcher UI milestone accepted and committed. Console: SD-card image install
 (hash matches, old RootFS removed only after verify), broken card image fails with the RootFS kept, FTP stop during an
 upload (426, deferred stop, no crash), closed tab kills its `nohup sleep`; no fault lines. Log
@@ -1834,6 +1856,11 @@ native Vulkan layer. Steam Big Picture remains the long-term goal.
   place: fatal hooks (`WriteFatalLog`, `--wrap=abort`, `diagAbortWithResult`), the runtime trace written at once in
   Detailed/Trace. The 5 s memory report experiment (`ReportMemory`) was removed in 0.17.16 (no recurrence). If it happens
   again: Detailed log + HOS error code; bring the memory report back (`HostHeapReport()` every 5 s in `RunThreads`).
+- **Full arm64 feature test on the console (user, 2026-11-27).** For performance work: probe every arm64 feature the
+  console's A78C offers (by executing each instruction class in a probe, as mtprobe 3 did for LSE/RCPC/LRCPC2, since the ID
+  registers cannot be read safely from EL0), then use the result for both builds: the compiler flags of the NRO itself
+  (`-march`/`-mcpu` for the launcher, runtime and FEXCore host code) and the `HostFeatures` FEXCore generates guest code
+  for (today the runtime passes none). Known so far: LSE, RCPC, LRCPC2 present (mtprobe 3).
 - **Launcher review leftovers (0.17.16).** InRelease freshness (no Valid-Until / signature time check: replay of an older
   signed index is possible). The live RootFS index is plain HTTP (no TLS on the console): newer entries are limited to the
   built-in entry's host and marked not authenticated; a signed index would close it. The 0.16.3 perf counters

@@ -1,7 +1,17 @@
 # Guest-to-host multithreading (plan, 2026-11-26)
 
-Status: plan only, not started. Replaces the sketch in [Milestone5Plan.md](Milestone5Plan.md) Task 0. Discuss with the user
+Status: Task 0 (probe) complete; Task 1 next, after the 0.17.17 CPU feature fix. Replaces the sketch in [Milestone5Plan.md](Milestone5Plan.md) Task 0. Discuss with the user
 before starting; recommended order: after UI Task 8 (ptys and tabs), before the 32-bit work of Milestone 5.
+
+## Decisions (user, 2026-11-27)
+
+- Task 0 ships as a separate EXPERIMENT probe NRO (`make mt-probe`, log `sdmc:/fex/mtprobe.log`), not in the launcher.
+- TSO default (decided after the probe, 2026-11-27): a process runs without TSO until it creates its second thread; then
+  TSO turns on for it (design 7). Vector and memcpy TSO stay off (FEX defaults). With RCPC the cost is about 9 %
+  ([MultithreadingSdk.md](MultithreadingSdk.md) run 3).
+- Host CPU features (LSE, RCPC, LRCPC2) ship first as a separate fix (0.17.17), before Task 1.
+- Cores: guest threads may use every core the process has; the UI thread runs at a higher priority than guest threads.
+- FTP stays suspended while guest tabs run (design 9: no FTP under the runtime lock in this milestone).
 
 ## Today
 
@@ -68,6 +78,14 @@ Answer on the console, with numbers, in `docs/MultithreadingSdk.md`; stop and re
 - Stopping a thread running guest code via its poll word from another core, and latency.
 - TSO cost: a memory-heavy benchmark with `TSOEnabled` off/on (and the vector/memcpy variants).
 - Event wait/wake latency (`ueventSignal`/`svcWaitSynchronization` or condvar) between cores.
+
+Probe checks (stop and report if `jit_parallel` or `smc_cross_thread` fails):
+`thread_limit` (resource limit, create 256 KiB-stack threads to failure, ms per create), `core_scaling` (fixed work on
+1..6 threads, pinned and unpinned), `jit_parallel` (one Context, N threads `ExecuteThread` an x86 loop, results checked),
+`poll_stop` (stop latency via the poll word from another core), `smc_cross_thread` (rewrite and invalidate a block another
+thread runs), `tso_litmus` (2-thread message passing, TSO off/on), `tso_cost` (store/memcpy/pointer-chase loop, TSO off/on
+and the vector/memcpy variants), `wake_latency` (condvar, `ueventSignal`, arbiter ping-pong between cores),
+`thread_memory` (heap per extra guest thread). x86 test blobs are assembled on the PC at build time.
 
 ### Task 1: host thread per guest thread under one runtime lock
 
