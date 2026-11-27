@@ -1,0 +1,16 @@
+Bundled UI assets (all embedded into the NRO; nothing is read from the SD card at runtime).
+
+Fonts (SIL OFL 1.1, static TTF, current upstream releases, not the older Apache-2.0 ones)
+  Nunito Sans (font version 3.101)  Regular, SemiBold, Bold, ExtraBold
+    https://github.com/googlefonts/nunitosans  fonts/ttf/NunitoSans-*.ttf  (main, fetched 2026-11-25)   licenses/NunitoSans-OFL.txt
+  JetBrains Mono v2.304  Regular, SemiBold, Bold
+    https://github.com/JetBrains/JetBrainsMono/releases/tag/v2.304  fonts/ttf/JetBrainsMono-*.ttf        licenses/JetBrainsMono-OFL.txt
+  Noto Sans (notofonts latin-greek-cyrillic, font version 2.015)  Regular, Medium
+    https://github.com/notofonts/notofonts.github.io  fonts/NotoSans/full/ttf/NotoSans-*.ttf (main, fetched 2026-11-25)  licenses/NotoSans-OFL.txt
+
+Icons (Lucide 1.80.0, ISC + MIT for the Feather-derived ones)
+  https://github.com/lucide-icons/lucide/tree/1.80.0/icons  (tag 1.80.0, fetched 2026-11-25)            licenses/LUCIDE-LICENSE.txt
+  The set is listed in Assets.cpp. Lucide has no SD card icon: SdCard maps to memory-stick.svg.
+  Lucide renamed terminal-square to square-terminal: TerminalSquare maps to square-terminal.svg.
+
+NanoSVG (zlib) lives in ThirdParty/nanosvg (commit 239e102ec2 era); license text: licenses/NanoSVG-LICENSE.txt

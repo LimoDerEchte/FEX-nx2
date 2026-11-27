@@ -21,6 +21,21 @@ untracked sources, and the handoff together. Rebuild local artifacts under
 `Source/Switch2/build/` as needed. Use the recorded diagnostic pair for a
 pending console run.
 
+## Source layout
+
+- `launcher/`: the NRO main and text launcher, RootFS setup host code, icon.
+- `runtime/`: the Linux runtime (`GuestRuntime.*`, `GuestElf.*`) and its headers, grouped in `fs/`, `process/`, `memory/` and `ipc/`.
+- `host/`: console host support (arena, disk cache, memory, network).
+- `probes/`: EXPERIMENT console probes and the x86-64 hello ELF.
+- `demos/`: guest demo programs (`Dynamic/`, `Graphics/`, `Maze/`, `SDL2/`).
+- `tests/unit/`: host unit tests and the FTP test; `tests/guest/`: guest-side suites and acceptance programs.
+- `ui/`: the launcher UI (Task 1 so far): `platform/` (Display, Input, System; `switch2/` console, `host/` Linux headless, `fake/` tests) and `render/` (Renderer interface, Vulkan renderer, GLSL shaders). Only these two folders include Vulkan or libnx headers (`make check-ui` enforces it). `make ui-probe` builds the console UI probe NRO (EXPERIMENT, log `sdmc:/switch/fex-uiprobe.log`), `make ui-probe-host` the headless host probe.
+- RootFS install (UI Task 5): `runtime/fs/GuestSquashfs.h` (zstd squashfs reader), `runtime/fs/GuestRootfsInstall.h` (download, XXH3 check, extraction, unbreak step, extra Ubuntu packages, marker), `host/HttpClient.h`, `launcher/RootfsInstallHost.cpp` (home menu "Install Ubuntu 24.04 RootFS"), `ui/RootfsIndex.*` and `ui/assets/rootfs-index.json` (built-in index), `ThirdParty/zstd`. `make check-rootfs-install` checks it against host `mksquashfs`/`unsquashfs`; `make download-probe` builds the console download probe NRO (EXPERIMENT, log `sdmc:/switch/fex-downloadprobe.log`). Format and differences from FEX's `unbreak_chroot.sh`: `docs/ui/rootfs-image-format.md`.
+- `tools/`: rootfs and Debian staging scripts; `docs/`: plans and inventories; `ThirdParty/`: vendored code and build scripts.
+
+Headers are included by bare name: the Makefile and CMake put `runtime/`
+and its subfolders, `host/` and this folder on one include path.
+
 ## x86-64 guest probe
 
 Build with Clang, devkitA64, libounce, and kaiHEN. Initialize the dependencies
@@ -38,6 +53,24 @@ toolchain uses Clang with emulated TLS for FEXCore and the devkitA64 linker
 driver with libounce's startup code for the NRO.
 
 ## Using the launcher
+
+The launcher is a GPU-drawn UI (`ui/`, app shell `ui/App.cpp`, console backend `launcher/LauncherBackend.cpp`). Copy only
+`Source/Switch2/build/guest/fex-switch2-guest.nro` to the SD card; fonts, icons, licenses and the RootFS index are inside it. With
+no RootFS installed it opens RootFS setup (first run); otherwise Home: Launch Shell, the FTP pill (X), Settings (+), B to exit.
+Settings > Developer holds the old menu's test entries: Root shell, Run ELF file (and single-block JIT; the `.args`, `.user` and
+`.recovery-test` files next to the program apply), the embedded x86-64 guest, the ARM64 JIT probe and the Debian developer setup.
+Output of those runs appears in a terminal tab. The sections below describe the text menu that was replaced; the behavior of the
+runtime they describe is unchanged.
+
+Verification: `make -C Source/Switch2 check-ui` (host UI tests, app shell flow tests, every screen in both themes at 720p, 1080p and
+4K under `build/ui-shots/`), `make -C Source/Switch2 check-guest-<name>` for each runtime test, `make -C Source/Switch2
+check-rootfs-install`, `cmake --build Source/Switch2/build/guest --target guest_nro` and `make -C Source/Switch2 check-nro-assets`.
+
+### Text menu (replaced by the UI)
+
+With a shell open, use **+ Settings** to reach **Developer** and start a root
+shell or ELF in a new tab. Use the tab strip's **+** to open another user
+shell. Single-block JIT and recovery tests need their own runtime.
 
 Copy `Source/Switch2/build/guest/fex-switch2-guest.nro` to the SD card and
 launch it from hbmenu under kaiHEN. Use the D-pad or stick to navigate, A
@@ -58,7 +91,7 @@ longer than the SD card can hold (see below) work; new files and folders
 are owned by uid 1000, the default owner of files copied to the SD card. It supports RETR, STOR,
 APPE, REST, LIST, NLST, MLSD, MLST, SIZE, MDTM, MFMT, MKD, RMD, DELE and
 RNFR/RNTO. `make -C Source/Switch2 check-guest-ftp` runs the protocol
-test against a host build; `LinuxRuntime/FtpTest.py <address> <port>
+test against a host build; `tests/unit/FtpTest.py <address> <port>
 <password> 1000` runs the same test against the console and checks that
 new entries belong to uid 1000.
 
@@ -179,7 +212,7 @@ message and exit with status 42. Each executable uses the same
 package symlinks when copying libraries to the SD card.
 
 See [the active milestone](NextMilestone.md) for hardware results and the
-next runtime work. [The glibc bring-up notes](LinuxRuntimePlan.md) record
+next runtime work. [The glibc bring-up notes](docs/LinuxRuntimePlan.md) record
 the prior 0.8.4 tests.
 
 ## Interactive Bash terminal
@@ -199,9 +232,62 @@ new `process-probe.elf` checks private/shared fork mappings, inherited
 pipes, close-on-exec, and exit status. General signal delivery and job
 control remain open.
 
+## Test programs on the console
+
+Test ELFs, their sidecars (`.args`, `.user`, `.recovery-test`) and the helper
+scripts live in `sdmc:/fex/games`, the folder for standalone ELFs. They never
+go into the RootFS.
+
+```sh
+make -C Source/Switch2 debian-sysroot        # once: Debian 12 packages for linking
+make -C Source/Switch2 filesystem-runtime   # stages build/guest/sd/fex/games
+```
+
+`filesystem-runtime` deletes `build/guest/sd/fex` first, then stages only
+`fex/games/`. Copy `Source/Switch2/build/guest/sd/fex` onto the SD card as it
+is: the folder never contains RootFS files, so it cannot overwrite the
+installed Ubuntu RootFS. (`make debian-runtime` still stages the old Debian
+developer bundle, with its own libraries, in `build/debian-runtime`.)
+
+Run a program from **Settings > Developer > Run ELF** and choose it in
+`/fex/games`. The Ubuntu RootFS must be installed: it supplies `/`, the
+interpreter, the libraries, and bash, coreutils, util-linux, `nc`,
+`inotifywait`, `bwrap` and the other tools. The working folder is the games
+folder, which has no guest path, so the programs and scripts reach each other
+through relative paths (`./proc-suite.elf`). Scratch data goes to `/home/fex`
+(default user, uid 1000) or `/root` (the `-root` variants) through `-d DIR`
+in the `.args` sidecar. Every program exits 42 when it passes, unless the
+table says otherwise.
+
+| Program | Checks | Expected |
+| --- | --- | --- |
+| `thread-ipc.elf` | threads, futexes, pipes | success message, exit 42 |
+| `glibc-probe.elf` | `dlopen` of `libm.so.6` | success message, exit 42 |
+| `process-probe.elf` | fork, exec, pipes, close-on-exec | exit 42 |
+| `filesystem-probe.elf` | filesystem ABI | `Filesystem probe passed.`, exit 42 |
+| `filesystem-persist-write.elf`, then `-read.elf` | data and metadata survive a restart (`/home/fex/.fex-persistence-01231`) | each exit 42 |
+| `filesystem-recover-rollback-write.elf`, `-read.elf`, `filesystem-recover-commit-write.elf`, `-read.elf` | journaled rename interrupted at the checkpoint, recovered on the next launch (`/.fex-recovery-test`, root) | each exit 42; run write, then read |
+| `filesystem-coreutils.elf` | coreutils against the filesystem | `Coreutils filesystem probe passed.`, exit 0 |
+| `filesystem-acceptance.elf` | probe, coreutils and `fs-suite.elf` | `ABI 42, coreutils 0, suite 42` |
+| `fs-suite.elf`, `fs-suite-root.elf` | filesystem compatibility suite | exit 42 |
+| `proc-suite.elf`, `proc-suite-root.elf` | processes, signals, clocks, timers, epoll, inotify | exit 42 |
+| `process-acceptance.elf` | `proc-suite.elf` and `process-tools.sh` | `suite 42, tools 42` |
+| `comm-suite.elf`, `comm-suite-root.elf` | memory, threads, futexes, pipes, sockets | exit 42 |
+| `comm-acceptance.elf` | `comm-suite.elf` and `comm-tools.sh` | `suite 42, tools 42` |
+| `container-suite.elf`, `container-suite-root.elf` | namespaces, mounts, seccomp, scheduling | exit 42 |
+| `container-acceptance.elf` | `container-suite.elf` and `container-tools.sh` | `suite 42, tools 42` |
+| `pty-suite.elf`, `pty-suite-root.elf` | pseudo-terminals, job control | exit 42 |
+| `name-limit-probe.elf` | SD name and path length limits | `Name limit probe finished.`, exit 42 |
+
+The helper scripts (`filesystem-coreutils.sh`, `process-tools.sh`,
+`comm-tools.sh`, `container-tools.sh`) are run by bash from the wrappers; they
+also run by hand with `bash ./process-tools.sh DIR`. On the host, the native
+reference is `make check-fs-suite-native` and the other `check-*-native`
+targets; they run the suites from the build folder, unchanged.
+
 ## Filesystem compatibility suite
 
-`LinuxRuntime/FsSuite.c` checks common behavior and edge cases for
+`tests/guest/FsSuite.c` checks common behavior and edge cases for
 descriptors and I/O, paths and links, metadata and permissions, allocation
 and transfer, and extended attributes. Each test runs in its own scratch
 directory and prints a TAP line; failures name the source line, result and
@@ -210,28 +296,36 @@ errno. The suite exits 42 when nothing fails.
 ```sh
 make -C Source/Switch2 debian-sysroot        # Debian 12 packages into build/debian-sysroot
 make -C Source/Switch2 check-fs-suite-native # host kernel reference, as you and as namespace root
-make -C Source/Switch2 filesystem-runtime   # stages the SD bundle in build/guest/sd
-Source/Switch2/LinuxRuntime/RunPackagedNative.sh Source/Switch2/build/guest/sd/fex/rootfs [--root] /bin/fs-suite.elf
+make -C Source/Switch2 filesystem-runtime   # stages the test programs in build/guest/sd/fex/games
 ```
 
 Pass name prefixes to select tests (`io/`, `path/rename`) or `!prefix` to
-exclude them, and `-l` to list them. The bundle stages `/bin/fs-suite.elf`
-(default user) and `/bin/fs-suite-root.elf`, which runs as root through
+exclude them, `-l` to list them, and `-d DIR` to make the scratch folder in
+DIR (default: the working folder). The bundle stages `fs-suite.elf`
+(default user) and `fs-suite-root.elf`, which runs as root through
 the launcher's credential file so cross-identity cases execute.
-`/bin/filesystem-acceptance.elf` runs the ABI probe, coreutils and the
-suite together.
+`filesystem-acceptance.elf` runs the ABI probe, coreutils and the
+suite together. See "Test programs on the console" below for where they live.
 
-`LinuxRuntime/ProcSuite.c` is the process and event suite of milestone 2
+`tests/guest/ProcSuite.c` is the process and event suite of milestone 2
 (groups `proc/`, `signal/`, `session/`, `cred/`, `clock/`, `timer/`,
 `event/`, `poll/`, `epoll/`, `inotify/`), with the same selection options
-and exit code. `/bin/process-acceptance.elf` runs it, then
-`/bin/process-tools.sh` (pipelines, `timeout`, `kill`, traps, jobs and
-`inotifywait` from Debian), and prints `suite 42, tools 42` on success;
-`/bin/proc-suite-root.elf` runs the suite as root.
+and exit code. `process-acceptance.elf` runs it, then
+`process-tools.sh` (pipelines, `timeout`, `kill`, traps, jobs and
+`inotifywait` from the RootFS), and prints `suite 42, tools 42` on success;
+`proc-suite-root.elf` runs the suite as root.
 
 ```sh
 make -C Source/Switch2 check-proc-suite-native
-Source/Switch2/LinuxRuntime/RunPackagedNative.sh Source/Switch2/build/guest/sd/fex/rootfs /bin/process-acceptance.elf
+```
+
+`tests/guest/PtySuite.c` is the pseudo-terminal suite (group `pty/`, 43
+cases, same options and exit code; `pty-suite.elf` and
+`pty-suite-root.elf`). Behavior and deviations:
+[docs/TerminalInventory.md](docs/TerminalInventory.md).
+
+```sh
+make -C Source/Switch2 check-pty-suite-native check-guest-pty
 ```
 
 A `<program>.user` file next to an ELF holds `uid gid` for its launch,
@@ -239,13 +333,14 @@ like starting the program from a root shell. Without it, guests run as
 uid 1000. An empty `<program>.recovery-test` file lets that launch
 interrupt the recovery probe's journaled move into `/.fex-recovery-test`,
 so the next launch must roll it back or forward; the bundle stages it for
-the two `filesystem-recover-*-write.elf` probes.
+the two `filesystem-recover-*-write.elf` probes. Those probes run as root
+because `/` is root-owned.
 
 Guest inode metadata (ownership, modes, links, xattrs) and its recovery
-journal live in `/fex/.inode_store/`. Horizon limits a whole SD path to 257
+journal live in `/fex/.inode/`. Horizon limits a whole SD path to 257
 bytes, so entries whose path is longer, and everything below them, are
 kept there as well: directories as overflow records and files as objects
-in `/fex/.inode_store/objects`. They do not appear under `/fex/rootfs` on the
+in `/fex/.inode/objects`. They do not appear under `/fex/rootfs` on the
 SD card; use the FTP server to copy them. Launchers before 0.15.1 used
 `/fex/.inode/`; it is not migrated (delete it by hand).
 

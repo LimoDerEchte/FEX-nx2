@@ -2,6 +2,134 @@
 
 ## Restart checkpoint
 
+### 0.17.16 console (2026-11-27): launcher UI milestone accepted and committed. Console: SD-card image install
+(hash matches, old RootFS removed only after verify), broken card image fails with the RootFS kept, FTP stop during an
+upload (426, deferred stop, no crash), closed tab kills its `nohup sleep`; no fault lines. Log
+`.superpowers/sdd/console-0.17.16.log`. After the run: the failed-install log line no longer says "removing" when the
+RootFS was not touched (log text only). Next: multithreading milestone (`docs/MultithreadingPlan.md`, discuss with the
+user first), then M5; performance backlog.
+
+#### 0.17.16 whole-milestone review fixes. Review `.superpowers/sdd/ui-review-report.md` (1 Critical,
+3 Important, 7 Minor). Fixed: (C1) "Image from the SD card" built `/fex/rootfs/fex/images/x.sqsh` (`launcher/RootfsInstallHost.cpp`
+now keeps the card path); (I3, C1) the installer removes the old RootFS only after the new image is downloaded, verified and
+opens (`RunSteps`/`RemoveOld` in `runtime/fs/GuestRootfsInstall.h`; wipe first only when the download does not fit next to
+it); a card image with another name than the index file installs unverified with a warning; (I1) FTP stop/start/tab
+open/install from a frame drawn inside a transfer freed the running server: now deferred to `Tick` after `Step`, transfers
+aborted, tab open/install refused while a transfer runs (`launcher/LauncherBackend.cpp`); (I2) live index entries only from
+the built-in host, note says not authenticated, index sizes over 1 TiB rejected; (M1) background jobs of a closed tab are
+killed 2 s after close even when the leader exited first (`ServicePoll`); (M2) xz truncation check; (M3) downloads capped
+at the expected size (64 MiB without one); (M6) squashfs block list read in chunks; (M5) `ReportMemory` removed;
+(M7) specs moved to `Source/Switch2/docs/ui`, plan marked historical, `ThirdParty/nanosvg/LICENSE.txt`. Host: check-ui ok,
+30/30 check-guest-* ok, pty-suite 43/0/0, proc-suite 249/0/7 + 253/0/3 + 6/0/0, check-rootfs-install ok (3 new cases),
+filesystem-runtime ok, guest_nro 0 warnings. NRO `.superpowers/sdd/fex-switch2-guest-0.17.16.nro`.
+
+### 0.17.15 console (2026-11-26): UI Task 8 accepted. pty-suite and pty-suite-root 43/0/0; X overlay and Settings/About fixes approved; apt-get update did not crash (backlog). Log `.superpowers/sdd/console-0.17.15.log`. Next: whole launcher UI milestone review (one Sonnet agent), orchestrator fixes, console acceptance, one commit. — fixes from the 0.17.13 console run (UI Task 8e, host part)
+
+0.17.14 console (log `.superpowers/sdd/console-0.17.14.log`): X no longer crashes; PgUp/PgDn worked already in 0.17.13
+(misread finding); RootFS ETA deferred by the user. pty `isig_signals_to_foreground_group` root cause: test race, not the
+runtime: the parent typed ^C ^\\ ^Z ^C before the child ran once (signal trace: shared pending 0x80006), and standard
+signals coalesce; the native run hid it (child on another CPU). Test now waits for the child's acknowledgement after each
+signal; experiment logging removed. X overlay redrawn as the user asked: no panel, scrim, the four keys, labels outside
+(above Up, below Down, left of Left, right of Right). apt-get update still closes the app (HOS error screen; the console runs
+stock HOS, not Atmosphère) while apt "store"s a Packages file, with no fault/abort line: 0.17.15 writes the runtime trace
+to the SD at once in Detailed/Trace (was buffered and lost) and logs process memory every 5 s (EXPERIMENT).
+Proc suite: `clock/monotonic_never_decreases` assumed BOOTTIME == MONOTONIC (false on a host that has slept); now checks
+BOOTTIME >= MONOTONIC. Checks: check-ui ok, all check-guest-* ok, pty-suite 43/0/0, proc-suite 253/0/3, guest_nro 0
+warnings, filesystem-runtime ok. NRO `.superpowers/sdd/fex-switch2-guest-0.17.15.nro`.
+
+Orchestrator part (2026-11-26): (1) X crash fixed: `HintBar::SetHints` freed its `HintButton`s while `Interaction` layers
+and `PressedW` still pointed at them (use-after-free in `Interaction::Update`, reproduced with
+`build/fex-ui-host --headless --screen shell --script X`). `HintBar` now keeps a pool of buttons for its lifetime and
+`Interaction` re-flattens every layer from its roots before and after dispatch (`Reflatten`, drops a stale press). (9) apt
+crash: no trace in the log because `__libnx_exception_handler` gave up when another thread held `LogMutex` (guest worker
+beside the UI since 8b). New `WriteFatalLog` waits up to 200 ms, then writes without the lock, flushing the buffered guest
+trace; `abort` (`--wrap=abort`) and `diagAbortWithResult` log `Host abort lr=` / `Host diagAbortWithResult` first. Cause
+of the crash itself still unknown: next log. (12) EXPERIMENT logging for `pty/isig_signals_to_foreground_group`
+(Detailed/Trace): `Guest pty signal target` (mask, wait set, pending, handler, frames) per member after each pty signal,
+then up to 64 `Guest signal handler|return|dropped` lines. Remove once the cause is found. Checks after these changes:
+`check-ui` ok, all `check-guest-*` ok, pty-suite 43/0/0, proc-suite ok, guest_nro 0 warnings, `filesystem-runtime` ok.
+
+0.17.13 console (log `.superpowers/sdd/console-0.17.13.log`): X on the Shell crashed the app, `sudo apt-get update` crashed, PgUp/PgDn
+still wrong in `less`, `pty/isig_signals_to_foreground_group` failed again (42/1). Report `.superpowers/sdd/ui-task8e-report.md`,
+NRO `.superpowers/sdd/fex-switch2-guest-0.17.14.nro`. Done in 8e: X overlay (cross of the four D-pad keys with their combinations),
+Settings row centring, no lines in the About license list / before About, "Read license text" button style, RootFS install ETA
+(average rate, extraction weighted by bytes and entries), Run ELF picker starts in `sdmc:/fex/games`, list wrap-around, the HID
+keyboard mapping as host code with tests. Handed to the orchestrator: X crash (cause found, see the report), apt crash, isig test.
+Console to retest: see the report's checklist.
+
+### 0.17.13 pending — fixes from the 0.17.12 console run (UI Task 8d)
+
+0.17.12 console (log `.superpowers/sdd/console-0.17.12.log`): the 8b CLI tests passed. Findings fixed in 0.17.13, report
+`.superpowers/sdd/ui-task8d-report.md` (cause, fix, test per finding; console checklist there), NRO
+`.superpowers/sdd/fex-switch2-guest-0.17.13.nro`:
+1. Shell footer arrows drew as missing glyphs (the UI font has none): the footer is button discs now.
+2. Controller tab management: ZR new tab, ZL close tab, L/R switch; right stick scrolls back; R3 opens the list of all bindings.
+3. PgUp/PgDn were encoded as `CSI 4~`/`5~` (End/PgUp) instead of `5~`/`6~`; the "flash" was the 120 ms BEL overlay (bash rings
+   BEL on Tab and unbound keys): removed.
+4. `/proc/<pid>/stat`, `statm`, `cmdline`, `comm`, `cgroup`, `task/`, `/proc/stat|uptime|loadavg|meminfo|cpuinfo`,
+   `pid_max` (`runtime/process/GuestProcfs.h`): `top` and `ps` read them; `docs/ProcessInventory.md`.
+5. RootFS install extras: `bsdutils` (script; not `bsdextrautils`), `util-linux` (su), `mount` (mount/umount): a package whose
+   file is missing is unpacked although dpkg lists it as installed. Needs a RootFS reinstall.
+6. apt sources: deb only (no deb-src), plain archive URIs (no mirror method). Needs a RootFS reinstall.
+7. Settings row rules removed.
+8. pty-suite on the console: termios (the guest ELF is built with the host's glibc 2.42+ headers where `B38400` is 38400 but
+   runs on Debian 12's glibc 2.36, whose `cfgetospeed` returns the code 0017: test compares speeds now) and TIOCSPGRP
+   (pgid 1 is the virtual init: EPERM, not ESRCH) fixed; `isig_signals_to_foreground_group` still open: the second ^C (typed
+   line pending) raises no SIGINT on the console only. EXPERIMENT: 0.17.13 logs every terminal signal typed at a pty master
+   ("Guest pty N: signal S for foreground group G: K process(es) signalled", Detailed/Trace log). Read it in the next run.
+Host 2026-11-26: `check-ui` ok, 30 `check-guest-*` ok (new `check-guest-procfs`), `check-rootfs-install` ok,
+`check-pty-suite-native` 43/0/0 (host glibc and Debian 12 glibc), `check-proc-suite-native` 249/0/7 and 253/0/3 (+ Debian
+glibc `procfs/` 6/0/0), `guest_nro` 0 warnings, `filesystem-runtime` exit 0. Console: not run.
+
+### 0.17.12 pending — UI Task 8b + 8c
+
+8b artifacts: `build/guest/fex-switch2-guest.nro`, report
+`.superpowers/sdd/ui-task8b-report.md`; console run pending.
+
+UI Task 8c (terminal emulation, keys) host work done, console run pending:
+`ui/TerminalGrid.*` xterm emulator, `ui/TerminalKeys.*`, Shell footer and
+X-then-D-pad control keys; details in `docs/TerminalInventory.md`, report
+`.superpowers/sdd/ui-task8c-report.md`, console checklist there. Host rerun
+on 2026-11-26: `make check-ui` ok (ui-terminal-test 219 checks, 0 failures),
+`check-pty-suite-native` 43/0/0, `check-proc-suite-native` 247/0/3,
+`guest_nro` 0 warnings, `filesystem-runtime` exit 0. These supersede the
+blocked 8b host results below.
+
+
+Task 8b is implemented in the working tree. Release version remains 0.17.10
+until the host gate passes. The launcher shares one runtime across user,
+root and developer tabs. Each tab uses its own pty. Games ELF interpreters
+resolve in the installed RootFS guest namespace.
+
+Host: `cmake --build Source/Switch2/build/guest --target guest_nro` built
+`guest_nro` with 0 warnings. `make -C Source/Switch2 filesystem-runtime`
+exited 0. The 29 `check-guest-*` targets returned 28 passes and one FTP
+failure (`listen failed: Operation not permitted`). `make -C Source/Switch2
+check-ui` stopped at `VK_ERROR_INITIALIZATION_FAILED (-3)`. The app
+test passed (ui-app-test: 88 checks, 0 failures).
+Native: `make -C Source/Switch2 check-pty-suite-native` 41/2/0,
+`make -C Source/Switch2 check-proc-suite-native` 233/10/7. No console run.
+
+Rerun outside the sandbox (2026-11-26): all 29 `check-guest-*` pass,
+`check-ui` 0 failures, pty-suite 43/0/0, proc-suite 247/0/3. 0.17.11 (8b only)
+was never run on the console; 0.17.12 (8b + 8c) replaces it:
+`build/guest/fex-switch2-guest.nro` (copy
+`.superpowers/sdd/fex-switch2-guest-0.17.12.nro`), games staged in
+`build/guest/sd/fex/games`, 0 build warnings. Next: console run with the 8b
+checklist below plus `.superpowers/sdd/ui-task8c-report.md` "Console checklist".
+See `.superpowers/sdd/ui-task8b-report.md` for the full check list.
+
+#### Console checklist
+
+1. Copy `Source/Switch2/build/guest/fex-switch2-guest.nro` to the card. Copy `Source/Switch2/build/guest/sd/fex/games/` to `sdmc:/fex/games/`, including sidecars. Use the installed Ubuntu RootFS.
+2. Start FTP, open Shell, then open another shell with the tab strip's +. Run `for i in 1 2 3 4 5; do echo "$i $(tty)"; sleep 2; done` in each tab. Each tab should print its own distinct `/dev/pts/N` and keep progressing while focus is on the other tab. Confirm typing only reaches the active tab and the UI stays responsive. Check `stty size` before and after a display size change.
+3. In a user tab check `id -u` → 1000, `pwd` → `/home/fex`, `echo "$TERM"` → `xterm-256color`, and `sudo true; echo $?` → 0. Run `sudo apt-get update` on a connected console. Check that it gets no pty or `posix_openpt` error.
+4. In one shell run `sleep 30 &`, `jobs`, and `fg` in order. Send Ctrl+Z and check for a stopped job, then run `bg` and check that it resumes. The other tab should remain unaffected. Task 8c supplies physical Ctrl+Z input. The current console can test the same VSUSP path by running `stty susp x` before `fg`, sending `x` from the software keyboard while the job is foreground, then restoring `stty susp '^Z'` after regaining the prompt.
+5. Run `script -qc true /dev/null; echo $?` and expect 0. In **+ Settings > Developer**, open a Root shell next to the user shell. Check `id -u` → 0 and `pwd` → `/root`. Switch back and recheck the user credentials and terminal.
+6. In **+ Settings > Developer > Run ELF**, choose `sdmc:/fex/games/pty-suite.elf` beside a shell. Expect startup through the installed Ubuntu interpreter, 43 passed, 0 failed, 0 skipped, and a retained `Exited with status 42` tab. Repeat with `pty-suite-root.elf` to verify the UID/GID sidecar. Check that a single-block or recovery launch is refused while an ordinary session is active.
+7. Close a running tab and confirm the other survives. Run `exit` in Bash and confirm its tab closes. Close all remaining tabs and expect Home, guest shutdown, and FTP restoration. Run again and exit the app using a normal platform shutdown with tabs still open. Confirm guest shutdown and inode-store persistence by checking `sdmc:/fex/fex-switch2-guest.log` and reopening the launcher.
+
+- **Test staging (2026-11-26, console not run; launcher unchanged at 0.17.10).** `make -C Source/Switch2 filesystem-runtime` now deletes `build/guest/sd/fex` and stages only `fex/games/` (test ELFs, sidecars, helper scripts); it never writes `fex/rootfs` or `fex/setup`, so copying `build/guest/sd/fex` onto the card cannot overwrite the Ubuntu RootFS. Programs run from Settings > Developer > Run ELF (working folder = the games folder) and are named without `/bin/`: use `filesystem-acceptance.elf`, `process-acceptance.elf`, `comm-acceptance.elf`, `container-acceptance.elf`, `*-suite.elf`, `*-suite-root.elf` where older entries below say `/bin/<name>`. Scratch goes to `/home/fex` or `/root` through `-d DIR` in the `.args` sidecars; the recovery probes run as root (`.user 0 0`) because the runtime's journal test folder is `/.fex-recovery-test`. The full list with expected results is in the README section "Test programs on the console". `make debian-runtime` still stages the old Debian developer bundle in `build/debian-runtime`. `tools/RunPackagedNative.sh` needs a RootFS folder; the staged bundle no longer has one.
 - **Status (2026-11-24).** Milestone 3 (memory and communication) is
   **complete** and committed on `nx2` as launcher **0.14.2**. Console
   acceptance on 0.14.2: `/bin/comm-acceptance.elf` `Communication
@@ -17,13 +145,51 @@
   `make bind-probe`), so INADDR_ANY passes through. Native: comm-suite
   122/0/3 as uid 1000 and namespace root; packaged comm-acceptance
   `suite 42, tools 42`. Host: the 8 `check-guest-*` targets of milestone 3
-  pass. Evidence per interface: [CommunicationInventory.md](CommunicationInventory.md).
+  pass. Evidence per interface: [CommunicationInventory.md](docs/CommunicationInventory.md).
 - **FTP (2026-11-24, launcher 0.14.3).** LIST printed `%b %d %Y %H:%M`
   (one field too many), so clients took the time as part of the name.
   `GuestFtp.h` `ListTime` prints `ls -l` dates (`%b %e %H:%M` within six
   months, else `%b %e  %Y`). Host: `make -C Source/Switch2 check-guest-ftp`
   0 failed. Console 0.14.3: FileZilla lists, browses, downloads and uploads
   with correct names and paths.
+- **0.17.9 (2026-11-26, console not run): RootFS `/` owner.** 0.17.7 console: `/etc` and `/etc/sudoers.d` are 0:0, but `/` stayed 1000:1000: extraction skipped the image's root entry (the folder exists), so it had no owner record (default 1000). Extraction now applies the image root's owner (re-owned, 1000 to 0) and mode to `/` through new `RootfsWriter::SetOwner` (console: `ChangeOwner`). Fixture root pinned to 0755 1000:1000 (`-root-mode/-root-uid/-root-gid`); install_full checks `/` is 0:0 0755 (failed before). Existing installs: `chown 0:0 /` from the Root shell, or reinstall. sudo now fails with "unable to allocate pty: No such file or directory": no ptys yet, UI Task 8a. Host: `make check-rootfs-install` ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.9.elf`.
+- **0.17.10 (2026-11-26, console not run): UI Task 8a, runtime ptys.** `/dev/ptmx`, `/dev/pts/N` with Linux semantics (tty object shared with the console terminal, `TtyMaster` interface for 8b); details and Partial items in `docs/TerminalInventory.md`, report `.superpowers/sdd/ui-task8a-report.md`. New `tests/guest/PtySuite.c`: 43/0/0 native (uid 1000 and unshare-root), staged as `/bin/pty-suite.elf` and `/bin/pty-suite-root.elf` (+ `.user 0 0`). Host: 29/29 check-guest-* (new check-guest-pty), check-ui, proc and container suites native ok; guest_nro 0 warnings. Runtime wiring console-only, unverified (agent's least sure spots: pty waits in `WaitKind::IO`, stat/readlink of pty nodes through the SD path code). ELF `.superpowers/sdd/fex-switch2-guest-0.17.10.elf`. Next: 8b.
+- **0.17.10 console (2026-11-26, log `.superpowers/sdd/console-0.17.10.log`):** both runs from `sdmc:/fex/games` failed before start with "Could not open the selected file.": `Inspect` (launcher/LauncherBackend.cpp) reads a games program's interpreter by raw SD path (`ResolvePath` + `ReadElf`), but Ubuntu's `/lib64/ld-linux-x86-64.so.2` is a symlink chain kept in the inode store. The old Debian bundle staged a real ld-linux there, which hid it. Fix (interpreter through the guest namespace, like `ReadRootfsElf`) handed to the running 8b agent, which owns those files. Pty suite, sudo, acceptance: not run yet.
+- **Multithreading plan 2026-11-26:** guest threads still run on one host thread (cooperative scheduler + 10 ms watchdog preemption). Full plan `docs/MultithreadingPlan.md` (one runtime lock with the JIT outside it, host thread per guest thread, retry-model waits on per-thread wake objects, stop-the-world for whole-process changes, TSO at the second thread; Task 0 console feasibility probe first). Not started; proposed after UI Task 8, before Milestone 5's 32-bit work.
+- **UI Task 8 (ptys + tabs) started 2026-11-26,** split into 8a runtime ptys + `tests/guest/PtySuite.c` (Sonnet, brief `.superpowers/sdd/ui-task8a-brief.md`), 8b concurrent runtime + one Bash per tab on host-owned masters, 8c terminal emulation; then the whole-UI review. **8a done (host side, console not run, launcher still 0.17.9):** per-terminal `GuestTty` + devpts ptys (`runtime/process/GuestPty.h`, wiring in `GuestRuntime.cpp`), `tests/guest/PtySuite.c` (43 cases pass natively as uid 1000 and `unshare -r` root; staged as `/bin/pty-suite.elf` and `-root.elf` by `make filesystem-runtime`), `docs/TerminalInventory.md`, host test `make check-guest-pty`. Report `.superpowers/sdd/ui-task8a-report.md`. Console checklist: run `/bin/pty-suite.elf` and `/bin/pty-suite-root.elf` (expect 43 passed, exit 42), then `sudo true` in Bash (no pty error).
+- **0.17.8 (2026-11-26, console not run): UI fixes.** (1) Settings sidebar: the rule above About spans the whole sidebar (x 0 to `SidebarW`, `ui/screens/settings.cpp`). (2) Wipe steps read "Counting the files" / "Removing the files". (3) After a wipe the app no longer exits (left over from the old Settings wipe): Done shows A Continue, which sends `Request::Kind::StartFirstRun`; `App::StartFirstRun` closes every screen and opens first-run RootFS setup (B there exits, as on a launch without a RootFS). Reinstall is unchanged (Continue goes Home). New `TestWipeFlow` in `ui/tests/AppTest.cpp`. (4) Debian 12 removed (user decision: not planned): built-in index entry, card, tests, docs (`docs/ui/rootfs-image-format.md`, `docs/LauncherUiPlan.md`); the `Available`/`Reason` index fields stay, tested with a synthetic entry. The Debian developer sysroot tools (`tools/FetchDebian.py`, `make debian-sysroot`) are a separate thing and stay. Host: `make check-ui` ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.8.elf`.
+- **0.17.7 (2026-11-26, console not run): root-owned RootFS, hosts, login start folder.** 0.17.5 shell: `sudo true` said "/etc/sudoers.d is owned by uid 1000, should be 0", "unable to resolve host fex-switch2", "a password is required". Cause: the FEX image owns all 39,528 entries as 1000/1000 (`unsquashfs -lln`) and the installer kept image owners, so sudo ignored `/etc/sudoers.d/fex` (NOPASSWD rule, already written by setup) and asked for a password. Fix: `ExtractHooks::BuilderToRoot` (installer sets it) maps uid/gid `ImageBuilderId` 1000 to 0 at extraction; other ids stay; `/home/fex` stays 1000. `/etc/hosts` gains `127.0.1.1\tfex-switch2` when no line names `GuestHostName` (`HostsNames`). Because the system tree is now root's, runs as the default user start in `/home/fex` with HOME=/home/fex, and root runs start in `/root` (`RunProgram` in `launcher/LauncherBackend.cpp`, env in `RunGuest`); the suites make their scratch folders in the working directory. Old installs keep uid 1000 until reinstalled. nano/wget printing nothing in the log: user says they work; the log only captures stderr of shell children (not a bug to fix now). Tests: fixture gains `etc/sudoers.d` + README owned 1000 (`tools/CheckRootfsInstall.py`); install_full checks they become 0/0, setuid-probe stays 12/34, /home/fex 1000, hosts line; failed before the fix. Host: `make check-rootfs-install` ok, `make check-ui` ok, 28/28 check-guest-* ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.7.elf`.
+- **0.17.6 (2026-11-26, console not run): RootFS wipe one entry at a time, with progress.** 0.17.5 console: the new object store works (user), extras configured. Wipe: `fsFsDeleteDirectoryRecursively` held the SD service about a minute, so HOME/hbmenu froze. `WipeGuestRootfs` (`launcher/RootfsInstallHost.cpp`) now removes the marker first, counts every entry of `/fex/rootfs` and `/fex/.inode` (`SdWipe::Count`, fsDirRead), then deletes deepest-first with one `fsFsDeleteFile`/`fsFsDeleteDirectory` per entry, on a worker thread (`WipeOnWorker`) while the UI thread pumps frames. Settings > Wipe RootFS opens the Installation screen with `InstallRequest::WipeOnly` ("Wiping the RootFS", step 1/2 "Count the files", 2/2 "Remove the files" with "n of m", no cancel; Done: A Exit; Failed: Retry/Back); backend `WipeRootfs(InstallEvents&)` returns an `InstallOutcome` (`RunRootfsWipe`). A reinstall uses the same delete inside its step 1 ("Counting files: n", "Removed n of m"), title unchanged. Host: `make check-ui` ok (new wipe-mode test in Task6Test), `make check-rootfs-install` ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.6.elf`. The 0.17.5 shell issues are fixed in 0.17.7.
+- **0.17.5 (2026-11-25, console not run): object store layout and extras status.** (1) Inode objects move from one flat `/fex/.inode/objects/<inode>` folder to `objects/<inode>>16 hex>/<(inode>>8)&0xff hex>/<inode>` (`ObjectFolder`/`ObjectPath`/`EnsureObjectFolder` in `runtime/GuestRuntime.cpp`; leaf folders cached per session). Reason: the user saw single small files in `/usr/share` take seconds late in a RootFS install; exFAT creates/looks up names by scanning the whole folder (0.16.12 log: 28,047 promotion intents, objects all in one folder). Unconfirmed as the cause until a console install log shows the time drop. No migration (user decision): a store with files directly in `objects/` is detected at load (`FlatObjectLayout`), logged ("old flat layout ... reinstall the RootFS") and the inode store is unavailable, so old RootFS installs must be reinstalled. (2) 0.17.2 console: extras configure failed with dpkg "parsing file '/var/lib/dpkg/status' near line 18573 package 'sudo': mixed non-coinstallable and coinstallable package instances present": the image keeps a non-installed `sudo` entry and the installer appended a second one. `WithoutReplacedEntries` (`runtime/fs/GuestRootfsInstall.h`) drops the image's entry for each unpacked package (dpkg instance rules: one per name, or one per arch for Multi-Arch: same) before appending; fixture status gains a `deinstall ok config-files` sudo entry and the test checks one sudo entry remains (failed before the fix, passes after). Host: `make check-rootfs-install` ok, 28/28 check-guest-* ok, guest_nro 0 warnings; the object layout is console-only code (host checks do not cover it). ELF `.superpowers/sdd/fex-switch2-guest-0.17.5.elf`.
+- **0.17.4 (2026-11-25, console not run): reinstall fixes.** 0.17.2 console: Reinstall showed no progress screen; log stopped at "Removing the existing RootFS" (the recursive SD delete ran on the UI thread, no frames). `ConsoleEnv::WipeRootfs` (`launcher/RootfsInstallHost.cpp`) now deletes on a worker thread and pumps the UI every 16 ms; the step shows "Removing the existing RootFS". The wipe now runs before the free-space check (user request), so the old RootFS's space counts. Host: `make check-rootfs-install` ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.4.elf`. Open: Settings > Wipe RootFS still deletes on the UI thread (frozen until done).
+- **0.17.3 (2026-11-25, console not run): UI fixes from the user's 0.17.1 notes.** Shell footer is the standard footer (`chrome::FooterY/FooterH`, terminal ends at 656); path chip as tall as Browse; focus ring clipped to the list (`Widget::RingClip`, file picker and Settings rows); file picker rows bound to slot `Index % PoolSize` (focus no longer falls to the sidebar when the list scrolls to the last entry; `TestPickerDownToLast`); Settings rows 74 du with the text centred 4 du above the middle, a rule above each section's first row, rules from the sidebar rule to the screen edge (also the About rule). Host: `make check-ui` ok, check-nro-assets ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.3.elf`.
+- **Non-PIE executables (python3) deferred to a potential Milestone 7** (user, 2026-11-25): draft plan `docs/Milestone7Plan.md`, nothing implemented. Tracked gap: Ubuntu's python3.12 and other ET_EXEC binaries return ENOEXEC; python3-* maintainer scripts fail in `apt upgrade`.
+- **0.17.2 (2026-11-25, console not run): 0.17.1 + signed archive index (item d).** ELF `.superpowers/sdd/fex-switch2-guest-0.17.2.elf`.
+- **0.17.1 (2026-11-25, superseded by 0.17.2 before a console run): fixes from the 0.17.0 console run.** 0.17.0 console: UI works; log `.superpowers/sdd/ui-task7-console-0.17.0.log`. Fixed: Home FTP pill 24 du higher; Settings/About row focus ring wider and inside the row rules (`RingOutsetY`); file picker stale rows after a folder change (rows unbound in `Open`, `Loaded` flag instead of "was not done this frame", which also fixes the missing scroll range and auto-scroll); picker B = parent folder (closes at a root), X = cancel; one header/footer component (`ui/components/Chrome.{h,cpp}`: `DrawScreenHeader`, `DrawFullRule`, `chrome::` layout) used by Settings, FTP, RootFS setup, picker, license view, gallery; header and footer rules edge to edge; Home B exits without a dialog; footer segments 8 du apart; wheel scroll 12 -> 2.4 du per unit. Removed: Debian developer setup (`launcher/RootfsSetupHost.cpp`, manifest/URL code of `GuestRootfsSetup.h`, `tests/unit/GuestRootfsSetupTest.cpp`, `tools/CheckRootfsSetup.py`, `tools/RootfsManifest.py`, `check-rootfs-setup`, `/fex/setup` staging) and the embedded-guest and JIT-probe developer rows. RootFS install: extras + sudo, nano, wget, whiptail (git is in the image); `/etc/sudoers.d/fex` (NOPASSWD, fex has no password); apt archive URI -> `mirror+http://mirrors.ubuntu.com/mirrors.txt` (security pocket unchanged). Host: `make check-ui` ok, `make check-rootfs-install` ok, 28/28 `check-guest-*` ok, `check-nro-assets` ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.1.elf`. **Open from the 0.17.0 log:** (a) python3 does not run: Ubuntu's `/usr/bin/python3.12` is non-PIE (ET_EXEC at 0x400000), `LoadElf` returns ENOEXEC, dash then runs py3clean/py3compile as sh scripts -> python3-* maintainer scripts fail during `apt upgrade`. Needs fixed low guest addresses (docs/Milestone3Sdk.md: not mappable on the console) -> guest/host address translation; milestone-sized, not planned yet. (b) apt "posix_openpt (2: ENOENT)": no /dev/ptmx until UI Task 8. (c) apt lock EACCES as user fex is correct (use sudo). (d) Fixed in 0.17.2: the extras' `InRelease` is now verified (`runtime/fs/OpenPgp.h`: SHA-512, RSA e=65537, cleartext framework, v4 signature packets) against the embedded Ubuntu Archive Automatic Signing Key (2018), fingerprint F6ECB3762474EDA9D21B7022871920D1991BC93C (`runtime/fs/UbuntuArchiveKey.h`); only the signed text is parsed. Checked by hand against the live noble and noble-updates InRelease (valid, ~8 ms each; one flipped byte rejected). Fixture archive is signed with a throwaway RSA-2048 key (`tools/CheckRootfsInstall.py`); `install_extras` passes, tampered / other-key / wrong-key InRelease are refused. Remaining: no Valid-Until in Ubuntu's InRelease, so an attacker can replay an older genuine index (old but genuine packages). Still open: the RootFS image itself is checked only by XXH3-64 (not cryptographic) over HTTP, as FEX's RootFS_links.json provides it. The machine-id RNG finding does not apply on the console (`RootfsInstallHost.cpp` uses libnx `randomGet`). Next: user's 0.17.2 console run (same checklist as 0.17.1), then RESUME below.
+- **0.17.0 (2026-11-25, console run, see 0.17.1): UI Tasks 6 and 7 in.** New Vulkan launcher UI replaces the text menu (reports `.superpowers/sdd/ui-task6-report.md`, `ui-task7-report.md`; console checklist draft in the Task 7 report). Host: `make check-ui` ok (70 PNGs), `make check-nro-assets` ok (51 embedded files), all `check-guest-*` and `check-rootfs-install` pass, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.0.elf`. **PAUSED (user, token limit).** RESUME: (1) collect the user's 0.17.0 console result; (2) UI Task 8 (ptys + shell tabs, LauncherUiPlan.md) via one Sonnet agent; (3) one Sonnet review of the whole UI diff (minor list in progress.md); (4) orchestrator fixes, console acceptance, one commit.
+- **0.16.12 console accepted for UI Task 5 (2026-11-25).** Log `.superpowers/sdd/ui-task5-console-0.16.12.log`: Ubuntu 24.04 install complete (reused the kept image, verify ok, 26773 files / 3741 folders / 9009 links / 5 hard links, Unbreak, setup incl. `/dev/pts`, 4 extra packages unpacked and configured, step 7/7). SD time for the tree still 497 s (journal appends 83 s); further speed work deferred. apt/dpkg pty message: not fixed at the user's request (no pseudo-terminals, ContainerInventory.md). **Next: UI Task 6** (one Sonnet agent, report `.superpowers/sdd/ui-task6-report.md`), then Task 7, one Sonnet review, orchestrator fixes and console acceptance, one commit.
+- **0.16.12 (2026-11-25, console not run).** 0.16.11 console install (log `.superpowers/sdd/ui-task5-console-0.16.11.log`): extraction completed (26773 files, 3741 folders, 9009 links, 5 hard links; no 0xd401: the SdPath fix holds), Unbreak ok, then `Could not create a mount point: /dev/pts (error 13)`: `/dev` in the RootFS is the runtime's virtual directory. SD time still 504 s for the whole tree: `WriteInodeFile` 27911 x 2 (68 s) and RecoverDirectoryRename 55830 (12 s) came from `MoveNativeEntry` (the writer writes `<name>.dpkg-new` and renames it), journal appends 42206 / 74.5 s without flush (the write itself costs 1.8 ms), SdWriteGuest 52852 / 77 s, EntryType 159059 / 27 s (was 608k / 102 s for 60% of the tree). Fixes: (1) `MoveNativeEntry` in BulkCreates mode skips the intent, the recovery and the full copy of `SdInodes` kept for rollback (a copy of every name per rename). (2) `/dev/pts` is a virtual empty directory (`PtsDirectory`: listed in `/dev`, mode 0755, statfs type devpts 0x1cd1, creating in it EOPNOTSUPP like `/dev`); the installer's MakeDirectory keeps an existing directory. `DescriptorFilesystem` now reports tmpfs for `/dev/shm` too (was proc). Open: no pseudo-terminals (`/dev/ptmx`), which apt/dpkg in Bash report; tracked in ContainerInventory.md. Open (normal mode): `MoveNativeEntry` copies all names per rename for rollback. Host: all `check-guest-*` and `check-rootfs-install` pass (they do not exercise the /dev code); guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.16.12.elf`.
+- **0.16.11 (2026-11-25, console not run): RootFS writer skips the create protocol (user decision).** `GuestSyscalls::BulkCreates`, set by `OpenGuestRootfsWriter` (RootFS install and Debian rootfs setup): `CreateNativeEntry` creates the entry under its final name, then `CheckpointNewEntry`; on a store error the entry is deleted again. No intent file, staging entry, rename or recovery (0.16.8: about 53 s of 405 s SD time). Journal frames are written without FsWriteOption_Flush (0.16.8: 42 s); the session-end checkpoint writes the whole store. A crash mid-install can leave native entries without records (default metadata) or lose unflushed frames; the install marker is absent then and the next install wipes the tree. Revisit if crashes show up. Normal guest programs keep the full protocol. Host: all `check-guest-*` and `check-rootfs-install` pass; guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.16.11.elf`.
+- **0.16.10 (2026-11-25, console not run): SD directory cache.** Path walks checked every parent folder with fsFsGetEntryType (0.16.8: 608k calls, 102 s, 25 per entry). `SdDirectories` in GuestRuntime.cpp holds native paths known to be directories; `EntryType` answers from it and adds every directory it sees. `SdRetry` drops a path and everything below it on fsFsDeleteDirectory, fsFsDeleteDirectoryRecursively, fsFsCleanDirectoryRecursively (contents only) and fsFsRenameDirectory (source); `LoadInodeStore` clears it at session start (the launcher deletes folders directly); 65536-entry cap. Only one thread does SD work at a time (the launcher joins the guest worker), so no lock. Known gap: a folder removed by another FTP server while a session runs stays cached; the call on the path itself still fails with ENOENT. Not changed: the crash-safe create protocol (intent file + staging entry + rename: about 53 s of 405 s) and the flushed journal append (42 s). Also (user request): a cancel after the hash check keeps `/fex/.download/<image>` (`Installer::Verified`); the next install reuses it. `install_cancel_cleanup` checks both cases and the reuse. Host: all `check-guest-*` and `check-rootfs-install` pass; guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.16.10.elf`.
+- **0.16.9 (2026-11-25, console not run): root cause of SD 0xd401.** 0.16.8 console install (log `.superpowers/sdd/ui-task5-console-0.16.8.log`) failed on the same entry as 0.16.6 (`/usr/share/icons/Humanity/mimes/22/text-x-perl.svg`, a symlink, so its EntryType goes to `/fex/.inode/objects/<inode>`), after the same number of SD calls (1362145 against 1362161), and all three retries at 1/10/100 ms failed: deterministic. Cause: libounce `fsFsGetEntryType` (and the other path calls) hands the caller's pointer to the kernel as an IPC pointer buffer of FS_MAX_PATH (0x301) bytes without copying (`mov w0, #0x3010000` before `svcSendSyncRequest`). The failing path string was at 0x65f690fd80, 640 bytes before the page boundary 0x65f6910000, so the kernel's read ran past the string into the next page and returned InvalidMemoryState. Fix: `host/SdPath.h` (`SdPath` copies a path into a 0x301-byte buffer; `SdArgument` picks parameters by the fs function's own types, so `const void*` data buffers are passed through). `SdRetry` now copies all path parameters, and the launcher's direct fs calls (`GuestProbe.cpp`, `RootfsInstallHost.cpp`) wrap paths in `SdPath`. The 0.16.7 delayed-retry experiment is reverted (no retry helped); 0xd401 is still logged with caller and pointer states. This is probably also the cause of the earlier intermittent 0xd401 (M2 SD retry hook, M4 sparse-exec EIO). Perf sites from 0.16.8: EntryType 608102 calls / 102 s (25 per entry), SdWriteGuest 41045 / 60 s, journal append 42 s, `WriteInodeFile` 2 x 22 s (store slot writes), RecoverDirectoryRename 35650 / 7.7 s. Host: all `check-guest-*` and `check-rootfs-install` pass; guest_nro 0 warnings; 16 `strncpy` before `fsFsGetEntryType` call sites in the ELF. ELF `.superpowers/sdd/fex-switch2-guest-0.16.9.elf`.
+- **0.16.8 (2026-11-25, console not run).** Store directory back to `/fex/.inode` (was `/fex/.inode_store` since the old `/fex/.inode` broke). Root cause of both "corrupted" folders, confirmed on the console over OunceShell's FTP (192.168.178.29:1337): Horizon creates `NetLock_Arany_=Class_Gold=_Főtanúsítvány.crt` but never lists it, so its folder looks empty and RMD or recursive delete fails. `DELE` by exact name worked (250), then `RMD` worked for `/fex/rootfs/usr/share/ca-certificates/mozilla` and for `/fex/.inode/dir-backup` (an old staged copy of a mozilla folder). The non-ASCII overflow routing in 0.16.7 is the fix. Host: all `check-guest-*` and `check-rootfs-install` pass; guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.16.8.elf`.
+- **0.16.7 (2026-11-25, console not run).** 0.16.6 console install (log `.superpowers/sdd/ui-task5-console-0.16.6.log`): failed after about 24k of 39528 entries with SD 0xd401 on fsFsGetEntryType (`EntryType`, nro+0x1b824; all 3 immediate tries failed), then `Could not delete /fex/rootfs (0x00001002)`. Perf: 1.36M SD calls / 407 s (about 57 per entry, 0.3 ms each); journal 23962 frames / 47 s (12%); 3 checkpoints / 0.26 s. The inode store is no longer the main cost. Afterwards `/fex/rootfs/usr/share/ca-certificates/mozilla` cannot be listed by our FTP or OunceShell's FTP (the user cannot take the card out to check it on a PC). That folder holds `NetLock_Arany_=Class_Gold=_Főtanúsítvány.crt`, one of only 2 non-ASCII names in the image (valid NFC UTF-8); the other is a symlink, stored as an object. Fixes: `SdNameUnsafe` sends names with any byte >= 0x80 to the overflow store. Diagnostics (EXPERIMENT): `Perf: SD site nro+...` (top 15 call sites by count); 0xd401 retried after 1/10/100 ms with a `cleared on retry N` line. Host: all `check-guest-*` and `check-rootfs-install` pass; guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.16.7.elf`.
+- **0.16.6 (2026-11-25, console not run): inode store write-ahead journal.** Replaces the full-snapshot save on every metadata change (O(N^2) for N changes; stalled the Ubuntu extraction, slows small-file FTP and shell work). Design (GuestInodeStore.h "Write-ahead journal", after SQLite WAL / ext4 jbd2; research notes in this conversation: UMSDOS, posixovl, pseudo, WSL DrvFs, git fan-out): `SdInodes`/`Inodes` are `TrackedMap`s that record every key changed through them (lookups return const iterators, so the compiler finds every write; `Edit()` for writes through an iterator; swap and whole-map assignment force a checkpoint). `SaveInodeStore` appends one checksummed frame to `/fex/.inode_store/journal` with only the changed names, linked records and retired objects (retired objects at object level, so in-memory and decoded representations agree), and advances the generation, so the intent protocols are unchanged. `WriteCheckpoint` writes the full snapshot into the slot that does not hold the newest one and empties the journal: when the journal passes 4 MiB, when a map was replaced wholesale, at the end of each guest session, and at load after a crash (after intent recovery). Load: newest slot + replay of the frames that follow (stale leading frames skipped, stop at a torn frame or gap, journal cut after the last consumed frame); the replayed store is encoded and decoded as a snapshot again, so it passes the same checks. Unlinked-object reclaim keeps "both slots retire it" (now: newest and the other checkpoint). The 0.16.4/0.16.5 bulk-writer deferral is removed. No migration (user resets `/fex`). Host: new journal model test in `check-guest-inode-store` (40 seeds x 400 random ops: create, managed file, hard link, rename via extract/insert, unlink with managed retire, chmod/chown/utimens, xattr via Edit, reclaim, backing-object replacement, runtime-only inodes, swap, subtree merge; replay equals memory after every save; a journal cut at a random byte replays to the last complete save; a frame for one create in a 3000-entry store is under 200 bytes); mutation check: dropping retired adds, name removals or record-touch collection fails the test (dropping record removals does not: the snapshot encoder already ignores unnamed records). All 28 `check-guest-*`, `check-rootfs-install` pass; guest_nro 0 warnings. Perf counters (0.16.3 EXPERIMENT) still log `Perf: ... Inode journal: N frames ...; M checkpoints ...` at session end. ELF `.superpowers/sdd/fex-switch2-guest-0.16.6.elf`. Console checklist: reset `/fex`, banner `launcher 0.16.6`, Ubuntu install (expect steady extraction), Bash checks and timing, log.
+- **0.16.5 (2026-11-25, console not run).** 0.16.4 console (log `.superpowers/sdd/ui-task5-console-0.16.4.log`): install failed at once, `Could not write to the RootFS: /Unknown_Packages (error 2)`. Cause: native creation publishes an intent for generation + 1, creates the staging entry, checkpoints, then `RecoverDirectoryRename` finishes or rolls back by comparing the in-memory `InodeGeneration`; the deferred save did not advance it, so every create was rolled back. 0.16.5: a deferred save advances `InodeGeneration` in memory and writes nothing; the store stays dirty and the writer's final save writes the next generation. guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.16.5.elf`.
+- **0.16.4 (2026-11-25, console not run).** The 0.16.2 Ubuntu install slowed to a near stop during extraction. Cause (from code): every created entry goes through `CheckpointNewEntry`, which calls `SaveInodeStore`, which encodes and rewrites the whole, growing store, so N entries cost O(N^2) SD writes. Fix: `OpenGuestRootfsWriter` (RootFS install and Debian setup) sets `GuestSyscalls::DeferInodeSaves`; the store is saved once when the writer is destroyed (before `dpkg --configure -a` runs the guest, and before the cancel/failure cleanup wipes). A crash before that save loses only this run's records; both flows start over by wiping. The FTP server and guest programs still save per operation (the general fix waits for the 0.16.3 `Perf:` numbers). Keeps the 0.16.3 perf counters. guest_nro 0 warnings; `check-rootfs-install` passes. ELF `.superpowers/sdd/fex-switch2-guest-0.16.4.elf`.
+- **0.16.3 (2026-11-25, diagnostic EXPERIMENT, console not run).** 0.16.2 console FTP: `FTP STOR 335352744 bytes in 14.03 s (22.80 MiB/s), file system 13.72 s` (log `.superpowers/sdd/ui-task5-console-0.16.2.log`): the guest file layer, not the network, is the FTP bottleneck. User: small files are much slower, and Bash has been slower since milestone 3. Suspects from the code: `SaveInodeStore` encodes and rewrites the whole inode snapshot (all names and records) to the SD on every metadata change; `MarkInodeAccessed` uses `Inodes[Inode]`, so every read file gains a record (the store grows with every file read) and marks the store dirty; guest file data moves through the SD in 64 KiB bounce chunks. 0.16.3 measures, without changing behavior: SD calls through `SdRetry` (count, time), inode store saves (count, KiB, time, encode time), names and records, and the 20 syscalls with the most total time, logged unbuffered as `Perf:` lines when the guest session ends. ELF `.superpowers/sdd/fex-switch2-guest-0.16.3.elf`. Revert after the cause is found.
+- **0.16.2 (2026-11-25).** Console probe on 0.16.1 (log `.superpowers/sdd/ui-task5-probe-0.16.1.log`): all 8 cases pass, whole image 501.3 MiB in 150.4 s = 3.33 MiB/s, XXH3 matches; the 0.16.0 stall is gone. Socket-buffer sweep (log `.superpowers/sdd/ui-task5-probe-0.16.2.log`, 64 MiB each, 100 Mbit line): SO_RCVBUF 64 KiB 3.34 MiB/s, 256 KiB 11.92, 512 KiB 11.59, 1 MiB 11.62. `TransferSocketBuffer` default is now 256 KiB (FTP data sockets and the HTTP client). Launcher 0.16.2 built, 0 warnings; `check-guest-ftp`, `check-rootfs-install` pass. ELF `.superpowers/sdd/fex-switch2-guest-0.16.2.elf`. Console next: FTP speed (RETR/STOR log lines) and the Task 5 install checklist with banner 0.16.2.
+- **0.16.1 (2026-11-25, console not run).** On 0.16.0 the download probe sat for several minutes between PASS 3 and PASS 4 (32 MiB; no progress output then). The user reports OunceShell's FTP server is much faster than ours. OunceShell ftpd (`switch2/third_party/ftpd/ftp.c`, `ftp_set_socket_options`) sets SO_RCVBUF/SO_SNDBUF 64 KiB and TCP_NODELAY on each data socket; we set neither. 0.16.1: new `host/SocketTuning.h` (`TuneTransferSocket`) applied to the FTP PASV listener and accepted data socket and to the HTTP client socket before connect. FTP logs one line per RETR/STOR with bytes, time, MiB/s and the time spent in the guest file layer (to tell network from file-layer cost). The download probe prints `started` and a `progress:` line every 2 s. Host: `check-guest-ftp`, `check-rootfs-install`, `check-ui` pass; guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.16.1.elf`. EXPERIMENT until the console shows a speed-up.
+- **UI Task 5 console run pending (launcher 0.16.0, 2026-11-25).** Tasks 4 and 4b (SD root `sdmc:/fex`; settings = real project features only: Reinstall/Wipe RootFS, Start folder, Theme, Accent, Log level; ui.json only) and Task 5 (FEX Ubuntu 24.04 SquashFS installer in the text launcher, Home item 6; download probe `build/fex-switch2-downloadprobe.nro`) are done and uncommitted. Host: `check-ui`, `check-rootfs-install` and all `check-*` pass except `check-proc-suite-native` (`clock/monotonic_never_decreases`, host suspend, pre-existing). Native: real image installed on host (39502 entries match unsquashfs except the 5 setup files), extras install, CommTools.sh passes in that tree. Console checklist: `.superpowers/sdd/ui-task5-report.md` "Console checklist" (banner is `launcher 0.16.0`, not 0.15.12). Logs to save: `.superpowers/sdd/ui-task5-probe.log`, `.superpowers/sdd/ui-task5-console.log`; ELF `.superpowers/sdd/fex-switch2-guest-0.16.0.elf`. Install wipes `/fex/rootfs` and `/fex/.inode_store`. Open for the fix pass: Wipe RootFS copy mentions desktops and game stores; Task 7 wires LauncherBackend (RootfsImages, FetchLiveRootfsIndex, InstallRootfs, WipeRootfs). Next after the console run: Task 6.
+- **RESTART HERE: Launcher UI (2026-11-25).** Plan: `Source/Switch2/docs/LauncherUiPlan.md`. Task reports: `.superpowers/sdd/ui-task{1,1.5,2,3}-report.md`. Nothing has been committed since M4 (`c772c11e9`, pushed to `origin` = github.com/LimoDerEchte/FEX-nx2, a public fork; `upstream` = FEX-Emu/FEX). The folder restructure and the UI work are uncommitted on `nx2`; per AGENTS.md they are committed once, after UI acceptance.
+  - Done: Task 1 (platform abstraction plus Vulkan renderer; console probe 2 passed). Task 1.5 (restructure). Task 2 (fonts, icons, theme; swatch PNGs in `Source/Switch2/build/ui-check/`). Task 3 (input, focus, components, Joy-Con mouse through Nmouse/PadPointer).
+  - Console probe 3 (log `.superpowers/sdd/ui-probe3.log`, partly run by the user, everything tried worked): HarfBuzz kerning yes; Nmouse found both Joy-Cons (types 0x2, 0x4); the right Joy-Con drove the pointer; the stick wheel works (about 12-33 raw per frame); the user raised the gain to 1.56. Not yet checked on the console: the full gallery checklist, ZL/ZR-as-click, the 3 s release, a USB mouse. Input problems are to be debugged in later stages (user, 2026-11-25).
+  - Minor items for the final review: (1) the host gallery PNG shows a focus ring on the "normal" icon-button demo as well as on "focused"; check whether that is the live focus ring. (2) Pointer gain default 1.0: the user used 1.56; pick a default after more console use. (3) Dark `toggle_off_track` has about 2:1 contrast (spec value kept). (4) No glyph fallback font. (5) FreeType/HarfBuzz license texts and `licenses.json` are due in Task 4 (About). (6) LicenseModal moved to Task 4.
+  - **NEXT STEP: dispatch Task 4** (Home, Settings, About, File picker) to one fresh Sonnet agent, with the same prompt shape as Tasks 2 and 3. Requirements: AGENTS.md, plan sections Architecture, Global constraints, File structure and Task 4, and the specs in `docs/ui/`. Context: read the Task 1-3 reports and the `ui/` headers first. Settings rows come from the schema, and only settings the runtime honors are enabled. NRO-only: embed licenses. No commit, no version bump. Keep `guest_nro`, all `check-*`, `check-ui` and `ui-probe` green. Report to `.superpowers/sdd/ui-task4-report.md`. Task 4 is host-tested; it needs a console run only if the report says so. Then Task 5 (RootFS: FEX Ubuntu 24.04 SquashFS, zstd squashfs reader, unbreak step, extra packages, download probe; console-gated), then Tasks 6 and 7, one Sonnet review, the orchestrator's fixes, console acceptance and one commit.
+- **UI Task 5 (RootFS images and installer) implemented, console run pending (2026-11-25).** Report and the console checklist: `.superpowers/sdd/ui-task5-report.md`. Code: `runtime/fs/GuestSquashfs.h`, `runtime/fs/GuestRootfsInstall.h`, `host/HttpClient.h`, `launcher/RootfsInstallHost.cpp` (home menu "Install Ubuntu 24.04 RootFS"), `ui/RootfsIndex.*` + `ui/assets/rootfs-index.json`, `ThirdParty/zstd`, `probes/DownloadProbe.cpp` (`make download-probe`, EXPERIMENT), format notes `docs/ui/rootfs-image-format.md`. Host: `make check-rootfs-install` (fixture squashfs vs unsquashfs, pipeline scenarios), real Ubuntu 24.04 image extracted natively and `CommTools.sh`/`ProcessTools.sh` run in it. Console order: (1) `make download-probe` NRO, (2) the launcher NRO, install from the home menu. Next after the console passes: Task 6.
+- **UI Task 1 passed on the console (2026-11-25).** The Vulkan probe ran at 2560x1440 docked and 1920x1080 handheld; dock and undock work; touch, buttons, FreeType and the clock work; the Joy-Con mouse is not reported (tracked in the plan). Log: `.superpowers/sdd/ui-probe2.log`. Next: Task 2 (fonts, icons, theme).
+- **Launcher UI, 2026-11-25 update.** UI probe 1 (SDL2) failed on the console: SDL fell back to `offscreen`, then "Could not find a valid EGL device" (log `.superpowers/sdd/ui-probe1.log`). User decision: render with Vulkan as ounce-hbmenu does, behind a platform abstraction (`ui/platform/` Display, Input and System; `ui/render/` Renderer). Plan updated: `docs/LauncherUiPlan.md`, Task 1 redone. Task 1.5 restructure done (report `.superpowers/sdd/ui-task1.5-report.md`): the 33 check targets pass, guest_nro has 0 warnings, the filesystem-runtime file list is unchanged. That task also fixed the HostDiskCache path in `FEXCore/Source/CMakeLists.txt`.
+- **Launcher UI started (2026-11-25).** Plan [LauncherUiPlan.md](docs/LauncherUiPlan.md), Task 1 (SDL2 on libounce plus `make ui-probe`) is with a Sonnet agent; its report goes to `.superpowers/sdd/ui-task1-report.md`. User decisions: RootFS images come from the FEX RootFS project (`http://rootfs.fex-emu.gg/RootFS_links.json`, plain HTTP works). Ubuntu 24.04 SquashFS (zstd, XXH3 hash) is the only selectable RootFS. FEX has no Debian image, so the Debian 12 card is disabled and the in-app Debian setup is dropped. Extra packages are limited to what the tests and tools need; audio and graphics come through the FEX layer. Task 5 has been rewritten to match.
 - **Milestone 4 accepted (2026-11-25, launcher 0.15.12).** Console log `.superpowers/sdd/m4-console13.log`: comm `suite 42, tools 42`, filesystem `ABI 42, coreutils 0, suite 42`, container `suite 42, tools 42` (process `suite 42, tools 42` on 0.15.11). No SD 0xd401 in this run, so the comm-tools crash and the sparse-exec EIO of 0.15.11 did not reproduce. Both stay open as intermittent: the SD error is open since 0.13.5, and the comm crash happened at the same spot as the 0.14.2 hang. For the commit, the exec log line and the retry backoff were removed (no evidence); the unbuffered `SdRetry` lines with pointer memory state stay as a diagnostic. Next: the launcher UI plan.
 - **0.15.12 (2026-11-25, diagnostic EXPERIMENT, console not run).** Correction to the 0.15.11 notes: the `SdRetry` retry lines go through `WriteLog`, which is buffered during a guest run, and that run's log shows `Guest log omitted 37863 older lines`. The missing retry lines therefore prove nothing: the sparse-exec read most likely went through `SdRetry` and failed all three tries. Every SD file call in `GuestRuntime.cpp` uses `SdRetry`, and guest file data uses the host-heap bounce buffer. All guest work runs on one host worker thread, so concurrent IPC on the bounce buffer is ruled out. 0.15.12 changes: `SdRetry` writes each retry with `WriteRunCheckpoint`, which is unbuffered and survives trimming and crashes. Each retry line holds the caller (`nro+0x...`, resolve with `.superpowers/sdd/fex-switch2-guest-0.15.12.elf`) and `svcQueryMemory` type, attr and perm for every pointer argument. Retries now back off 1 ms, then 20 ms. A failure on the last try logs `SD result 2001-0106 persisted after 2 retries.` Each guest exec also logs `exec pid N: <program> <argv1>` unbuffered, so a crash shows the last program started. The `WriteRunCheckpoint` line buffer grew from 256 to 640 bytes. Revert the exec line once the comm crash is found. Console checklist: (1) banner `launcher 0.15.12` (copy only the NRO; the SD bundle is unchanged); (2) `/bin/comm-acceptance.elf`, expect `Communication acceptance results: suite 42, tools 42`; if it crashes, the last `exec pid` line names the step; (3) `/bin/filesystem-acceptance.elf`, expect `ABI 42, coreutils 0, suite 42`; on an SD 0xd401, the retry lines name the call and buffer state.
 - **0.15.11 console (2026-11-24), NEXT STEPS.** Log `.superpowers/sdd/m4-console12.log`; ELF for symbolization `.superpowers/sdd/fex-switch2-guest-0.15.11.elf`.
@@ -37,7 +203,7 @@
 - **0.15.9 (2026-11-24, console not run):** 0.15.8 console: `/fex/rootfs/bin/container-acceptance.elf` gave "Could not resolve the guest ELF file." The user had copied the prepackaged rootfs over a rootfs from the setup: the inode store still held link records for `/bin` (and others) while the SD card now had real folders there. 0.15.9 drops a link record when the SD entry is a folder (`DropStaleSymlink` in the path walk, logged as "Inode store: ... dropped its stale link record."). Console checklist as for 0.15.8, banner `launcher 0.15.9`; expect that log line for `/fex/rootfs/bin` on the first launch.
 - **Partial revert (0.15.8, 2026-11-24, console not run):** the user reported that 0.15.7 broke the file structure and the rootfs setup. Everything as of 0.15.7 is saved on branch `wip/m4` (4e9f3ddeb). 0.15.8 keeps the milestone 4 runtime: namespaces, mounts, seccomp, scheduling, the `/proc` view and `/proc/<pid>/fd` fixes, failed-path logging, `.inode_store` and orphan set-aside, and the `/fex/.tmp` tmpfs folders. It reverts to the HEAD (8d822c1b8) behavior: the rootfs setup (unpack only; the debootstrap second stage and merged /usr are on `wip/m4`), the test layout in `rootfs/bin` with absolute paths, and the cwd of the acceptance programs. It removes the launch-time base folder repair and the root owner of `/` (a known difference, see ContainerInventory.md). The staged rootfs gets an empty `tmp` folder for bwrap. Native packaged (uid 1000): container `suite 42, tools 1` (userns refused inside the chroot, expected); container suite-root 42; comm `42, 42`; filesystem `ABI 42, coreutils 0, suite 42`; process `suite 1, tools 42` (only `clock/monotonic_never_decreases`, because the host was suspended). The host checks pass and `guest_nro` has 0 warnings. Console checklist: 1. copy the NRO and `build/guest/sd/fex/`; on the SD card, delete `/fex/games/tests` and any rootfs from the 0.15.7 setup, and use the prepackaged rootfs; 2. banner `launcher 0.15.8`; 3. `/bin/container-acceptance.elf` -> `suite 42, tools 42`; 4. `/bin/container-suite-root.elf` -> exit 42; 5. regressions `/bin/process-acceptance.elf`, `/bin/comm-acceptance.elf`, `/bin/filesystem-acceptance.elf` as listed below. Then commit milestone 4.
 - **Milestone 4: console run pending (0.15.6, 2026-11-24).** 0.15.5 console: repair created `/tmp`, `/var/tmp` failed ENOENT (`/var` missing in the console rootfs); uid 1000 suite still EACCES on its scratch mkdir (cause open; 0.15.6 prints cwd, uid, owner and mode); bwrap now fails at `readlink(/proc/self/fd/N)` (0.15.6 adds `/proc/<pid>/fd/` links and listing, mount-aware paths). Repair continues past failures and logs each. 0.15.4 console: container-suite-root 54/0/0; tools all ok except 6 bwrap cases (`/tmp` missing in the console rootfs); uid 1000 suite bailed (scratch in `/` is EACCES since `/` is root-owned). 0.15.5: launcher recreates missing `/tmp` (1777), `/var/tmp` (1777), `/run` (0755) at rootfs launch (`RepairBaseDirectories`, logged); acceptance programs and the filesystem acceptance script work in a fresh `/tmp/<name>-acceptance.XXXXXX`; packaged native runner provides `/tmp` and the launcher char devices. Packaged native 0.15.5 (uid 1000): container `suite 42, tools 1` (userns refused in the chroot, expected), process `suite 1, tools 42` (only `clock/monotonic_never_decreases`: host was suspended), comm `42, 42`, filesystem `ABI 42, coreutils 0, suite 42`. 0.15.3 console (old suite binary, SD bundle not copied): `/proc/self/...` ENOENT from a process in a nested PID namespace (fixed in 0.15.4: the walk ended its `ProcViewScope` before the `/proc/<pid>` directory check); bwrap `mount("tmpfs", "/tmp")` ENOENT from the target lookup (open). tmpfs backing folder renamed `/fex/.tmp` (old `/fex/.t`, `/fex/.tmpfs` removed at start). 0.15.2 console: suite 53/1 (`ns/pid_init_numbers`) as uid 1000 and root; tools: bwrap `Failed to mount tmpfs: ENOENT`, `unshare -Urpf --mount-proc` `/proc/self/uid_map` ENOENT. 0.15.3 adds diagnostics: failed path syscalls log `path=` (mount also source/type/flags, /proc paths the PID-namespace view), tmpfs folder creation failures, and the pid test child prints its values. Debugging is done by the orchestrator, not subagents. 0.15.1 console: container suite 50/4 (uid 1000) and 50/4 (root), tools 8 failures; fixes in `.superpowers/sdd/m4-console1-report.md`. 0.15.2 also sets aside a staging `dir-backup` with no intent into `/fex/.inode_store/orphans/`, logs refused creates, and (EXPERIMENT, this build only) tries to delete the old `/fex/.inode`. 0.15.0 console: every create failed EIO (corrupt `/fex/.inode`); 0.15.1 moves the inode store to `/fex/.inode_store` with no migration. Tasks 1-4,
-  review and fixes done (uncommitted). Suite `LinuxRuntime/ContainerSuite.c`
+  review and fixes done (uncommitted). Suite `tests/guest/ContainerSuite.c`
   (54 cases), `ContainerTools.sh` (20 checks), `ContainerAcceptance.c`;
   report `.superpowers/sdd/m4-suite-report.md`. Native: container-suite
   50/0/4 as uid 1000 and namespace root; tools 20/20. Packaged native:
@@ -53,18 +219,18 @@
   tools 42`), `/bin/filesystem-acceptance.elf` (`ABI 42, coreutils 0,
   suite 42`). Then commit milestone 4 once.
 - **After milestone 4 commits:** the launcher UI plan
-  [LauncherUiPlan.md](LauncherUiPlan.md) (spec from the user,
+  [LauncherUiPlan.md](docs/LauncherUiPlan.md) (spec from the user,
   `~/Downloads/fex-switch2-ui-spec.md` + theming spec; Task 1 copies them
   to `docs/ui/`). Backend: SDL2 2.28.5 switch port rebuilt for libounce +
   switch2 EGL/GLES2. Task 1 is a console-gated probe.
 - **Next.** Milestone 4, containers and scheduling
-  ([Milestone4Plan.md](Milestone4Plan.md)): namespaces, mounts,
+  ([Milestone4Plan.md](docs/Milestone4Plan.md)): namespaces, mounts,
   `pivot_root`/`chroot`, seccomp, `sched_*`, and Linux errors for the
-  machine-wide calls. Then milestone 5, 32-bit guests
-  ([Milestone5Plan.md](Milestone5Plan.md)), and milestone 6, `/proc`,
-  `/sys`, `/dev` and input ([Milestone6Plan.md](Milestone6Plan.md)). The
+  machine-wide calls. Then milestone 5, a host thread per guest thread (Task 0) and 32-bit guests
+  ([Milestone5Plan.md](docs/Milestone5Plan.md)), and milestone 6, `/proc`,
+  `/sys`, `/dev` and input ([Milestone6Plan.md](docs/Milestone6Plan.md)). The
   90 uninventoried syscalls and the open rows of milestones 1–3 are in
-  [RemainingSyscalls.md](RemainingSyscalls.md). Process for each
+  [RemainingSyscalls.md](docs/RemainingSyscalls.md). Process for each
   milestone (AGENTS.md): sequential Sonnet task agents, one Sonnet review
   of the whole milestone, then Opus writes the suite and runs console
   debugging. `ptrace` is future work; graphics is in no milestone.
@@ -84,7 +250,7 @@
 - **Milestone 3 history.** Milestone 3, memory and communication (virtual memory, pipes
   and IPC, sockets; see
   [Active milestone sequence](#active-milestone-sequence--linux-guest-kernel-compatibility)).
-  The plan is [Milestone3Plan.md](Milestone3Plan.md) (written
+  The plan is [Milestone3Plan.md](docs/Milestone3Plan.md) (written
   2026-11-23): 5 Sonnet work packages, 5 Sonnet reviewers, then an Opus
   final pass with the suite and console run. Phase A: WP1 (memory arena,
   mapping calls, limits) is implemented in the working tree with host checks
@@ -107,7 +273,7 @@
   commit failure leaving R/W uncommitted pages, recvmsg Unix name write one
   byte past the check), then C2 CommSuite.c, C3, C4 console build 0.14.0.
   C1 done (`.superpowers/sdd/m3-c1-report.md`). C2+C3 done 2026-11-24
-  (Sonnet, `.superpowers/sdd/m3-c2c3-report.md`): `LinuxRuntime/CommSuite.c`
+  (Sonnet, `.superpowers/sdd/m3-c2c3-report.md`): `tests/guest/CommSuite.c`
   (125 cases), `CommTools.sh`, `CommAcceptance.c`, staged by
   `make -C Source/Switch2 filesystem-runtime`. Guest-unverified native-adjusted
   asserts: second connect after nonblocking connect (0 then EISCONN),
@@ -143,10 +309,10 @@
   check-guest-inet check-guest-socket check-guest-sysv-ipc check-guest-mqueue check-guest-pipe
   check-guest-futex check-guest-arena check-guest-memory` exit 0. Rows
   and deliberate differences are in
-  [CommunicationInventory.md](CommunicationInventory.md).
+  [CommunicationInventory.md](docs/CommunicationInventory.md).
   SDK risks and the EXPERIMENT
   probe (`make m3-probe`, `build/fex-switch2-m3probe.nro`, log
-  `sdmc:/fex/m3probe.log`) are in [Milestone3Sdk.md](Milestone3Sdk.md);
+  `sdmc:/fex/m3probe.log`) are in [Milestone3Sdk.md](docs/Milestone3Sdk.md);
   its console results feed the plan. procfs (`/proc/<pid>/stat`,
   `/fd` for `ps`/`pgrep` and `event/anon_inode_names`), devfs, ioctls and
   the 137 entries outside the three groups are reconciled after milestone 3.
@@ -188,8 +354,8 @@
   interactive runs; `inotifywait_create`/`_monitor` act only after
   inotifywait reports "Watches established." Native tools script exits 42.
 - **Next (2026-11-23): console run of 0.13.17-diag** (same checklist). Milestone 2,
-  processes and events ([Milestone2Plan.md](Milestone2Plan.md), inventory in
-  [ProcessInventory.md](ProcessInventory.md), ledger in
+  processes and events ([Milestone2Plan.md](docs/Milestone2Plan.md), inventory in
+  [ProcessInventory.md](docs/ProcessInventory.md), ledger in
   `.superpowers/sdd/progress.md`, git-ignored). Tasks 1-9 were
   console-verified on 0.13.13-diag (proc-suite 138/0/7, proc-suite-root
   143/0/2, fs-suite 81/0/2, fs-suite-root 83/0/0). Tasks 10-18 are now
@@ -369,7 +535,7 @@
   New launcher item **Setup Debian rootfs** (`RootfsSetupHost.cpp`,
   `GuestRootfsSetup.h`, XZ Embedded v2024-12-30 in `ThirdParty/xz-embedded`):
   reads `/fex/setup/debian-rootfs.manifest` (from `make rootfs-manifest`,
-  `LinuxRuntime/RootfsManifest.py`: bookworm minbase = required + essential +
+  `tools/RootfsManifest.py`: bookworm minbase = required + essential +
   apt with dependencies, 93 packages, 32.0 MiB, usr-is-merged preferred over
   usrmerge), downloads each package over HTTP from deb.debian.org or
   security.debian.org (snapshot.debian.org fallback), checks size and SHA-256,
@@ -670,7 +836,7 @@
   `make -C Source/Switch2 check-fs-suite-native`: 79 passed, 0 failed,
   2 skipped as uid 1000 and as namespace root.
   `make -C Source/Switch2 filesystem-runtime` staged `build/guest/sd`.
-  `LinuxRuntime/RunPackagedNative.sh build/guest/sd/fex/rootfs /bin/bash --noprofile --norc /bin/filesystem-coreutils.sh /bin/filesystem-probe.elf /bin/fs-suite.elf`
+  `tools/RunPackagedNative.sh build/guest/sd/fex/rootfs /bin/bash --noprofile --norc /bin/filesystem-coreutils.sh /bin/filesystem-probe.elf /bin/fs-suite.elf`
   printed `ABI 42, coreutils 0, suite 42` and exited 0; with
   `--root /bin/fs-suite-root.elf` it exited 42. Persist write and read
   run natively in the bundle returned 42 each.
@@ -708,11 +874,11 @@
   ignoring unknown flags, regular files polling readable and writable,
   `ustat`, `name_to_handle_at`, `open_by_handle_at` (all 102 inventory
   entries routed; see
-  [deliberate differences](FilesystemInventory.md#deliberate-differences-from-a-stock-kernel)),
+  [deliberate differences](docs/FilesystemInventory.md#deliberate-differences-from-a-stock-kernel)),
   and `<program>.user` launch credentials.
-- **Test suite.** `LinuxRuntime/FsSuite.c` has 79 named cases, each in
+- **Test suite.** `tests/guest/FsSuite.c` has 79 named cases, each in
   its own scratch directory, with TAP output and exit 42.
-  `LinuxRuntime/RunPackagedNative.sh` runs a staged bundle on the host
+  `tools/RunPackagedNative.sh` runs a staged bundle on the host
   kernel in user, mount and PID namespaces.
 - **Build layout.** One tree: `build/guest` (configure per README). The
   bundle stages to `build/guest/sd` (`make -C Source/Switch2
@@ -722,7 +888,7 @@
   passed. `make -C Source/Switch2 check-fs-suite-native`: 77 passed,
   0 failed, 2 skipped as uid 1000 and as namespace root (the skips,
   `path/handles` and `xattr/trusted_namespace`, need init-namespace
-  capabilities). `LinuxRuntime/RunPackagedNative.sh build/guest/sd/fex/rootfs /bin/bash --noprofile --norc /bin/filesystem-coreutils.sh /bin/filesystem-probe.elf /bin/fs-suite.elf`
+  capabilities). `tools/RunPackagedNative.sh build/guest/sd/fex/rootfs /bin/bash --noprofile --norc /bin/filesystem-coreutils.sh /bin/filesystem-probe.elf /bin/fs-suite.elf`
   printed `ABI 42, coreutils 0, suite 42`; with `--root /bin/fs-suite-root.elf`
   it exited 42. `cmake --build Source/Switch2/build/guest --target guest_nro`
   built the 0.12.33 NRO.
@@ -739,7 +905,7 @@ is unchanged from 0.12.37). Acceptance and the root suite passed on
 1. Open **FTP server** with the console on the PC's network. Expect
    `ftp://<ip>:1337` (or 2121 / another port), `User any name` and a
    six-digit password.
-2. On the PC run `python3 Source/Switch2/LinuxRuntime/FtpTest.py <ip>
+2. On the PC run `python3 Source/Switch2/tests/unit/FtpTest.py <ip>
    <port> <password> 1000`. Expect `ftp test: 0 failed`.
 3. Press B to stop the server.
 
@@ -791,7 +957,7 @@ Reuse the combined ABI and Debian coreutils acceptance program. Add cases
 for the remaining behavior and use restart phases for persistence and
 recovery. Reconcile the syscall and flag inventory before declaring the
 milestone complete. Commit on `nx2` after hardware acceptance.
-The [current syscall inventory](FilesystemInventory.md) records ABI
+The [current syscall inventory](docs/FilesystemInventory.md) records ABI
 numbers and dispatcher routing. It includes three unrouted legacy
 and handle-based candidates whose milestone assignment still needs
 reconciliation with the historical baseline.
@@ -960,7 +1126,7 @@ Use one combined acceptance program: `/bin/process-acceptance.elf` is a
 wrapper that runs `proc-suite.elf` and `ProcessTools.sh`. Pair the
 console run with an interactive job-control checklist. Report host
 execution and Switch 2 execution separately, and track every syscall in
-[ProcessInventory.md](ProcessInventory.md).
+[ProcessInventory.md](docs/ProcessInventory.md).
 
 ### Filesystem implementation in progress
 
@@ -1313,14 +1479,14 @@ memory filesystem statistics and the native SD commit result still need
 verification. The raw SD operations are a first backend slice, and group
 1–5 completion requires the full ABI and real application verification.
 
-`LinuxRuntime/FilesystemProbe.c` creates a unique scratch directory and
+`tests/guest/FilesystemProbe.c` creates a unique scratch directory and
 covers positioned and vectored I/O, append, shared offsets after dup, file
 growth, both getdents layouts, relative operations after directory rename,
 link identity, open-after-unlink, mode, timestamps and xattrs. Its Debian
 ELF builds with `make -C Source/Switch2 filesystem-probe
 DEBIAN_ROOT=/path/to/debian-sysroot` and exited 42 with the Debian 12
 glibc 2.36 loader on native Linux. It advertises x86-64-baseline.
-`LinuxRuntime/CoreutilsFilesystemProbe.sh` passed on native Linux using the
+`tests/guest/CoreutilsFilesystemProbe.sh` passed on native Linux using the
 Debian 9.7-3 coreutils binaries and the staged Debian 12 coreutils 9.1-1
 binaries using the bundled Debian loader and Bash. The guest exposes the
 SD-backed root mount in `/proc/self/mountinfo` and `/proc/mounts` for `df`.
@@ -1662,6 +1828,16 @@ and their hardware history (0.12.1–0.12.12) are on branch
 native Vulkan layer. Steam Big Picture remains the long-term goal.
 
 ## Backlog for future milestone selection
+
+- **apt-get update closed the app on the console (0.17.13, 0.17.14; HOS error screen, no fault/abort line).** Both times
+  while apt was "store"-ing a large Packages file (6.7 / 15 MB). Did not recur on 0.17.15 (2026-11-26). Evidence tools in
+  place: fatal hooks (`WriteFatalLog`, `--wrap=abort`, `diagAbortWithResult`), the runtime trace written at once in
+  Detailed/Trace. The 5 s memory report experiment (`ReportMemory`) was removed in 0.17.16 (no recurrence). If it happens
+  again: Detailed log + HOS error code; bring the memory report back (`HostHeapReport()` every 5 s in `RunThreads`).
+- **Launcher review leftovers (0.17.16).** InRelease freshness (no Valid-Until / signature time check: replay of an older
+  signed index is possible). The live RootFS index is plain HTTP (no TLS on the console): newer entries are limited to the
+  built-in entry's host and marked not authenticated; a signed index would close it. The 0.16.3 perf counters
+  (`LogPerfStats`, EXPERIMENT) stay for the performance work (Tab completion, apt, RootFS ETA).
 
 2. **Desktop IPC foundation.** Fold the subset required by Wayland into
    milestone 3. Keep broader descriptor, file-backed shared memory, and

@@ -77,7 +77,7 @@ set(SRCS
   Utils/Profiler.cpp)
 
 if (FEX_SWITCH2)
-  list(APPEND SRCS "${CMAKE_CURRENT_SOURCE_DIR}/../../Source/Switch2/HostDiskCache.cpp")
+  list(APPEND SRCS "${CMAKE_CURRENT_SOURCE_DIR}/../../Source/Switch2/host/HostDiskCache.cpp")
 else()
   list(APPEND SRCS Interface/Core/DiskCache.cpp)
 endif()

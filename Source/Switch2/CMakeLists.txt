@@ -60,7 +60,7 @@ add_subdirectory("${FEX_ROOT}/FEXHeaderUtils" headerutils)
 add_subdirectory("${FEX_ROOT}/CodeEmitter" codeemitter)
 add_subdirectory("${FEX_ROOT}/FEXCore" fexcore)
 
-add_library(fex_switch2_host OBJECT HostMemory.cpp)
+add_library(fex_switch2_host OBJECT host/HostMemory.cpp)
 target_link_libraries(fex_switch2_host PRIVATE FEXCore_Base)
 
 # Use the devkit driver for its startup objects, newlib, libstdc++ and Switch specs.
@@ -72,20 +72,67 @@ add_library(xz_embedded OBJECT "${XZ_EMBEDDED}/xz_crc32.c" "${XZ_EMBEDDED}/xz_cr
   "${XZ_EMBEDDED}/xz_dec_stream.c" "${XZ_EMBEDDED}/xz_dec_lzma2.c" "${XZ_EMBEDDED}/xz_dec_bcj.c")
 target_include_directories(xz_embedded PRIVATE "${XZ_EMBEDDED}")
 target_compile_definitions(xz_embedded PUBLIC XZ_USE_CRC64 XZ_USE_SHA256 XZ_DEC_X86 XZ_DEC_CONCATENATED)
-add_executable(fex-switch2-guest GuestProbe.cpp GuestRuntime.cpp GuestElf.cpp HostArena.cpp HostNet.cpp JitProbe.cpp RootfsSetupHost.cpp
+# The zstd decoder (BSD, ThirdParty/zstd) decodes the RootFS squashfs image and Ubuntu package members; vendored sources are not ours to warn on.
+set(ZSTD_DECODER "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/zstd/zstddeclib.c")
+set_source_files_properties("${ZSTD_DECODER}" PROPERTIES COMPILE_OPTIONS "-w")
+# The RootFS index is embedded in the NRO (ui/assets/rootfs-index.json); the installer's index parser uses the UI's small JSON tree.
+# The UI (ui/): the Vulkan platform and renderer, fonts, icons, theme, input, components and screens, the app shell. Shaders are
+# compiled to SPIR-V headers like the Makefile does; fonts, icons, licenses and the RootFS index are linked into the NRO (.incbin).
+set(UI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ui")
+set(UI_GEN "${CMAKE_BINARY_DIR}/ui-gen")
+find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
+foreach(Stage vert frag)
+  add_custom_command(OUTPUT "${UI_GEN}/ui_${Stage}.h"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${UI_GEN}"
+    COMMAND "${GLSLANG_VALIDATOR}" -V --quiet --vn ui_${Stage} -o "${UI_GEN}/ui_${Stage}.h" "${UI_DIR}/render/shaders/ui.${Stage}"
+    DEPENDS "${UI_DIR}/render/shaders/ui.${Stage}" VERBATIM)
+endforeach()
+set(UI_SOURCES
+  platform/common/Log platform/common/Names render/vulkan/Target render/vulkan/VulkanRenderer
+  render/Atlas render/Fonts render/Icons assets/Assets assets/IndexAsset theme theme_dark theme_light
+  input/InputModes input/Focus input/Interaction components/Basic components/Chrome components/Controls components/Modals components/Progress
+  components/Rows components/LicenseModal Storage PathUtil Json RootfsIndex SettingsSchema LicenseStore FileBrowser screens/home screens/settings
+  screens/filepicker components/Tiles components/Terminal TerminalGrid TerminalKeys FtpModel InstallModel RootfsSelection screens/ftp screens/rootfs_setup
+  screens/install screens/shell App RootfsState platform/switch2/Switch2Platform platform/switch2/Switch2AppInit)
+list(TRANSFORM UI_SOURCES PREPEND "${UI_DIR}/")
+list(TRANSFORM UI_SOURCES APPEND ".cpp")
+set(UI_SHADER_HEADERS "${UI_GEN}/ui_vert.h" "${UI_GEN}/ui_frag.h")
+file(GLOB_RECURSE UI_ASSET_FILES "${UI_DIR}/assets/*.json" "${UI_DIR}/assets/*.ttf" "${UI_DIR}/assets/*.svg" "${UI_DIR}/assets/*.txt")
+# The FEX version of the build (git describe FEX-<yymm>-...), shown on Home.
+execute_process(COMMAND git -C "${FEX_ROOT}" describe --tags --match "FEX-*" OUTPUT_VARIABLE FEX_DESCRIBE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+string(REGEX MATCH "^FEX-([0-9]+)" FEX_DESCRIBE_MATCH "${FEX_DESCRIBE}")
+if(CMAKE_MATCH_1)
+  set(FEX_BUILD_NUMBER "${CMAKE_MATCH_1}")
+else()
+  set(FEX_BUILD_NUMBER "unknown")
+endif()
+
+add_executable(fex-switch2-guest launcher/GuestProbe.cpp launcher/LauncherBackend.cpp runtime/GuestRuntime.cpp runtime/GuestElf.cpp host/HostArena.cpp host/HostNet.cpp
+  launcher/RootfsInstallHost.cpp ${UI_SOURCES} "${ZSTD_DECODER}" ${UI_SHADER_HEADERS}
   $<TARGET_OBJECTS:xz_embedded>)
+set_source_files_properties(ui/assets/IndexAsset.cpp ui/RootfsIndex.cpp PROPERTIES COMPILE_DEFINITIONS "UI_ASSET_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/ui/assets\"")
+set_source_files_properties(ui/assets/IndexAsset.cpp ui/assets/Assets.cpp PROPERTIES COMPILE_DEFINITIONS "UI_ASSET_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/ui/assets\"")
+set_source_files_properties(ui/assets/IndexAsset.cpp ui/assets/Assets.cpp PROPERTIES OBJECT_DEPENDS "${UI_ASSET_FILES}")
+target_compile_definitions(fex-switch2-guest PRIVATE FEX_SWITCH2_FEX_BUILD="${FEX_BUILD_NUMBER}")
 target_compile_definitions(fex-switch2-guest PRIVATE XZ_USE_CRC64 XZ_USE_SHA256 XZ_DEC_X86 XZ_DEC_CONCATENATED)
 target_compile_definitions(fex-switch2-guest PRIVATE FEX_SWITCH2_LAUNCHER=1)
-target_include_directories(fex-switch2-guest PRIVATE "${CMAKE_BINARY_DIR}/include")
-target_link_directories(fex-switch2-guest PRIVATE "${DKP}/portlibs/switch2/lib" "${DKP}/libounce/lib")
-target_link_libraries(fex-switch2-guest PRIVATE fex_switch2_host FEXCore FEXCore_Base JemallocLibs kaihen nx)
+# Include strategy: no relative includes; every source folder with headers is on the include path.
+foreach(Dir runtime runtime/fs runtime/process runtime/memory runtime/ipc host .)
+  target_include_directories(fex-switch2-guest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/${Dir}")
+endforeach()
+target_include_directories(fex-switch2-guest PRIVATE "${CMAKE_BINARY_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/ui" "${UI_GEN}" launcher
+  "${DKP}/portlibs/switch/include/freetype2" "${DKP}/portlibs/switch/include/harfbuzz")
+target_link_directories(fex-switch2-guest PRIVATE "${DKP}/portlibs/switch2/lib" "${DKP}/portlibs/switch/lib" "${DKP}/libounce/lib")
+target_link_libraries(fex-switch2-guest PRIVATE fex_switch2_host FEXCore FEXCore_Base JemallocLibs xxHash::xxhash kaihen vulkan harfbuzz freetype png16 bz2 z m nx)
+# abort() goes through __wrap_abort (launcher/GuestProbe.cpp), which logs before aborting.
+target_link_options(fex-switch2-guest PRIVATE LINKER:--wrap=abort)
 set_target_properties(fex-switch2-guest PROPERTIES SUFFIX ".elf")
 
 set(GUEST_NACP "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nacp")
 set(GUEST_NRO "${CMAKE_CURRENT_BINARY_DIR}/fex-switch2-guest.nro")
-set(GUEST_ICON "${CMAKE_CURRENT_SOURCE_DIR}/FexIcon.jpg")
+set(GUEST_ICON "${CMAKE_CURRENT_SOURCE_DIR}/launcher/FexIcon.jpg")
 add_custom_command(OUTPUT "${GUEST_NACP}"
-  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Team, Limo (nx2)" "0.15.12" "${GUEST_NACP}"
+  COMMAND "${DKP}/tools/bin/nacptool" --create "FEX for Switch 2" "FEX Team, Limo (nx2)" "0.17.16" "${GUEST_NACP}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   VERBATIM)
 add_custom_command(OUTPUT "${GUEST_NRO}"

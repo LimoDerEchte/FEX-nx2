@@ -31,6 +31,9 @@ software on Switch 2 through the normal launcher.
   in parallel. Then one Sonnet agent reviews the whole milestone. Then
   the Opus orchestrator fixes review findings, writes the test suite and
   hands the user console runs to debug until acceptance passes.
+- The orchestrator does complex work itself: crashes, hangs, root-cause
+  debugging of console failures and subtle runtime bugs. Delegate only
+  well-specified, mechanical tasks (UI tweaks, docs, staging) to agents.
 - Graphics is in no milestone: it needs its own
   architecture planning first.
 - Start from the [restart checkpoint](Source/Switch2/NextMilestone.md#restart-checkpoint):
