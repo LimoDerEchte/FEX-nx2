@@ -94,6 +94,9 @@ int main() {
   const auto Stat_ = FormatSystemStat(Sys);
   CHECK(Stat_.rfind("cpu  10 0 0 100 0 0 0 0 0 0\ncpu0 4 0 0 34 0 0 0 0 0 0\ncpu1 3 0 0 33 0 0 0 0 0 0\ncpu2 3 0 0 33", 0) == 0);
   CHECK(Stat_.find("\nctxt 55\nbtime 1700000000\nprocesses 9\nprocs_running 2\nprocs_blocked 1\n") != std::string::npos);
+  Sys.CpuBusy = {7, 0, 3};
+  Sys.CpuIdle = {26, 33, 41};
+  CHECK(FormatSystemStat(Sys).rfind("cpu  10 0 0 100 0 0 0 0 0 0\ncpu0 7 0 0 26 0 0 0 0 0 0\ncpu1 0 0 0 33 0 0 0 0 0 0\ncpu2 3 0 0 41", 0) == 0);
   CHECK(FormatCpuinfo(2).find("processor\t: 1\n") != std::string::npos);
   std::puts("guest-procfs-test: ok");
   return 0;

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Multithreading suite for the Switch 2 guest runtime (multithreading Task 1).
+// Multithreading suite for the Switch 2 guest runtime (multithreading Tasks 1 to 4).
 //
 // Same harness as proc-suite: every test runs in its own forked child, the
 // results are TAP lines, and the exit status is 42 when every selected test
@@ -918,7 +918,403 @@ TEST(thread, cpu_clocks_count_each_thread) {
   CHECK(Process + 20 >= Args[0].Seed + Args[1].Seed);
 }
 
+// ---------------------------------------------------------------------------
+// Thread lifecycle (multithreading Task 2)
+
+static volatile int CleanupRan;
+static void NoteCleanup(void *Raw) {
+  (void) Raw;
+  CleanupRan = 1;
+}
+
+static void *ReadUntilCancelled(void *Raw) {
+  const int FD = *(int *) Raw;
+  pthread_cleanup_push(NoteCleanup, NULL);
+  char Byte;
+  for (;;) (void) !read(FD, &Byte, 1);  // read is a cancellation point
+  pthread_cleanup_pop(0);
+  return NULL;
+}
+
+TEST(thread, cancel_deferred_in_blocking_call) {
+  int Pipe[2];
+  CHECK(pipe(Pipe) == 0);
+  CleanupRan = 0;
+  pthread_t Reader;
+  CHECK(pthread_create(&Reader, NULL, ReadUntilCancelled, &Pipe[0]) == 0);
+  nanosleep(&(struct timespec) {.tv_nsec = 50 * 1000000}, NULL);
+  CHECK(pthread_cancel(Reader) == 0);
+  void *Result = NULL;
+  CHECK(pthread_join(Reader, &Result) == 0);
+  CHECK(Result == PTHREAD_CANCELED);
+  CHECK(CleanupRan);
+}
+
+static void *SpinUntilCancelled(void *Raw) {
+  (void) Raw;
+  int Old;
+  pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &Old);
+  uint64_t State = 1;
+  for (;;) {
+    State = State * 6364136223846793005ULL + 1;
+    __asm__ volatile("" : "+r"(State));
+  }
+  return NULL;
+}
+
+TEST(thread, cancel_asynchronous_busy_loop) {
+  pthread_t Spinner;
+  CHECK(pthread_create(&Spinner, NULL, SpinUntilCancelled, NULL) == 0);
+  nanosleep(&(struct timespec) {.tv_nsec = 50 * 1000000}, NULL);
+  const uint64_t Start = NowMs();
+  CHECK(pthread_cancel(Spinner) == 0);
+  void *Result = NULL;
+  CHECK(pthread_join(Spinner, &Result) == 0);
+  CHECK(Result == PTHREAD_CANCELED);
+  printf("# cancelled after %llu ms\n", (unsigned long long) (NowMs() - Start));
+}
+
+static pthread_mutex_t *RobustMutex;
+static void InitRobust(pthread_mutex_t *Mutex, int Shared) {
+  pthread_mutexattr_t Attr;
+  pthread_mutexattr_init(&Attr);
+  pthread_mutexattr_setrobust(&Attr, PTHREAD_MUTEX_ROBUST);
+  if (Shared) pthread_mutexattr_setpshared(&Attr, PTHREAD_PROCESS_SHARED);
+  pthread_mutex_init(Mutex, &Attr);
+  pthread_mutexattr_destroy(&Attr);
+}
+
+static void *LockAndExit(void *Raw) {
+  (void) Raw;
+  pthread_mutex_lock(RobustMutex);
+  return NULL;  // ends holding the mutex: its robust list hands it on
+}
+
+TEST(thread, robust_mutex_owner_thread_dies) {
+  static pthread_mutex_t Mutex;
+  RobustMutex = &Mutex;
+  InitRobust(&Mutex, 0);
+  pthread_t Owner;
+  CHECK(pthread_create(&Owner, NULL, LockAndExit, NULL) == 0);
+  CHECK(pthread_join(Owner, NULL) == 0);
+  CHECK(pthread_mutex_lock(&Mutex) == EOWNERDEAD);
+  CHECK(pthread_mutex_consistent(&Mutex) == 0);
+  CHECK(pthread_mutex_unlock(&Mutex) == 0);
+  CHECK(pthread_mutex_lock(&Mutex) == 0);
+  CHECK(pthread_mutex_unlock(&Mutex) == 0);
+}
+
+TEST(thread, robust_mutex_owner_process_dies) {
+  pthread_mutex_t *Mutex = mmap(NULL, sizeof(*Mutex), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  CHECK(Mutex != MAP_FAILED);
+  if (Mutex == MAP_FAILED) return;
+  InitRobust(Mutex, 1);
+  const pid_t Child = fork();
+  if (Child == 0) _exit(pthread_mutex_lock(Mutex) == 0 ? 0 : 1);  // exits holding it
+  const int Status = WaitExit(Child);
+  CHECK(WIFEXITED(Status) && WEXITSTATUS(Status) == 0);
+  CHECK(pthread_mutex_lock(Mutex) == EOWNERDEAD);
+  CHECK(pthread_mutex_consistent(Mutex) == 0);
+  CHECK(pthread_mutex_unlock(Mutex) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// CPU-time timers, scheduler calls and CPU accounting (multithreading Task 3)
+
+static volatile int StopSpinning;
+static void *SpinUntilStopped(void *Raw) {
+  (void) Raw;
+  uint64_t State = 1;
+  while (!StopSpinning) {
+    for (int Step = 0; Step < 1000; ++Step) {
+      State = State * 6364136223846793005ULL + 1;
+      __asm__ volatile("" : "+r"(State));
+    }
+  }
+  return NULL;
+}
+
+static volatile sig_atomic_t ProfSignals;
+static volatile uint64_t ProfFiredMs;
+static void CountProf(int Signal) {
+  (void) Signal;
+  if (!ProfSignals++) ProfFiredMs = NowMs();
+}
+
+TEST(thread, itimer_prof_counts_all_threads) {
+  if (Processors() < 3) SKIP("fewer than three processors");
+  struct sigaction Action = {.sa_handler = CountProf, .sa_flags = SA_RESTART};
+  sigemptyset(&Action.sa_mask);
+  sigaction(SIGPROF, &Action, NULL);
+  ProfSignals = 0;
+  StopSpinning = 0;
+  pthread_t Spinners[3];
+  for (int Index = 0; Index < 3; ++Index) CHECK(pthread_create(&Spinners[Index], NULL, SpinUntilStopped, NULL) == 0);
+  // 300 ms of process CPU time: three busy threads use it in about 100 ms of wall time.
+  const uint64_t Start = NowMs();
+  const struct itimerval Once = {.it_value = {.tv_usec = 300000}};
+  CHECK(setitimer(ITIMER_PROF, &Once, NULL) == 0);
+  const uint64_t Limit = Deadline(3000);
+  while (!ProfSignals && !DeadlineExpired(Limit)) nanosleep(&(struct timespec) {.tv_nsec = 5 * 1000000}, NULL);
+  StopSpinning = 1;
+  for (int Index = 0; Index < 3; ++Index) pthread_join(Spinners[Index], NULL);
+  printf("# SIGPROF after %llu ms of wall time\n", (unsigned long long) (ProfFiredMs - Start));
+  CHECK(ProfSignals == 1);
+  CHECK(ProfFiredMs - Start < 290);  // less than the 300 ms of CPU time: more than one thread was counted
+}
+
+TEST(thread, itimer_prof_interval_reaches_busy_threads) {
+  struct sigaction Action = {.sa_handler = CountProf, .sa_flags = SA_RESTART};
+  sigemptyset(&Action.sa_mask);
+  sigaction(SIGPROF, &Action, NULL);
+  ProfSignals = 0;
+  StopSpinning = 0;
+  pthread_t Spinners[2];
+  for (int Index = 0; Index < 2; ++Index) CHECK(pthread_create(&Spinners[Index], NULL, SpinUntilStopped, NULL) == 0);
+  const struct itimerval Every = {.it_interval = {.tv_usec = 10000}, .it_value = {.tv_usec = 10000}};
+  CHECK(setitimer(ITIMER_PROF, &Every, NULL) == 0);
+  nanosleep(&(struct timespec) {.tv_nsec = 400 * 1000000}, NULL);
+  const struct itimerval Off = {0};
+  setitimer(ITIMER_PROF, &Off, NULL);
+  StopSpinning = 1;
+  for (int Index = 0; Index < 2; ++Index) pthread_join(Spinners[Index], NULL);
+  printf("# %d SIGPROF in 400 ms with two busy threads\n", (int) ProfSignals);
+  CHECK(ProfSignals >= 20);
+}
+
+// The CPUs this thread may run on, in order.
+static int AllowedCpus(int *Out, int Max) {
+  cpu_set_t Set;
+  if (sched_getaffinity(0, sizeof(Set), &Set) < 0) return 0;
+  int Count = 0;
+  for (int Cpu = 0; Cpu < CPU_SETSIZE && Count < Max; ++Cpu) {
+    if (CPU_ISSET(Cpu, &Set)) Out[Count++] = Cpu;
+  }
+  return Count;
+}
+
+static int PinTo(int Cpu) {
+  cpu_set_t Set;
+  CPU_ZERO(&Set);
+  CPU_SET(Cpu, &Set);
+  return sched_setaffinity(0, sizeof(Set), &Set);
+}
+
+TEST(thread, affinity_pins_thread_to_cpu) {
+  int Cpus[16];
+  const int Count = AllowedCpus(Cpus, 16);
+  CHECK(Count >= 1);
+  for (int Index = 0; Index < Count; ++Index) {
+    CHECK(PinTo(Cpus[Index]) == 0);
+    int Wrong = 0;
+    for (int Round = 0; Round < 200; ++Round) {
+      Work(20000, Round);
+      if (sched_getcpu() != Cpus[Index]) ++Wrong;
+      if (Round % 20 == 0) sched_yield();
+    }
+    if (Wrong) printf("#   cpu %d: %d of 200 reads elsewhere\n", Cpus[Index], Wrong);
+    CHECK(Wrong == 0);
+  }
+}
+
+static void *ReportAffinity(void *Raw) {
+  int *Out = Raw;
+  cpu_set_t Set;
+  sched_getaffinity(0, sizeof(Set), &Set);
+  Out[0] = CPU_COUNT(&Set);
+  Work(200000, 9);
+  Out[1] = sched_getcpu();
+  return NULL;
+}
+
+TEST(thread, affinity_inherited_by_new_thread) {
+  int Cpus[16];
+  const int Count = AllowedCpus(Cpus, 16);
+  if (Count < 2) SKIP("one processor");
+  const int Last = Cpus[Count - 1];
+  CHECK(PinTo(Last) == 0);
+  int Seen[2] = {0, -1};
+  pthread_t Child;
+  CHECK(pthread_create(&Child, NULL, ReportAffinity, Seen) == 0);
+  CHECK(pthread_join(Child, NULL) == 0);
+  CHECK(Seen[0] == 1);
+  CHECK(Seen[1] == Last);
+}
+
+struct CpuSeen {
+  uint64_t Mask;
+};
+static void *RecordCpus(void *Raw) {
+  struct CpuSeen *Seen = Raw;
+  const uint64_t Limit = Deadline(300);
+  while (!DeadlineExpired(Limit)) {
+    Work(50000, 3);
+    const int Cpu = sched_getcpu();
+    if (Cpu >= 0 && Cpu < 64) Seen->Mask |= 1ULL << Cpu;
+  }
+  return NULL;
+}
+
+TEST(thread, getcpu_reports_several_cpus_for_parallel_threads) {
+  if (Processors() < 2) SKIP("one processor");
+  struct CpuSeen Seen[4] = {{0}};
+  pthread_t Threads[4];
+  for (int Index = 0; Index < 4; ++Index) CHECK(pthread_create(&Threads[Index], NULL, RecordCpus, &Seen[Index]) == 0);
+  uint64_t All = 0;
+  for (int Index = 0; Index < 4; ++Index) {
+    pthread_join(Threads[Index], NULL);
+    All |= Seen[Index].Mask;
+  }
+  printf("# cpus seen %#llx\n", (unsigned long long) All);
+  CHECK(__builtin_popcountll(All) >= 2);
+}
+
+// A decimal number at *Text (after blanks), advancing *Text past it. Parsed by hand: the host headers map strtol to C23
+// symbols the Debian libc of the guest does not have.
+static long long ParseNumber(const char **Text) {
+  const char *Cursor = *Text;
+  while (*Cursor == ' ') ++Cursor;
+  const int Negative = *Cursor == '-';
+  if (Negative) ++Cursor;
+  long long Value = 0;
+  while (*Cursor >= '0' && *Cursor <= '9') Value = Value * 10 + (*Cursor++ - '0');
+  *Text = Cursor;
+  return Negative ? -Value : Value;
+}
+
+// Field Index (1-based, as proc(5) numbers them) of a /proc stat file.
+static long long StatField(const char *Path, int Index) {
+  char Text[1024];
+  const int FD = open(Path, O_RDONLY);
+  if (FD < 0) return -1;
+  const ssize_t Length = read(FD, Text, sizeof(Text) - 1);
+  close(FD);
+  if (Length <= 0) return -1;
+  Text[Length] = 0;
+  const char *Cursor = strrchr(Text, ')');  // the name may hold spaces
+  if (!Cursor) return -1;
+  ++Cursor;
+  for (int Field = 3; Field <= Index; ++Field) {
+    while (*Cursor == ' ') ++Cursor;
+    if (Field == Index) return ParseNumber(&Cursor);
+    while (*Cursor && *Cursor != ' ') ++Cursor;
+  }
+  return -1;
+}
+
+static volatile pid_t SpinnerTid;
+static void *SpinAndReport(void *Raw) {
+  SpinnerTid = gettid();
+  return SpinUntilStopped(Raw);
+}
+
+TEST(thread, proc_task_stat_counts_thread_cpu) {
+  StopSpinning = 0;
+  SpinnerTid = 0;
+  pthread_t Spinner;
+  CHECK(pthread_create(&Spinner, NULL, SpinAndReport, NULL) == 0);
+  nanosleep(&(struct timespec) {.tv_nsec = 300 * 1000000}, NULL);
+  char Path[64];
+  snprintf(Path, sizeof(Path), "/proc/self/task/%d/stat", (int) SpinnerTid);
+  const long long Busy = StatField(Path, 14) + StatField(Path, 15);  // utime + stime of the spinning thread
+  snprintf(Path, sizeof(Path), "/proc/self/task/%d/stat", (int) gettid());
+  const long long Idle = StatField(Path, 14) + StatField(Path, 15);  // this thread slept
+  StopSpinning = 1;
+  pthread_join(Spinner, NULL);
+  printf("# spinning thread %lld ticks, sleeping thread %lld ticks\n", Busy, Idle);
+  CHECK(Busy >= 15);
+  CHECK(Idle >= 0 && Idle < Busy);
+}
+
+// user + nice + system ticks of the "cpuN" line of /proc/stat, or -1.
+static long long CpuBusyTicks(int Cpu) {
+  static char Text[16384];
+  const int FD = open("/proc/stat", O_RDONLY);
+  if (FD < 0) return -1;
+  ssize_t Length = 0, Got;
+  while (Length < (ssize_t) sizeof(Text) - 1 && (Got = read(FD, Text + Length, sizeof(Text) - 1 - Length)) > 0) Length += Got;
+  close(FD);
+  Text[Length > 0 ? Length : 0] = 0;
+  char Name[16];
+  snprintf(Name, sizeof(Name), "\ncpu%d ", Cpu);
+  const char *Line = strstr(Text, Name);
+  if (!Line) return -1;
+  const char *Cursor = Line + strlen(Name);
+  const long long User = ParseNumber(&Cursor), Nice = ParseNumber(&Cursor), System = ParseNumber(&Cursor);
+  return User + Nice + System;
+}
+
+TEST(thread, proc_stat_counts_busy_cpu) {
+  int Cpus[16];
+  const int Count = AllowedCpus(Cpus, 16);
+  CHECK(Count >= 1);
+  const int Cpu = Cpus[Count - 1];
+  CHECK(PinTo(Cpu) == 0);
+  const long long Before = CpuBusyTicks(Cpu);
+  const uint64_t Limit = Deadline(400);
+  while (!DeadlineExpired(Limit)) Work(100000, 1);
+  const long long After = CpuBusyTicks(Cpu);
+  printf("# cpu%d busy %lld ticks over 400 ms\n", Cpu, After - Before);
+  CHECK(Before >= 0 && After - Before >= 20);
+}
+
+// Two processes (not forked copies: the second is an exec) passing messages through a shared memfd keep x86 order.
+static void MessageWriterProcess(int FD) {
+  void *Raw = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, FD, 0);
+  if (Raw == MAP_FAILED) _exit(2);
+  volatile uint64_t *Words = Raw;  // [0] data, [8] flag, [16] start
+  while (!Words[16]) {
+  }
+  for (uint64_t Value = 1; Value <= 1000000; ++Value) {
+    Words[0] = Value;
+    __asm__ volatile("" ::: "memory");
+    Words[8] = Value;
+  }
+  _exit(0);
+}
+
+TEST(thread, shared_memory_message_passing_between_processes) {
+  if (Processors() < 2) SKIP("one processor");
+  char Self[PATH_MAX];
+  const ssize_t SelfLength = readlink("/proc/self/exe", Self, sizeof(Self) - 1);
+  Self[SelfLength > 0 ? SelfLength : 0] = 0;
+  // The native check of the Debian build runs it through ld-linux: /proc/self/exe is then the loader.
+  if (strstr(Self, "/ld-linux")) SKIP("started through the dynamic loader");
+  const int FD = memfd_create("message", 0);
+  CHECK(FD >= 0);
+  if (FD < 0) return;
+  CHECK(ftruncate(FD, 4096) == 0);
+  void *Raw = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, FD, 0);
+  CHECK(Raw != MAP_FAILED);
+  if (Raw == MAP_FAILED) return;
+  volatile uint64_t *Words = Raw;
+  const pid_t Child = fork();
+  if (Child == 0) {
+    char Arg[16];
+    snprintf(Arg, sizeof(Arg), "%d", FD);
+    execl("/proc/self/exe", "thread-suite", "--message-writer", Arg, (char *) NULL);
+    _exit(3);
+  }
+  Words[16] = 1;
+  uint64_t Flag = 0, Reordered = 0;
+  const uint64_t Limit = Deadline(8000);
+  while (Flag != 1000000 && !DeadlineExpired(Limit)) {
+    Flag = Words[8];
+    __asm__ volatile("" ::: "memory");
+    if (Words[0] < Flag) ++Reordered;
+  }
+  const int Status = WaitExit(Child);
+  printf("# %llu reorderings\n", (unsigned long long) Reordered);
+  CHECK(WIFEXITED(Status) && WEXITSTATUS(Status) == 0);
+  CHECK(Flag == 1000000);
+  CHECK(Reordered == 0);
+}
+
 int main(int argc, char **argv) {
+  if (argc == 3 && !strcmp(argv[1], "--message-writer")) {
+    const char *Text = argv[2];
+    MessageWriterProcess((int) ParseNumber(&Text));
+  }
   int List = 0, Count = 0;
   const char *Location = ".";  // -d dir: where the scratch folder is made
   char **Patterns = calloc(argc, sizeof(char *));

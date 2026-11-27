@@ -12,6 +12,70 @@ User decision (2026-11-27): the whole SD card appears in the guest at `/mnt/sd`,
 with FEX's internal folders hidden (`/fex/rootfs`, `/fex/.inode`, `/fex/.tmp` and older tmpfs areas, `/fex/.download`,
 `/fex/config`). Card launches then run as `/mnt/sd/<card path>` (cwd and `/proc/self/exe` inside that mount).
 
+### Multithreading milestone complete: 0.18.18 accepted and committed (2026-11-27)
+Console 0.18.18 (log `.superpowers/sdd/console-0.18.18.log`): final-pass-suite 11/11 clean, 1134/0/10. Committed on
+nx2 (not pushed). Next milestone: per AGENTS.md / Milestone5Plan.md (32-bit), after discussing with the user.
+
+### Multithreading Tasks 2-4 accepted on console 0.18.17 (2026-11-27)
+Console (log `.superpowers/sdd/console-0.18.17.log`): final-pass-suite 11/11 clean, 1134/0/10 (thread 36/0/0,
+proc 243/0/6, proc-root 249/0/0, comm 124/0/1 both, fs 81/0/2, fs-root 83/0/0, pty 43/0/0 both, container 54/0/0
+both); two-tab check OK (user).
+Final review done (`.superpowers/sdd/mt-final-review.md`: 0 Critical, 1 Important, 4 Minor). Fixed in 0.18.18:
+- I1: a wall-time LiveTicks estimate could make CPU clocks step back at the next commit. LiveReported now keeps a
+  high-water mark that the commit honors.
+- M4: garbled MapLock/ServiceNetPolling comment.
+Tracked, not fixed:
+- M2: JIT link slots are never freed, so they grow under repeated invalidation. A target resolved before the
+  invalidation lock may link stale code (unverified).
+- M3: an affinity mask with only nonexistent CPUs leaves host affinity unchanged.
+- M1: SIGKILL to a process waits for its chosen thread to run.
+Next: console final pass on 0.18.18 (`.superpowers/sdd/fex-switch2-guest-0.18.18.nro`), then commit.
+
+### Multithreading Tasks 2-4, 0.18.15 pending console (2026-11-27)
+- TSO starts off per process (`SetHardwareTSOSupport(true)` in InitializeProcessContext). `EnableTso` turns it on
+  and drops every translation (`DropTranslations` over [0, GuestUserLimit)) at the second thread (CloneThread), at a
+  memfd/tmpfs shared mapping (MapGuest) and at shmat. Fork inherits it; exec resets it to off. Log line at
+  Detailed: "TSO on for process N (why)". Known limit (review): the rest of the block that made the syscall still
+  runs without TSO.
+- sched_setaffinity sets the host core mask (ApplyHostAffinity); new host threads inherit it. getcpu reports the
+  current core. Nice and policies stay unmapped to host priorities: Horizon priorities are strict and would starve
+  lower ones, while Linux nice never starves.
+- /proc/stat per-CPU busy time (CpuBusyTicks; a dispatch counts for the CPU it started on). Counts are monotonic.
+- Already present from earlier milestones and now tested: pthread_cancel (deferred and async), robust mutexes
+  (thread and process owner death), ITIMER_PROF over all threads.
+- thread-suite has 12 new tests (36 total). xz-scaling.sh also times `sort --parallel=1/4` (make is not in the RootFS).
+- Host: check-thread-suite-native 36/0/0 (host build), 35/0/1 (Debian glibc via ld-linux: the exec'd memfd test
+  skips); check-guest-procfs ok. Review (Sonnet): no critical or important findings. Fixed: /proc/stat per-CPU
+  counts could go back; ITIMER_PROF bound relaxed to < 290 ms.
+- NRO `.superpowers/sdd/fex-switch2-guest-0.18.15.nro`. Console: final-pass-suite, xz-scaling.elf, two-tab check.
+- 0.18.15 console (log `.superpowers/sdd/console-0.18.15.log`): final pass 10/11 clean, 1131/3/10. All 24 old
+  thread tests pass; 3 new ones fail:
+  - itimer_prof_counts_all_threads (SIGPROF after 974 ms, not ~100 ms);
+  - itimer_prof_interval_reaches_busy_threads (2 SIGPROF in 400 ms);
+  - proc_stat_counts_busy_cpu (cpu5 busy 0).
+  Causes:
+  (a) Horizon updates another thread's tick count only when that thread is switched out, so a thread spinning in
+      guest code on its own core showed no CPU time;
+  (b) a CPU-clock timer deadline was slept as wall time even with N busy threads;
+  (c) a dispatch was counted on the CPU it started on, but the test pins itself mid-dispatch.
+- 0.18.16 fixes:
+  (a) LiveTicks of another thread in guest code = max(kernel count, wall time since its last commit), unless the
+      cores are oversubscribed;
+  (b) MonotonicDeadline divides the remaining process CPU time by the process's threads in guest code;
+  (c) CommitCpuTime at every syscall and at dispatch end, charged to the core it ran on.
+  NRO `.superpowers/sdd/fex-switch2-guest-0.18.16.nro`.
+- 0.18.16 console (log `.superpowers/sdd/console-0.18.16.log`):
+  - thread-suite 35/1/0: itimer_prof_counts_all_threads now passes (103 ms);
+  - itimer_prof_interval_reaches_busy_threads still fails (3 SIGPROF);
+  - xz -T1 2875 / -T4 1231 ms, sort --parallel 1/4 1762 / 1031 ms; two-tab check OK.
+  Cause: every thread with a deliverable process signal was woken or stopped. The sleeping main thread took SIGPROF
+  and its nanosleep ended with EINTR. Linux complete_signal wakes one chosen thread; for a CPU itimer, that is the
+  thread using the CPU.
+- 0.18.17: process-directed signals choose a target (ChooseSignalTarget: Prefer, else the main thread, else a
+  rotor); only it is woken or stopped (HasActionableSignal ToWake in Ready and NeedsStop). Others take it only if
+  they run anyway, or if the target can no longer take it. CPU itimers prefer a thread in guest code.
+  Needs the full final pass (signal behavior everywhere). NRO `.superpowers/sdd/fex-switch2-guest-0.18.17.nro`.
+
 ### Multithreading Task 1 accepted on console 0.18.14 (2026-11-27, committed)
 Console (log `.superpowers/sdd/console-0.18.14.log`): final-pass-suite 11/11 clean, 1122/0/10: proc 243/0/6,
 proc-root 249/0/0, comm 124/0/1 (root same), fs 81/0/2, fs-root 83/0/0, pty 43/0/0 (root same), container 54/0/0

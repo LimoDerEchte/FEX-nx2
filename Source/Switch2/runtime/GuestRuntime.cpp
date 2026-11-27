@@ -1110,6 +1110,7 @@ public:
     LockSite = 0;
     HostSyscallNumber = static_cast<int64_t>(Frame->State.gregs[FEXCore::X86State::REG_RAX]);
     LeftGuest(*Slot);
+    CommitCpuTime(*Slot);
     Enter(*Slot);
     // The thread must not run the call now: it ends, or its process is held (another thread's exec, a fork snapshot,
     // a memory view swap, a stop). Leaving before anything of the call ran makes the guest run the syscall
@@ -1283,7 +1284,11 @@ public:
     case 135: Result = SetPersonality(A); break;
     case 140: Result = GetPriority(A, B); break;
     case 141: Result = SetPriority(A, B, C); break;
-    case 309: Result = (A && CopyOut(A, uint32_t {})) || (B && CopyOut(B, uint32_t {})) ? Fault : 0; break; // getcpu: CPU 0, node 0
+    case 309: { // getcpu: the core this host thread runs on now, node 0
+      const uint32_t Cpu = GuestCpuOfCore(static_cast<uint32_t>(svcGetCurrentProcessorNumber()));
+      Result = (A && CopyOut(A, Cpu)) || (B && CopyOut(B, uint32_t {})) ? Fault : 0;
+      break;
+    }
     case 63: Result = UnameGuest(A); break;
     case 170: Result = SetUtsName(false, A, B); break;
     case 171: Result = SetUtsName(true, A, B); break;
@@ -1793,12 +1798,19 @@ private:
     // Where the host thread's time went (MonotonicNs): created, first guest entry, in guest code, asleep in BlockSlot,
     // in the yield after a preemption.
     uint64_t BornNs {}, FirstGuestNs {}, InGuestNs {}, BlockedNs {}, YieldNs {};
+    uint32_t LastCpu {}; // the guest CPU its current or last dispatch started on (/proc/stat)
     // When the thread entered guest code (MonotonicNs) and its host thread's tick count then, so the
     // watchdog and the CPU clocks can tell how long this thread alone has run. StopArmed: the watchdog
     // already asked it to stop.
     uint64_t GuestSince {};
     uint64_t EnteredNs {}; // EXPERIMENT: when the thread last went into guest code (dispatch or syscall return)
+    // CPU ticks of its host thread when its CPU time was last committed (CommitCpuTime), and the monotonic time then;
+    // 0 outside a dispatch.
     uint64_t DispatchStartTicks {};
+    uint64_t CpuMarkNs {};
+    // The most CPU time LiveTicks has reported for the stretch since the commit; the commit counts at least this, so
+    // no CPU clock goes back after a wall-time estimate.
+    mutable uint64_t LiveReported {};
     std::atomic<bool> StopArmed {};
     GuestSyscalls* Owner {}; // the runtime its host thread serves
   };
@@ -1910,7 +1922,7 @@ private:
     // answers the pending signal (EINTR, or blocking again so the next pass delivers it). Stopping it before the
     // instruction would deliver the signal with no call in progress, and the call would restart instead of failing.
     return Owner.Stopped || Owner.Exited || Owner.PendingExec || Owner.StopRequests ||
-           (!Slot.SignalRerunDone && HasActionableSignal(Slot));
+           (!Slot.SignalRerunDone && HasActionableSignal(Slot, true));
   }
 
   // Another thread of a process that runs one thread at a time is in guest code.
@@ -2187,8 +2199,9 @@ private:
       CopyOut(Slot.SetTidOnStart, OwnTid(Slot));
       Slot.SetTidOnStart = 0;
     }
-    const auto Before = CurrentThreadTicks();
-    Slot.DispatchStartTicks = Before;
+    Slot.DispatchStartTicks = CurrentThreadTicks();
+    Slot.CpuMarkNs = MonotonicNs();
+    Slot.LastCpu = GuestCpuOfCore(static_cast<uint32_t>(svcGetCurrentProcessorNumber()));
     if (Task->TraceFirstDispatch && Logging == LogLevel::Trace) {
       LogFirstDispatch(*Slot.Core->CurrentFrame);
       FirstDispatchCompileCheckpoints = 11;
@@ -2206,10 +2219,8 @@ private:
     const bool Run = !Slot.Exited && !Task->Stopped && Slot.Waiting == WaitKind::None;
     if (Run) Dispatch(*Slot.Core->CTX);
     FirstDispatchCompileCheckpoints = 0;
-    const auto Used = CurrentThreadTicks() - Before;
+    CommitCpuTime(Slot);
     Slot.DispatchStartTicks = 0;
-    Task->CpuTicks += Used;
-    Slot.CpuTicks += Used;
     if (Task->StartupSyscallCheckpoints && Task->LastStartupSyscall) {
       char Message[112];
       std::snprintf(Message, sizeof(Message), "%s syscall %llu completed",
@@ -2264,7 +2275,7 @@ private:
     Slot.BornNs = MonotonicNs();
     if (R_FAILED(threadCreate(&Slot.Host, &GuestThreadEntry, &Slot, nullptr, GuestHostStackSize, GuestThreadPriority, -2))) return false;
     Slot.HostCreated = true;
-    SpreadOverCores(Slot.Host);
+    ApplyHostAffinity(Slot); // the CPU mask it inherited (all cores by default)
     if (Serving && !StartHostThread(Slot)) {
       threadClose(&Slot.Host);
       Slot.HostCreated = false;
@@ -2440,17 +2451,45 @@ private:
   struct MemoryView {
     uint32_t Resident {};
   };
-  // CPU time a slot's thread has used in its current dispatch; it is only added to the stored ticks once the
-  // dispatch ends. The running slot reads its own host thread; another slot in guest code is read through its host
-  // thread's handle (the kernel may count the quantum in progress late, so this can lag a little).
+  // Adds the CPU time the slot's thread used since the last commit to the thread, its process and the CPU it was
+  // counted on, and starts the next stretch on the CPU it runs on now. Runs on the slot's own host thread with the
+  // lock held: at every syscall and when a dispatch ends. Every CPU's count only grows.
+  void CommitCpuTime(GuestThread& Slot) {
+    if (!Slot.DispatchStartTicks) return;
+    const auto Now = CurrentThreadTicks();
+    const auto Used = std::max<uint64_t>(Now > Slot.DispatchStartTicks ? Now - Slot.DispatchStartTicks : 0, Slot.LiveReported);
+    Slot.LiveReported = 0;
+    Slot.CpuTicks += Used;
+    Processes.at(Slot.PID).CpuTicks += Used;
+    CpuBusyTicks[std::min<uint32_t>(Slot.LastCpu, CpuBusyTicks.size() - 1)] += Used;
+    Slot.DispatchStartTicks = Now;
+    Slot.CpuMarkNs = MonotonicNs();
+    Slot.LastCpu = GuestCpuOfCore(static_cast<uint32_t>(svcGetCurrentProcessorNumber()));
+  }
+
+  // CPU time a slot's thread used since its last commit. The running slot reads its own host thread. Horizon updates
+  // another thread's tick count only when that thread is switched out, so a thread that stays in guest code on its
+  // own core would show none: for a slot in guest code, the wall time since the commit counts when it is larger, as
+  // long as every guest thread that wants a core has one (an overcount only while a non-guest host thread borrows
+  // the core). With more such threads than cores the watchdog switches them every quantum, and the kernel's count
+  // stays current.
   uint64_t LiveTicks(const GuestThread& Slot) const {
     if (!Slot.DispatchStartTicks) return 0;
+    if (&Slot == Current) {
+      const auto Ticks = CurrentThreadTicks();
+      return std::max<uint64_t>(Ticks > Slot.DispatchStartTicks ? Ticks - Slot.DispatchStartTicks : 0, Slot.LiveReported);
+    }
+    if (!Slot.HostCreated || Slot.HostState != GuestThread::HostRun::InGuest) return 0;
     u64 Ticks {};
-    if (&Slot == Current) Ticks = CurrentThreadTicks();
-    else if (Slot.HostCreated && Slot.HostState == GuestThread::HostRun::InGuest) {
-      svcGetInfo(&Ticks, InfoType_ThreadTickCount, Slot.Host.handle, TickCountInfo_Total);
-    } else return 0;
-    return Ticks > Slot.DispatchStartTicks ? Ticks - Slot.DispatchStartTicks : 0;
+    svcGetInfo(&Ticks, InfoType_ThreadTickCount, Slot.Host.handle, TickCountInfo_Total);
+    const uint64_t Counted = Ticks > Slot.DispatchStartTicks ? Ticks - Slot.DispatchStartTicks : 0;
+    uint64_t Live = Counted;
+    if (!CoresOversubscribed()) {
+      const auto Mono = MonotonicNs();
+      Live = std::max<uint64_t>(Live, Mono > Slot.CpuMarkNs ? armNsToTicks(Mono - Slot.CpuMarkNs) : 0);
+    }
+    Slot.LiveReported = std::max(Slot.LiveReported, Live);
+    return Slot.LiveReported;
   }
   uint64_t ProcessTicks(const GuestProcess& Process) const {
     auto Total = Process.CpuTicks;
@@ -2484,12 +2523,12 @@ private:
     // sleeping again. (Sending a signal moves IOEpoch, so without the limit every new signal or epoch change by another
     // thread would rescan again and the signal would never be delivered.)
     if ((Thread.Waiting == WaitKind::IO || Thread.Waiting == WaitKind::Net || Thread.Waiting == WaitKind::Terminal || Thread.Waiting == WaitKind::Lock) &&
-        Thread.WaitAddress != IOEpoch && HasActionableSignal(Thread) && !Thread.SignalRerunDone) {
+        Thread.WaitAddress != IOEpoch && HasActionableSignal(Thread, true) && !Thread.SignalRerunDone) {
       Thread.Waiting = WaitKind::None;
       Thread.RerunBeforeSignals = true;
       return true;
     }
-    if (HasActionableSignal(Thread)) return true;
+    if (HasActionableSignal(Thread, true)) return true;
     if (Thread.Waiting == WaitKind::Signal) {
       // rt_sigtimedwait reruns to take a signal from its set or time out.
       const auto& Process = Processes.at(Thread.PID);
@@ -2749,6 +2788,8 @@ private:
     if (Flags & SetTLS) State.fs_cached = TLS;
     const auto TID = NextTid;
     if (Current->Sched.Policy == Switch2Guest::Sched::Deadline && !Current->Sched.ResetOnFork) return -11; // sched_fork: EAGAIN
+    // Before the thread exists: from here on another thread runs against this memory.
+    EnableTso(*Task, "second thread");
     if (!AddThread(*Frame->Thread->CTX, State, TID, Flags & ChildClearTid ? ChildTid : 0, Task->PID)) return -11;
     ++NextTid;
     const uint32_t Local = Task->Ns.Pid->Allocate(TID); // the thread's number in its namespace (and the ancestors')
@@ -3551,6 +3592,7 @@ private:
     const size_t Rounded = PagesOf(Segment->Size) * GuestPageSize;
     const uint8_t Access = PF_R | (Flags & ReadOnly ? 0 : PF_W) | (Flags & Execute ? PF_X : 0);
     if (!Task->Memory.RegisterSharedFile(Base, Rounded, Access, Segment->Storage, !(Flags & ReadOnly))) return -12;
+    EnableTso(*Task, "System V shared memory");
     std::erase_if(Task->ShmAttached, [&](const ShmAttach& Old) { return !Task->Memory.AnyMapped(Old.Address, Old.Size); });
     Task->ShmAttached.push_back({Segment->Storage, Base, Rounded});
     Segment->Atime = NowSeconds();
@@ -4473,6 +4515,10 @@ private:
     // children and kept across exec.
     bool SerialGuest {};
     bool NoTso {}; // EXPERIMENT: the session's .no-tso sidecar; its processes' contexts translate without TSO
+    // x86 memory ordering (TSO) is emulated once another thread can watch this process's memory while it runs: from
+    // its second thread, or from a mapping of memory another process can run against (memfd, tmpfs, System V shm).
+    // Until then plain loads and stores are translated (about 9 % faster). Inherited by fork, reset by exec.
+    bool Tso {};
     bool Profile {}; // EXPERIMENT: the session's .profile sidecar: guest RIP samples per process
     std::unordered_map<uint64_t, uint32_t> ProfileSamples;
     // SerialGuest: the thread that gave up guest code (yield, preemption) waits until a sibling that was waiting for its
@@ -4537,6 +4583,10 @@ private:
     int32_t NextTimerId {};
     // Soft and hard resource limits (RLIMIT_*), inherited by fork and kept by exec.
     std::array<std::array<uint64_t, 2>, ResourceCount> Limits {DefaultLimits()};
+    // Linux complete_signal: the thread (TID) chosen to be woken for each process-directed signal, 0 for none. Only
+    // that thread is woken from a wait or stopped in guest code for it; any thread that runs may still take it.
+    std::array<uint32_t, 64> SignalTarget {};
+    size_t SignalRotor {}; // signal->curr_target: where the search for a willing thread starts
     // Job control: a stopped process does not run; the parent may collect
     // one stop or continue report through wait.
     bool Stopped {};
@@ -5280,7 +5330,25 @@ private:
     Process.Context->SetSyscallHandler(this);
     // Interrupt-page checks let the watchdog preempt CPU-bound guest code.
     Process.Context->SetPollPendingInterrupt(true);
+    // Without another thread on its memory, a process's own loads and stores are seen in program order: FEX's TSO
+    // emulation stays off until EnableTso (the switch FEX gives hosts whose hardware orders memory itself).
+    if (!Process.Tso) Process.Context->SetHardwareTSOSupport(true);
     return Process.Context->InitCore();
+  }
+
+  // Turns on TSO emulation for Process and drops everything already translated without it, in every thread of the
+  // process, so no block without TSO runs again. A block that is running finishes; its exits are delinked.
+  void EnableTso(GuestProcess& Process, const char* Why) {
+    if (Process.Tso) return;
+    Process.Tso = true;
+    if (!Process.Context || Process.NoTso) return;
+    Process.Context->SetHardwareTSOSupport(false);
+    DropTranslations(*Process.Context, Process.PID, 0, GuestUserLimit);
+    if (Logging != LogLevel::Standard) {
+      char Line[96];
+      std::snprintf(Line, sizeof(Line), "TSO on for process %u (%s)", Process.PID, Why);
+      WriteLog(Line);
+    }
   }
 
   static bool ValidateSnapshotRange(uint64_t Start, size_t Size) {
@@ -5668,6 +5736,7 @@ private:
     Child.ForkView = Task->ForkView; // Resident stays the parent until the first swap to the child
     Child.SerialGuest = Task->SerialGuest;
     Child.NoTso = Task->NoTso;
+    Child.Tso = Task->Tso; // its shared mappings stay; one thread alone may be enough, but this stays safe
     Child.Profile = Task->Profile;
     Child.RestorePending = true;
     if (Flags & CloneFiles) Child.PendingDescriptors = Current->Descriptors; // one table, two processes
@@ -6405,6 +6474,15 @@ private:
       Task->ExecBy = nullptr;
       return true;
     }
+    // The new image starts with one thread and no shared mappings: TSO off again. The other threads are gone, so
+    // nothing translated with TSO for the old image is left to run; clear what they added meanwhile.
+    if (Task->Tso) {
+      Task->Tso = false;
+      if (!Task->NoTso) {
+        OldThread->CTX->SetHardwareTSOSupport(true);
+        OldThread->CTX->ClearCodeCache(OldThread, false);
+      }
+    }
     DestroyCore(*Self);
     ResetSlotKeepHost(*Self);
     Current = nullptr;
@@ -6654,7 +6732,16 @@ private:
   std::optional<uint64_t> MonotonicDeadline(const TimerClock& Clock, uint64_t Deadline, uint64_t Mono) {
     const auto Now = TimerNow(Clock);
     if (!Now) return std::nullopt;
-    return Deadline <= *Now ? Mono : AddDeadline(Mono, Deadline - *Now);
+    if (Deadline <= *Now) return Mono;
+    // A process's CPU clock runs as fast as its threads in guest code together: N busy threads reach the deadline in
+    // 1/N of the remaining time.
+    uint64_t Running = 1;
+    if (Clock.Domain == TimerDomain::ProcessCpu) {
+      Running = std::max<uint64_t>(1, std::count_if(Threads.begin(), Threads.end(), [&](const auto& Slot) {
+        return Slot.Core && Slot.PID == Clock.Owner && Slot.HostState == GuestThread::HostRun::InGuest;
+      }));
+    }
+    return AddDeadline(Mono, (Deadline - *Now) / Running);
   }
 
   // The earliest monotonic time an armed timer may expire, or 0. Without
@@ -6745,8 +6832,18 @@ private:
         auto& Timer = Process.ITimers[Which];
         if (!Timer.Armed()) continue;
         const auto Now = Which ? ProcessCpuNs(Process) : MonotonicNs();
-        // it_real_fn and the CPU itimers send with SEND_SIG_PRIV: SI_KERNEL.
-        if (Timer.Expire(Now)) SendSignal(Process, nullptr, MakeSigInfo(ITimerSignals[Which], SiKernel));
+        // it_real_fn and the CPU itimers send with SEND_SIG_PRIV: SI_KERNEL. A CPU itimer's signal goes to a thread
+        // that was using the CPU, as Linux sends it from the running thread's tick.
+        const GuestThread* Busy {};
+        if (Which) {
+          for (const auto& Slot : Threads) {
+            if (Slot.Core && !Slot.Exited && Slot.PID == PID && Slot.HostState == GuestThread::HostRun::InGuest) {
+              Busy = &Slot;
+              break;
+            }
+          }
+        }
+        if (Timer.Expire(Now)) SendSignal(Process, nullptr, MakeSigInfo(ITimerSignals[Which], SiKernel), Busy);
       }
       for (auto& Timer : Process.Timers) {
         if (!Timer.Timer.Armed()) continue;
@@ -8864,25 +8961,33 @@ private:
   }
 
   mutable Switch2Guest::Procfs::LoadAverage LoadAvg;
+  // CPU ticks of finished dispatches per guest CPU, of every process that ever ran (/proc/stat never goes back).
+  std::array<uint64_t, 64> CpuBusyTicks {};
 
   // The files of /proc that are not about one process.
   std::optional<std::string> ProcSystemFile(std::string_view Name) const {
     namespace Pf = Switch2Guest::Procfs;
     const uint32_t Cpus = HostCpuCount();
     const uint64_t Mono = MonotonicNs();
-    uint64_t Busy {};
     uint32_t Running {}, Blocked {}, Tasks {};
-    for (const auto& [PID, Process] : Processes) {
-      if (Process.Reaped) continue;
-      Busy += ClockOf(armTicksToNs(ProcessTicks(Process)));
-    }
+    // Busy time per CPU: finished dispatches, plus the dispatch in progress of each thread on the CPU it entered on.
+    std::vector<uint64_t> CpuTicks(CpuBusyTicks.begin(), CpuBusyTicks.begin() + std::min<size_t>(Cpus, CpuBusyTicks.size()));
+    CpuTicks.resize(Cpus);
     for (const auto& Thread : Threads) {
+      if (Thread.Core && Thread.LastCpu < Cpus) CpuTicks[Thread.LastCpu] += LiveTicks(Thread);
       if (!Thread.Core || Thread.Exited) continue;
       ++Tasks;
       if (Thread.Waiting == WaitKind::None) ++Running;
       else if (Thread.Waiting == WaitKind::IO || Thread.Waiting == WaitKind::Terminal) ++Blocked;
     }
     const uint64_t UptimeTicks = ClockOf(Mono), Capacity = UptimeTicks * Cpus;
+    std::vector<uint64_t> CpuBusy(Cpus), CpuIdle(Cpus);
+    uint64_t Busy {};
+    for (uint32_t Cpu = 0; Cpu < Cpus; ++Cpu) {
+      CpuBusy[Cpu] = std::min(ClockOf(armTicksToNs(CpuTicks[Cpu])), UptimeTicks);
+      CpuIdle[Cpu] = UptimeTicks - CpuBusy[Cpu];
+      Busy += CpuBusy[Cpu];
+    }
     const uint64_t IdleTicks = Capacity > Busy ? Capacity - Busy : 0;
     if (Name == "/proc/uptime") return Pf::FormatUptime(Mono, IdleTicks * 10'000'000);
     if (Name == "/proc/loadavg") {
@@ -8894,6 +8999,8 @@ private:
       S.Cpus = Cpus;
       S.BusyTicks = Busy;
       S.IdleTicks = IdleTicks;
+      S.CpuBusy = std::move(CpuBusy);
+      S.CpuIdle = std::move(CpuIdle);
       S.Context = Preempt.Switches;
       S.BootTime = static_cast<uint64_t>(Realtime.Now(Mono) - static_cast<int64_t>(Mono)) / 1'000'000'000;
       S.Forks = NextTid;
@@ -14866,10 +14973,28 @@ private:
     return (Thread.Pending.Set() | Process.SharedPending.Set()) & ~(Thread.SignalMask | Thread.WaitSignals);
   }
 
-  // True when delivery would run a handler or a default action.
-  bool HasActionableSignal(const GuestThread& Thread) const {
+  // True when Signal, pending for the whole process, is Thread's to be woken for: it is the chosen target, or the
+  // chosen thread can no longer take it (gone, or it blocks the signal now).
+  bool SignalTargets(const GuestProcess& Process, uint32_t Signal, const GuestThread& Thread) const {
+    const auto Target = Process.SignalTarget[Signal - 1];
+    if (!Target || Target == Thread.TID) return true;
+    return std::none_of(Threads.begin(), Threads.end(), [&](const auto& Other) {
+      return Other.Core && !Other.Exited && Other.PID == Process.PID && Other.TID == Target && !(Other.SignalMask & SignalBit(Signal));
+    });
+  }
+
+  // True when delivery would run a handler or a default action. ToWake: only the signals Thread is to be woken or
+  // stopped for (a process-directed one chosen for another thread does not count; Thread takes it if it runs anyway).
+  bool HasActionableSignal(const GuestThread& Thread, bool ToWake = false) const {
     const auto& Process = Processes.at(Thread.PID);
-    for (auto Pending = DeliverableSignals(Thread); Pending; Pending &= Pending - 1) {
+    auto Deliverable = DeliverableSignals(Thread);
+    if (ToWake) {
+      for (auto Shared = Deliverable & ~Thread.Pending.Set(); Shared; Shared &= Shared - 1) {
+        const auto Signal = static_cast<uint32_t>(std::countr_zero(Shared) + 1);
+        if (!SignalTargets(Process, Signal, Thread)) Deliverable &= ~SignalBit(Signal);
+      }
+    }
+    for (auto Pending = Deliverable; Pending; Pending &= Pending - 1) {
       if (!SignalIgnored(Process, std::countr_zero(Pending) + 1)) return true;
     }
     return false;
@@ -14886,9 +15011,29 @@ private:
     return First;
   }
 
+  // Linux complete_signal's choice of the thread to wake for a process-directed signal: Prefer when it wants the
+  // signal, else the next willing thread from the rotor. A thread wants it when it does not block it and either runs
+  // or has nothing pending to handle yet (wants_signal). 0 when none wants it now (it stays pending for all).
+  uint32_t ChooseSignalTarget(GuestProcess& Process, uint32_t Signal, const GuestThread* Prefer) {
+    const auto Wants = [&](const GuestThread& Thread) {
+      return Thread.Core && !Thread.Exited && Thread.PID == Process.PID && !(Thread.SignalMask & SignalBit(Signal)) &&
+             (Thread.HostState == GuestThread::HostRun::InGuest || Thread.Waiting == WaitKind::None || !HasActionableSignal(Thread));
+    };
+    if (Prefer && Wants(*Prefer)) return Prefer->TID;
+    for (size_t Step = 0; Step < Threads.size(); ++Step) {
+      const auto Index = (Process.SignalRotor + Step) % Threads.size();
+      if (Wants(Threads[Index])) {
+        Process.SignalRotor = Index;
+        return Threads[Index].TID;
+      }
+    }
+    return 0;
+  }
+
   // Linux prepare_signal and __send_signal_locked. Thread is the target for
-  // a thread-directed signal, else nullptr. Returns 0 or -EAGAIN.
-  int64_t SendSignal(GuestProcess& Target, GuestThread* Thread, const SigInfo& Info) {
+  // a thread-directed signal, else nullptr; a process-directed signal wakes Prefer when it wants it (the main thread
+  // when not given; a CPU timer passes the thread that used the CPU). Returns 0 or -EAGAIN.
+  int64_t SendSignal(GuestProcess& Target, GuestThread* Thread, const SigInfo& Info, const GuestThread* Prefer = nullptr) {
     const auto Signal = static_cast<uint32_t>(Info.Signo);
     const auto Bit = SignalBit(Signal);
     auto Discard = [&](uint64_t Mask) {
@@ -14917,7 +15062,10 @@ private:
     auto& Queue = Thread ? Thread->Pending : Target.SharedPending;
     SigInfo Queued = Info;
     if (!RawSigInfo) TranslateSigInfo(Queued, Target);
+    // Chosen before the signal is queued: a waiting thread wants it while nothing else is pending for it.
+    const auto Chosen = Thread ? 0 : ChooseSignalTarget(Target, Signal, Prefer ? Prefer : LeaderThread(Target.PID));
     if (!Queue.Enqueue(Queued, Target.Limits[ResourceSigpending][0])) return -11;
+    if (!Thread) Target.SignalTarget[Signal - 1] = Chosen;
     ++IOEpoch; // signalfd readers and pollers
     ++SignalChanges;
     return 0;
@@ -15629,7 +15777,34 @@ private:
     auto* Owner = Thread ? FindProcess(Thread->PID) : nullptr;
     if (!Owner) return -3;
     if (!SchedActor(*Owner).SameOwner && !Task->Creds.Capable(CapSysNice)) return -1;
-    return AffinityApply(Thread->CpuMask, Requested, Count);
+    if (const auto Error = AffinityApply(Thread->CpuMask, Requested, Count)) return Error;
+    ApplyHostAffinity(*Thread);
+    return 0;
+  }
+
+  // Guest CPU i is the i-th core of the process's host core mask (the console gives cores 0-5: the same numbers).
+  static uint32_t HostCoresOf(uint64_t GuestMask) {
+    const uint32_t Cores = ProcessCoreMask();
+    uint32_t Out {};
+    for (uint32_t Core = 0, Index = 0; Core < 32; ++Core) {
+      if (!(Cores >> Core & 1)) continue;
+      if (Index < 64 && GuestMask >> Index & 1) Out |= 1u << Core;
+      ++Index;
+    }
+    return Out;
+  }
+
+  static uint32_t GuestCpuOfCore(uint32_t Core) {
+    return Core < 32 ? static_cast<uint32_t>(std::popcount(ProcessCoreMask() & ((1u << Core) - 1))) : 0;
+  }
+
+  // sched_setaffinity is enforced: the thread's host thread may run only on the cores of its CPU mask. The host
+  // thread of a slot carries one guest thread (exec keeps it, with the mask).
+  void ApplyHostAffinity(GuestThread& Thread) {
+    if (!Thread.HostCreated) return;
+    const auto Cores = HostCoresOf(Thread.CpuMask);
+    // Ideal core -1 (no preference): valid for every mask; the kernel moves the thread if its core left the mask.
+    if (Cores && R_FAILED(svcSetThreadCoreMask(Thread.Host.handle, -1, Cores))) WriteLog("Could not set a guest thread's host core mask.");
   }
 
   // ioprio_set and ioprio_get targets. A process target is one thread; a group or user target is every thread in it.
@@ -17898,16 +18073,21 @@ private:
     if (!Invalidate) return;
     ThreadPerf.Invalidations.fetch_add(1, std::memory_order_relaxed);
     // Each process has its own FEX context and code buffers.
-    auto* Context = Owner->Context ? Owner->Context.get() : Frame->Thread->CTX;
+    DropTranslations(Owner->Context ? *Owner->Context : *Frame->Thread->CTX, Owner->PID, Start, Size);
+  }
+
+  // Drops the translations of guest code in [Start, Start + Size) from the code buffers of Context and the caches of
+  // every thread of process Pid, and delinks the exits into them.
+  void DropTranslations(ContextType& Context, uint32_t Pid, uint64_t Start, size_t Size) {
     // A sibling may be compiling with the mutex held shared and waiting for MapLock in QueryGuestExecutableRange:
     // drop MapLock while the mutex is wanted or held. Nothing here changes what MapLock guards.
     const bool HadMap = mutexIsLockedByCurrentThread(&MapLock);
     if (HadMap) mutexUnlock(&MapLock);
     {
-      std::unique_lock Lock {Context->GetCodeInvalidationMutex()};
-      Context->InvalidateCodeBuffersCodeRange(Start, Size);
+      std::unique_lock Lock {Context.GetCodeInvalidationMutex()};
+      Context.InvalidateCodeBuffersCodeRange(Start, Size);
       for (const auto& Guest : Threads) {
-        if (Guest.Core && Guest.PID == Owner->PID) Context->InvalidateThreadCachedCodeRange(Guest.Core, Start, Size);
+        if (Guest.Core && Guest.PID == Pid) Context.InvalidateThreadCachedCodeRange(Guest.Core, Start, Size);
       }
     }
     if (HadMap) mutexLock(&MapLock);
@@ -18139,6 +18319,7 @@ private:
       if (Memory.MarkAllocated(Offset, Offset + Rounded)) return -12;
       const auto Base = Memory.Base() + Offset;
       if (!Task->Memory.RegisterSharedFile(Base, Rounded, Access, Memory.Storage, MayWrite)) return -12;
+      EnableTso(*Task, "shared memory mapping");
       MappedMemoryFiles[Memory.Storage.get()] = File->Memory;
       Lock(Base);
       return Base;
@@ -18741,9 +18922,9 @@ private:
   std::array<GuestThread, GuestThreadCount> Threads {};
   GuestThread* Current {};
   Mutex RuntimeLock {};
-  Mutex MapLock {};
+  Mutex MapLock {};               // the guest memory maps and the slot table, for FEX's compile-time queries (see LockRuntime)
   uint64_t ServiceSleepUntil {};  // when the sleeping service thread wakes by itself (0: it is awake)
-  bool ServiceNetPolling {};      // it sleeps 1 ms at a time, polling host sockets  // the guest memory maps and the slot table, for FEX's compile-time queries (see LockRuntime)
+  bool ServiceNetPolling {};      // it sleeps 1 ms at a time, polling host sockets
   uint64_t ExitStatus {};
   mutable uint64_t IOEpoch {};
   uint32_t NextTid {ProcessID + 1};

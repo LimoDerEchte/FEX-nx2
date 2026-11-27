@@ -161,6 +161,7 @@ inline std::string FormatMeminfo(const MemInfo& M) {
 struct SystemStat {
   uint32_t Cpus {1};
   uint64_t BusyTicks {}, IdleTicks {};  // summed over the CPUs
+  std::vector<uint64_t> CpuBusy, CpuIdle;  // per CPU when known (Cpus entries each), else an even share of the sums
   uint64_t Context {}, BootTime {}, Forks {};
   uint32_t Running {}, Blocked {};
 };
@@ -175,9 +176,11 @@ inline std::string FormatSystemStat(const SystemStat& S) {
   };
   Cpu("cpu ", S.BusyTicks, S.IdleTicks);
   const uint32_t Cpus = S.Cpus ? S.Cpus : 1;
-  for (uint32_t I = 0; I < Cpus; ++I) {  // an even share each: the runtime does not account time per core
+  const bool PerCpu = S.CpuBusy.size() == Cpus && S.CpuIdle.size() == Cpus;
+  for (uint32_t I = 0; I < Cpus; ++I) {
     const std::string Name = "cpu" + std::to_string(I);
-    Cpu(Name.c_str(), S.BusyTicks / Cpus + (I < S.BusyTicks % Cpus), S.IdleTicks / Cpus + (I < S.IdleTicks % Cpus));
+    if (PerCpu) Cpu(Name.c_str(), S.CpuBusy[I], S.CpuIdle[I]);
+    else Cpu(Name.c_str(), S.BusyTicks / Cpus + (I < S.BusyTicks % Cpus), S.IdleTicks / Cpus + (I < S.IdleTicks % Cpus));
   }
   std::snprintf(Line, sizeof(Line), "intr 0\nctxt %llu\nbtime %llu\nprocesses %llu\nprocs_running %u\nprocs_blocked %u\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n",
                 static_cast<unsigned long long>(S.Context), static_cast<unsigned long long>(S.BootTime), static_cast<unsigned long long>(S.Forks),
