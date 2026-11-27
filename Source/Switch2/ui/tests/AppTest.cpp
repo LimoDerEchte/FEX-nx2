@@ -370,6 +370,27 @@ void TestSettingsApplied() {
   CHECK(S.A->TopKind() == ScreenKind::Shell);
 }
 
+// Final Pass Suite: listed only while sdmc:/fex/games/final-pass-suite.elf exists; Run starts it without a picker.
+void TestFinalPassRow() {
+  Session S(true);
+  S.Frames(2);
+  S.Press(Button::Plus);
+  CHECK(S.A->TopKind() == ScreenKind::Settings);
+  CHECK(static_cast<SettingsScreen&>(S.A->Top()).RowFor("final_pass") == nullptr);
+  S.Press(Button::B);
+  S.B.Fs().AddFile("sdmc:/fex/games/final-pass-suite.elf", 100);
+  S.Press(Button::Plus);
+  auto& Set = static_cast<SettingsScreen&>(S.A->Top());
+  CHECK(Set.RowFor("final_pass") != nullptr);
+  Set.Input().SetFocus(Set.RowFor("final_pass")->Id, S.A->LastNow());
+  S.R.P.In.Push(Btn(Button::A, true));
+  S.Frames(1);
+  S.R.P.In.Push(Btn(Button::A, false));
+  S.Frames(30);
+  CHECK(S.B.DevStarted.size() == 1 && S.B.DevStarted[0].first == "final_pass" && S.B.DevStarted[0].second.empty());
+  CHECK(S.A->TopKind() == ScreenKind::Shell);
+}
+
 void TestQuit() {
   {
     Session S(true);
@@ -404,6 +425,7 @@ int main() {
   TestFadeAndRescale();
   TestShellAndDev();
   TestSettingsApplied();
+  TestFinalPassRow();
   TestQuit();
   std::printf("ui-app-test: %d checks, %d failures\n", Checks, Failures);
   return Failures ? 1 : 0;

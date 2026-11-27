@@ -306,7 +306,7 @@ void TestSchema() {
   for (const SettingDef& D : S)
     if (M.Enabled(D))
       ++Enabled;
-  CHECK(Enabled == 9 && S.size() == 9);  // reinstall, wipe, start folder, theme, accent, log level, then the three developer actions
+  CHECK(Enabled == 10 && S.size() == 10);  // reinstall, wipe, start folder, theme, accent, log level, then the four developer actions
   CHECK(M.Get("log_level") == "standard" && M.Get("start_folder") == "/fex/games");
   const SettingDef* Sf = M.Find("start_folder");
   CHECK(Sf && Sf->Type == RowType::Path && Sf->Folder && Sf->Store == StoreKind::App);
@@ -670,6 +670,10 @@ void TestSettingsRows() {
   std::string PrevSec;
   for (const SettingDef& D : Schema) {
     SettingsRow* R = S.RowFor(D.Key);
+    if (!D.ShownWhenFile.empty()) {  // not listed: the rig's storage has no such file
+      CHECK(R == nullptr);
+      continue;
+    }
     CHECK(R != nullptr);
     if (!R)
       continue;

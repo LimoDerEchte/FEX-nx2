@@ -116,6 +116,21 @@ std::string ReadSidecars(SessionLaunch& P, bool& Recovery, std::string& Notice) 
     P.Credentials.emplace(User, Group);
     Notice += "Running as uid " + std::to_string(User) + ", gid " + std::to_string(Group) + "\r\n";
   }
+  if (auto* File = std::fopen((Base + ".single-thread").c_str(), "r")) {
+    std::fclose(File);
+    P.SingleThread = true;
+    Notice += "Single-thread mode: the program's threads run one at a time.\r\n";
+  }
+  if (auto* File = std::fopen((Base + ".no-tso").c_str(), "r")) {
+    std::fclose(File);
+    P.NoTso = true;
+    Notice += "Experiment: x86 memory ordering (TSO) is off; threaded programs may misbehave.\r\n";
+  }
+  if (auto* File = std::fopen((Base + ".profile").c_str(), "r")) {
+    std::fclose(File);
+    P.Profile = true;
+    Notice += "Experiment: guest code is sampled every 10 ms; the profile goes to the log.\r\n";
+  }
   if (auto* File = std::fopen((Base + ".recovery-test").c_str(), "r")) {
     std::fclose(File);
     Recovery = true;
@@ -355,7 +370,8 @@ public:
     using K = ui::SessionSpec::Kind;
     const bool Shell = Spec.K == K::Shell || Spec.K == K::RootShell;
     const bool Single = Spec.Id == "run_elf_single";
-    if (!Shell && !Single && Spec.Id != "run_elf") {
+    const bool FinalPass = Spec.Id == "final_pass";
+    if (!Shell && !Single && !FinalPass && Spec.Id != "run_elf") {
       Error = "Unknown action " + Spec.Id;
       return 0;
     }
@@ -376,9 +392,10 @@ public:
       Launch.Arguments = {"-l"};
       if (Spec.K == K::RootShell) Launch.Credentials.emplace(0, 0);
     } else {
-      Launch.OnCard = Spec.Path.starts_with("sdmc:");
-      Launch.Program = Launch.OnCard ? Spec.Path.substr(5) : Spec.Path;
-      Title = ui::BaseName(Spec.Path);
+      const std::string Path = FinalPass ? "sdmc:/fex/games/final-pass-suite.elf" : Spec.Path;
+      Launch.OnCard = Path.starts_with("sdmc:");
+      Launch.Program = Launch.OnCard ? Path.substr(5) : Path;
+      Title = ui::BaseName(Path);
       Error = ReadSidecars(Launch, Recovery, Notice);
       if (!Error.empty()) {
         Host->Failure = Error;

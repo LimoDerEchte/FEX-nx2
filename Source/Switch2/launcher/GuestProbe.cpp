@@ -30,7 +30,7 @@
 
 namespace {
 // The launcher's version: the banner, the Home screen's version block and the NACP (CMakeLists.txt) all show it.
-constexpr char LauncherVersion[] = "0.17.20";
+constexpr char LauncherVersion[] = "0.18.14";
 } // namespace
 
 namespace Switch2Guest {
@@ -125,7 +125,15 @@ void FlushLogFile() {
   }
 }
 
+// EXPERIMENT (multithreading scaling): time this host thread spent writing log lines (SD write and flush).
+thread_local uint64_t LogWriteTicks {};
+struct LogWriteTimer {
+  uint64_t Start = armGetSystemTick();
+  ~LogWriteTimer() { LogWriteTicks += armGetSystemTick() - Start; }
+};
+
 void WriteLog(const char* Text) {
+  LogWriteTimer Timer;
   std::lock_guard Lock(LogMutex);
   if (!LogOpen || LogWriteFailed) return;
   constexpr size_t MaxLine = 1023;

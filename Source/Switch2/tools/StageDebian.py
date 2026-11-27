@@ -149,6 +149,32 @@ def stage_games(source, output, programs):
         elf(role, base + ".elf", ["-d", HOME_SCRATCH, *groups])
         elf(role, base + "-root.elf", ["-d", ROOT_SCRATCH, *groups], "0 0")
 
+    # The multithreading suite, and the same program under the .single-thread sidecar (one guest thread of the
+    # process in guest code at a time) to compare.
+    elf("thread_suite", "thread-suite.elf", ["-d", HOME_SCRATCH])
+    elf("thread_suite", "thread-suite-single.elf", ["-d", HOME_SCRATCH])
+    if programs.get("thread_suite"):
+        (games / "thread-suite-single.elf.single-thread").write_text("", encoding="utf-8")
+        # EXPERIMENT: xz with 1 and 4 threads, with and without x86 memory ordering (TSO).
+        script("xz-scaling.sh", "XzScaling.sh")
+        bash("xz-scaling.elf", ["--noprofile", "--norc", "./xz-scaling.sh"])
+        bash("xz-scaling-no-tso.elf", ["--noprofile", "--norc", "./xz-scaling.sh"])
+        (games / "xz-scaling-no-tso.elf.no-tso").write_text("", encoding="utf-8")
+        bash("xz-scaling-profile.elf", ["--noprofile", "--norc", "./xz-scaling.sh"])
+        elf("op_bench", "op-bench.elf")
+        elf("op_bench", "op-bench-4.elf", ["4"])
+        script("xz-scaling2.sh", "XzScaling2.sh")
+        bash("xz-scaling2.elf", ["--noprofile", "--norc", "./xz-scaling2.sh"])
+        (games / "xz-scaling-profile.elf.profile").write_text("", encoding="utf-8")
+
+    # The final pass of a milestone: every suite above that runs under a plain launch, in one program run as root (it
+    # starts each suite as the user of the suite's own .user file). Add a milestone's new suites here.
+    if programs.get("final_pass_suite"):
+        FINAL_PASS_SUITES = [name for base in ("proc-suite", "comm-suite", "fs-suite", "pty-suite", "container-suite")
+                             for name in (base + ".elf", base + "-root.elf")] + ["thread-suite.elf"]
+        elf("final_pass_suite", "final-pass-suite.elf",
+            [name for name in FINAL_PASS_SUITES if (games / name).is_file()], "0 0")
+
     if programs.get("process_acceptance"):
         script("process-tools.sh", "ProcessTools.sh")
         elf("process_acceptance", "process-acceptance.elf")
@@ -178,6 +204,9 @@ if __name__ == "__main__":
     parser.add_argument("--comm-suite", type=Path, help="Include the memory and communication compatibility suite (--games only)")
     parser.add_argument("--comm-acceptance", type=Path, help="Include the communication acceptance wrapper and tools (--games only)")
     parser.add_argument("--container-suite", type=Path, help="Include the container and scheduling compatibility suite (--games only)")
+    parser.add_argument("--thread-suite", type=Path, help="Include the multithreading suite (--games only)")
+    parser.add_argument("--final-pass-suite", type=Path, help="Include the final-pass runner of every suite (--games only)")
+    parser.add_argument("--op-bench", type=Path, help="EXPERIMENT: include the operation microbenchmark (--games only)")
     parser.add_argument("--pty-suite", type=Path, help="Include the pseudo-terminal compatibility suite (--games only)")
     parser.add_argument("--container-acceptance", type=Path, help="Include the container acceptance wrapper and tools (--games only)")
     args = parser.parse_args()
@@ -192,6 +221,9 @@ if __name__ == "__main__":
         programs["comm_acceptance"] = args.comm_acceptance
         programs["container_suite"] = args.container_suite
         programs["pty_suite"] = args.pty_suite
+        programs["thread_suite"] = args.thread_suite
+        programs["op_bench"] = args.op_bench
+        programs["final_pass_suite"] = args.final_pass_suite
         programs["container_acceptance"] = args.container_acceptance
         programs = {role: file.resolve() for role, file in programs.items() if file}
         stage_games(args.source.resolve(), args.output.resolve(), programs)

@@ -12,6 +12,162 @@ User decision (2026-11-27): the whole SD card appears in the guest at `/mnt/sd`,
 with FEX's internal folders hidden (`/fex/rootfs`, `/fex/.inode`, `/fex/.tmp` and older tmpfs areas, `/fex/.download`,
 `/fex/config`). Card launches then run as `/mnt/sd/<card path>` (cwd and `/proc/self/exe` inside that mount).
 
+### Multithreading Task 1 accepted on console 0.18.14 (2026-11-27, committed)
+Console (log `.superpowers/sdd/console-0.18.14.log`): final-pass-suite 11/11 clean, 1122/0/10: proc 243/0/6,
+proc-root 249/0/0, comm 124/0/1 (root same), fs 81/0/2, fs-root 83/0/0, pty 43/0/0 (root same), container 54/0/0
+(root same), thread 24/0/0. Two-tab busy loop OK (user). Block linking: xz -T1 40.4 -> 3.1 s, -T4 450 -> 1.26 s;
+apt update is now limited by the mirrors, not by speed (user). EXPERIMENT diagnostics kept, each labeled: runtime
+lock-hold / long-block logs (> 20 ms only), .profile, .no-tso, op-bench, xz-scaling scripts.
+Next: Multithreading Tasks 2-4 (docs/MultithreadingPlan.md); fork-group swap cost (Milestone 7 per-process delta).
+
+### Multithreading Task 1, 0.18.0 pending console (2026-11-27)
+Plan `docs/MultithreadingTask1.md`. 1A (preparation) and 1B (host thread per guest thread, runtime lock, wake words,
+stop requests, fork-group view swaps, per-slot watchdog, `.single-thread` sidecar) by Sonnet; review
+`.superpowers/sdd/mt-task1-review.md` (C1, I1, I2, minors 1/3/4/9 fixed by the orchestrator: `MapLock` for FEX's
+compile-time `QueryGuestExecutableRange`, dropped around `CodeInvalidationMutex`; no stop of processes outside the fork
+group; service thread woken for earlier timers and host-socket waits; open minors 2, 5-8 tracked in the review file).
+New `tests/guest/ThreadSuite.c` (21 cases): native host glibc and Debian 12 glibc 21/0/0 (`make check-thread-suite-native`);
+staged as `thread-suite.elf` and `thread-suite-single.elf` (+ `.single-thread`). Host: guest_nro 0 warnings, check-ui and
+all `check-guest-*` ok. NRO `.superpowers/sdd/fex-switch2-guest-0.18.0.nro`. Not committed.
+0.18.0 console (log `.superpowers/sdd/console-0.18.0.log`): thread-suite 18/3/0 (4 threads 349 ms vs one 347 ms: parallel
+works; futex round trip 16 us), single 17/4/0. Fixed in 0.18.1: signal to a thread blocked in read/poll never delivered
+(SendSignal moves IOEpoch, so Ready rescanned forever: rescan once per wait, `SignalRerunDone`); condvar test timed out
+with 4.6k "futex returned -11" lines flushed to SD under the lock (routine futex EAGAIN/ETIMEDOUT no longer logged);
+single-thread mode starved yielding siblings (`SerialYielder` hand-off). NRO `.superpowers/sdd/fex-switch2-guest-0.18.1.nro`.
+0.18.1 console (user report; log `.superpowers/sdd/console-0.18.1.log`, Standard level, no TAP lines): only
+signal_interrupts_read/poll (both modes) and the expected single-mode scaling failure left. Cause: the rescan dispatch was
+stopped by its own pending signal (AfterRuntimeEntry → NeedsStop) before the syscall instruction ran, so the signal was
+delivered with no call in progress and the call restarted. 0.18.2: NeedsStop ignores the signal while SignalRerunDone.
+NRO `.superpowers/sdd/fex-switch2-guest-0.18.2.nro`.
+0.18.2 console (log `.superpowers/sdd/console-0.18.2.log`): thread-suite 21/0/0 (4 threads 351 ms vs one 347 ms, futex
+round trip 13 us), single 20/1/0 (expected scaling failure), proc 243/0/6, pty 43/0/0, container 54/0/0; comm and fs not
+run. `xz -9 -T4` = `-T1`: the test is wrong (one 192 MiB block covers the 4 MB file). A busy loop in another tab made
+`xz -T1` 60 % slower. 0.18.3 (hypothesis, to verify): the watchdog preempted every guest thread each 10 ms quantum and the
+thread then yielded with core migration, which can put two busy threads on one core; now preemption and the yield happen
+only while more guest threads want a core than the process has (`GuestThreadsWantingCore`), and always for SerialGuest
+threads. NRO `.superpowers/sdd/fex-switch2-guest-0.18.3.nro`.
+0.18.3 console (user report, no log yet): `xz -6 -T4 --block-size=1MiB` did not finish after 4x the -T1 time. Not yet known
+whether it hangs or is slow, or whether 0.18.3 caused it (0.18.2 never ran a multi-worker xz). 0.18.4 (DIAGNOSTIC): Ctrl+C
+at Detailed level logs every thread of the foreground group (wait kind, host state, wait address, deadline, CPU ms, rip).
+NRO `.superpowers/sdd/fex-switch2-guest-0.18.4.nro`.
+0.18.3 console log (`.superpowers/sdd/console-0.18.3.log`): `xz -6 -T1 --block-size=1MiB` real 65 s / user 65 s;
+`-T4` real 9m09s / user 11m43s: it finishes, but the same work costs ~11x the CPU time when 4 threads run at once
+(preemption 7 switches: cores not oversubscribed). Cause unknown. 0.18.5 (EXPERIMENT): `Perf: threads:` line (block
+compiles, map-lock and runtime-lock waits, code invalidations) and a `.no-tso` sidecar; games `xz-scaling.elf` and
+`xz-scaling-no-tso.elf` (tests/guest/XzScaling.sh: 2 MiB, 512 KiB blocks, -T1 then -T4). NRO
+`.superpowers/sdd/fex-switch2-guest-0.18.5.nro`.
+0.18.5 console (log `.superpowers/sdd/console-0.18.5.log`): `xz-scaling` -T1 40 s (TSO on and off alike); -T4 stopped with
+Ctrl+C after each worker had used 68-77 s CPU (a quarter of the -T1 work each): >7x slower per thread in parallel, TSO
+off no different. Counters: ~1.2k compiles, map-lock waits 9 ms, runtime-lock waits 1.5 s total, 11 invalidations, so
+neither recompiles nor runtime locks. Thread dump: 4 workers in guest code, main thread in a timed futex wait. ThreadSuite
+now has three more scaling tests (random walk over 64 MiB per thread, 16 KiB cached read/write, indirect calls) to find
+which kind of guest work stops scaling; native: all scale.
+ThreadSuite on console 0.18.5 (log `.superpowers/sdd/console-0.18.5b.log`): 23/1/0. 16 KiB cached 300 -> 362 ms,
+indirect calls 348 -> 422 ms, compute 344 -> 353 ms, random walk over 64 MiB 151 -> 430 ms (fails): cache-missing memory
+work stops scaling in the guest. mtprobe 4 (EXPERIMENT, `.superpowers/sdd/fex-switch2-mtprobe-4.nro`, log
+`sdmc:/fex/mtprobe.log`) runs the same walk and a sequential read natively on 1/2/4/6 host threads to tell the hardware
+apart from the runtime. mtprobe 4 result (`.superpowers/sdd/mtprobe-4.log`): native random walk in heap memory scales perfectly (1/2/4/6
+threads 770/776/783/785 ms); sequential read 30.6/31.4/53.8/81.7 ms (bandwidth). So the guest's walk slowdown is ours.
+mtprobe 5 (`.superpowers/sdd/fex-switch2-mtprobe-5.nro`): walk natively and as x86 through FEX, in heap memory and in
+arena memory (svcMapPhysicalMemory, as guest memory), plus each region's memory type/attribute. Result
+(`.superpowers/sdd/mtprobe-5.log`): everything scales, x86 through FEX in arena memory too (779/791/794/794 ms for
+1/2/4/6 threads); both regions type 0x5 attr 0. So the slowdown comes from the runtime around the guest code, not
+FEX code generation or memory. 0.18.6 (EXPERIMENT): thread end logs guest entries, cores used and CPU ms at Detailed;
+ThreadSuite scaling tests print each thread's wall and CPU time (CPU < wall means it waited for a core). NRO
+`.superpowers/sdd/fex-switch2-guest-0.18.6.nro`.
+0.18.6 console (`.superpowers/sdd/console-0.18.6.log`): random walk 1 thread 151 ms, 4 threads 437 ms overall, but each
+walker measured only 216 ms from its first to last instruction: ~220 ms go around thread start/join (others: ~30 ms),
+plus 1.4x per thread. Guest CPU clocks read 29 ms for a 216 ms walk and ~70 % of wall in the compute tests: thread CPU
+accounting loses time (open bug). Preemption fired 1954 times although at most 4 threads ran: GuestThreadsWantingCore
+likely drifts up. 0.18.7 (EXPERIMENT): each thread's end logs its lifetime split (first guest entry, in guest, blocked,
+yielding, runtime-lock wait). NRO `.superpowers/sdd/fex-switch2-guest-0.18.7.nro`.
+0.18.7 console (log `.superpowers/sdd/console-0.18.7.log`, thread-suite 23/1/0, walk 151 -> 374 ms): each walk thread
+lived ~297 ms, ~125 ms of it blocked, and 3 of 4 waited ~128 ms for the runtime lock: something holds the lock ~125 ms
+while the walks run. Yielding 0 ms everywhere (the drift theory is wrong). "In guest" over-counted (measured from the
+dispatch, not each syscall return). Suspect: Detailed log lines are written and flushed to the SD with the lock held.
+0.18.8 (EXPERIMENT): logs every runtime-lock hold over 20 ms (tid, syscall, log-write share) and every thread sleep over
+20 ms (wait kind, syscall, lock share); in-guest time fixed. NRO `.superpowers/sdd/fex-switch2-guest-0.18.8.nro`.
+0.18.8 console (log `.superpowers/sdd/console-0.18.8.log`, 3 runs, thread-suite 24/0/0 each): NOT a fix. The walk test
+passes only because the one-thread baseline got slower (151 -> 225-228 ms); 4 threads got worse (374 -> 414-491 ms).
+Log writing is not the lock holder (0 ms of every long hold). During the walk test the lock is held ~30 ms at a time,
+alternating between tid 101 (suite runner, clock_nanosleep 230) and tid 327 (test main, host loop after leaving guest
+code, syscall -1); each waits ~20 ms for the other. Next: find what runs during those 30 ms holds.
+0.18.9 (EXPERIMENT): the long-hold line adds the holder's CPU time during the hold, the cores it took and gave back the
+lock on, and where it took it (syscall entry, back from guest code, woke from a wait). CPU ~0 means the holder was
+descheduled with the lock held (Horizon does not time-slice one priority); CPU ~hold means real work to find. NRO
+`.superpowers/sdd/fex-switch2-guest-0.18.9.nro`.
+0.18.9 console (log `.superpowers/sdd/console-0.18.9.log`, 24/0/0, walk 227 -> 419 ms): every long hold is real CPU work
+(CPU = hold, 0 ms log), taken on waking from a wait. ROOT CAUSE: the suite runner polled waitpid(WNOHANG) + 10 ms
+nanosleep (ThreadSuite.c RunIsolated). Runner and test child share one fork view, so each runner wake ran SwapView:
+SavePrivatePages of the child's ~256 MiB, restore the runner's (~30 ms of copying), then the child swapped back, with its
+threads stopped meanwhile. Scaling itself was never the problem. Fix (test harness): RunIsolated blocks SIGCHLD before
+fork and sleeps in sigtimedwait (1 s slices) instead of polling. Native: `make check-thread-suite-native` 24/0/0.
+Known runtime limit (track): a forked, non-exec'd parent and child that both run swap the view on every switch, at a cost
+proportional to private memory. Next: console thread-suite with the new ELF (expect walk ~151 -> ~160-200 ms), then xz.
+0.18.9 + new suite ELF console (log `.superpowers/sdd/console-0.18.9-xz.log`): thread-suite 24/0/0, walk one 377 ms /
+4 threads 350 ms, indirect 299/303, cache 299/335: SCALING FIXED (harness). thread-suite-single 20/4/0 (only the 4
+scaling tests, expected). xz: -T1 39.8 s (host native 0.29 s, 135x), -T4 450.5 s. Every xz thread spends its time in
+guest code (T1: 39.4 s in guest of 39.5; T4 workers ~450 s each in guest, 12 dispatches, few syscalls): not the runtime.
+TSO off changed nothing (0.18.5: 39.8 vs 39.9 s). Thread CPU ticks lag for threads that rarely switch (ignore them).
+0.18.10 (EXPERIMENT): `<program>.profile` sidecar: the watchdog stops the process's threads every 10 ms and the
+restored guest RIP is counted; at process end the log has "Profile file/block" lines (hottest 40 blocks, file+offset).
+Staged `xz-scaling-profile.elf` (+ `.profile`). NRO `.superpowers/sdd/fex-switch2-guest-0.18.10.nro`.
+0.18.10 console (log `.superpowers/sdd/console-0.18.10.log`): xz -T1 40.4 s, 3897 samples, 99.7 % in
+liblzma.so.5.4.5 (rc_encode loop at +0x13dd4/+0x13e0b with a jump-table switch, match finder +0x18xxx, optimum +0x1exxx):
+an ordinary xz profile, no pathological spot. T4 (stopped at ~110 s) has the same hot blocks. mtprobe spin 50M = 180 ms
+(~4 cycles/iter at ~1.1 GHz: FEX adds nothing on plain ALU). So 135x vs host is unexplained beyond clock (~5x) + IPC.
+FEXCore here has no single-thread TSO skip (Context.h: AtomicTSOEmulationEnabled = Config.TSOEnabled), so T1 ran with
+TSO on and no-tso did not change it: TSO is not the T1 cost. Next run: thread-suite prints steps and ps per step for the
+three kernels (native host: cache 307-309 ps, indirect calls 1282 ps, walk 65-68 ns) to get per-kind slowdown ratios;
+xz-scaling-no-tso.elf to see whether TSO is the T4 cost.
+Console (log `.superpowers/sdd/console-0.18.10b.log`): the staged thread-suite.elf was stale (no steps line; staging
+had not rerun), suite 24/0/0. xz no-tso: T1 40.0 s, T4 cancelled at 128 s: TSO is not the T4 cost either.
+Next run: restaged thread-suite.elf (steps verified with `strings`) and `xz-scaling2.elf` (tests/guest/XzScaling2.sh:
+a) one xz -6 on 512 KiB, b) four such processes in parallel, c) -T2 on 1 MiB, d) -1 -T1, e) -1 -T4; 120 s timeouts).
+Native host: a 73, b 83, c 144, d 85, e 30 ms.
+Console (log `.superpowers/sdd/console-0.18.10c.log`): ps per step console/native: cache 2505/307 (8x), indirect calls
+13691/1282 (11x), walk 239714/65253 (3.7x): ordinary. xz: a 11987 ms (164x), b four processes 68116 ms (5.7x one),
+c -T2 21574 ms, d -1 -T1 14397 ms (170x), e -1 -T4 > 120 s. So xz is ~165x alone even with a small dictionary and
+collapses whenever several run at once, as threads OR processes; the simple kernels show neither.
+Next run (EXPERIMENT): `op-bench.elf` (tests/guest/OpBench.c, 15 kernels of liblzma-like operations, ps per step) and
+`op-bench-4.elf` (same with 4 threads). Native baseline `.superpowers/sdd/opbench-native.txt`.
+Console (log `.superpowers/sdd/console-0.18.10d.log`): op-bench ps/step console vs native: most kernels 8-15x, but
+switch_table 690467 vs 769 (900x) and direct_call 413795 vs 733 (565x); with 4 threads 32.4 us and 17.4 us.
+ROOT CAUSE: block linking was disabled in the FEXCore port (3c276155e, JIT.cpp ExitFunctionLink: "The executable view
+is read-only. Leave branches routed through the linker."): every direct exit between blocks ran the C++ linker
+(CodeInvalidationMutex shared lock = std::shared_mutex on Switch, LookupCache FindBlock), and threads contend on it.
+Also the call-return stack is off on Switch (BranchOps.cpp UseCallRetStack=false), so every ret is an L1 lookup.
+0.18.11: data-slot block linking (JIT.cpp, __SWITCH2__ only): each jump thunk loads its target from a link slot in
+writable heap memory (ldr Record.HostCode = slot address; ldr [slot]; cbz -> linker; br), the linker stores the target
+once (release store) and registers SlotBlockDelinker, which stores 0 on invalidation. No code patching or publish.
+Slots: 8 bytes per compiled exit, never freed (known limit). NRO `.superpowers/sdd/fex-switch2-guest-0.18.11.nro`.
+Next: console op-bench / op-bench-4 / xz-scaling / thread-suite(-single) / proc-suite on 0.18.11; then the
+call-return stack with in-code bounds checks.
+0.18.11 console (log `.superpowers/sdd/console-0.18.11.log`): direct_call 414 -> 7.1 ns, switch_table 690 -> 12.8 ns
+(4 threads 9.0 / 12.8 ns: no contention). xz -T1 40.4 -> 3.1 s (10.6x native), -T4 1.26 s. proc-suite 243/0/6,
+thread-suite 24/0/0, thread-suite-single 20/4/0 (expected). op-bench-4 store_load_forward 13 ns is the bench (all
+threads write one word).
+0.18.12 (EXPERIMENT): call-return stack on for Switch 2 as a ring: CALLRET_STACK_SIZE 64 KiB (InternalThreadState.h),
+allocated aligned to its size (GuestRuntime.cpp AddThread), every push/pop is sub/add + bfi of the low 16 bits
+(BranchOps.cpp ExitFunction, Dispatcher.cpp callback push), and a popped entry is used only when its RIP matches and
+its host address is not 0. NRO `.superpowers/sdd/fex-switch2-guest-0.18.12.nro`.
+0.18.12 console (log `.superpowers/sdd/console-0.18.12.log`): no gain (direct_call 7.1 -> 8.0 ns, switch_table
+12.8 -> 11.8 ns, xz -T1 3.11 s, -T4 1.24 s): the L1 lookup on ret already costs about what the ring push/pop does.
+REVERTED in 0.18.13 (call-return stack off again on Switch 2, AddThread alignment back to the page size).
+Op-bench is now 8-17x native on every kernel except the store_load_forward 4-thread bench artifact.
+0.18.13 = 0.18.11 linking only. NRO `.superpowers/sdd/fex-switch2-guest-0.18.13.nro`.
+0.18.14: final-pass-suite (tests/guest/FinalPassSuite.c, staged as games/final-pass-suite.elf with .user "0 0" and
+the suite list StageDebian.py FINAL_PASS_SUITES as .args): runs proc/comm/fs/pty/container suites (user and root) and
+thread-suite, each as its .user identity in its own session (setsid + TIOCSCTTY), 45 min timeout each; suites with
+launch-wide sidecars (.single-thread etc.) are reported not run. Totals + per-suite lines, exit 42 when all clean.
+Settings > Developer > Final Pass Suite (Run) is listed only when sdmc:/fex/games/final-pass-suite.elf exists
+(SettingDef::ShownWhenFile). All suites: "# X summary: P/F/S (passed/failed/skipped)", results to $FEX_SUITE_RESULTS.
+Host: check-ui OK; native suites fs 81/0/2, pty 43/0/0, container 50/0/4, comm 122/0/3, proc 249/0/7 + 253/0/3,
+thread 24/0/0; runner native in a user namespace: counts and failure list correct (fs ownership_changes fails there
+without the runner too: only 2 ids mapped). NRO `.superpowers/sdd/fex-switch2-guest-0.18.14.nro`.
+Next: Task 1 acceptance runs (proc, comm, fs, pty, container, thread suites; two-tab busy loop), drop or keep
+EXPERIMENT diagnostics, commit Task 1.
+
 ### 0.17.20 accepted (2026-11-27): SD card at /mnt/sd (0.17.18 crashed at runtime start: EnsureCardMountPoint ran before Task existed; CreateNativeEntry read Task->Creds)
 `BuildInitialMounts` adds a read-only `msdos` mount of the card root "/" at `/mnt/sd` (`Superblock::Hidden`: RootFS,
 inode store, tmpfs areas, `/fex/.download`, `/fex/config`; lookups ENOENT, listings skip them). `EnsureCardMountPoint`

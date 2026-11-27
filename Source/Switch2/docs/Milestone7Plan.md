@@ -106,3 +106,19 @@ milestone; then the orchestrator fixes, writes the suite and runs the console.
   version; `sudo apt install --reinstall python3-apt` runs its maintainer
   scripts without "Syntax error"; `sudo dpkg --configure -a` finishes.
 - Every existing acceptance program still passes (PIE path unchanged).
+
+## Related: isolated memory for fork children (noted 2026-11-27)
+
+Processes made by `fork` share one memory view until `exec` and swap their private pages by copying
+(`GuestAddressSpace::SavePrivatePages`/`RestorePrivatePages`) whenever another member of the group runs; only one of them
+runs at a time. Multithreading Task 1 measured ~30 ms per swap with 256 MiB private memory (console 0.18.9,
+`.superpowers/sdd/console-0.18.9.log`): a parent that polls its forked child stalls both.
+
+The translation this milestone adds is the same mechanism a real fix needs: give a fork child its own per-process
+delta (host = guest + delta for every guest address, not only the low window), copy the parent's private pages once into
+a disjoint arena range at fork, and both processes run in parallel with no swaps. Same JIT hook (a per-context delta;
+for a whole-space delta one `add` per access instead of the window's tst/add/csel), same `GuestHost()` runtime sweep.
+Open points: arena space per child (the parent's mapped span must fit again in the 128 GiB alias region), shared
+mappings (MAP_SHARED, shared file views) must map one backing at two host ranges, code caches cannot be shared between
+deltas, and PIE-only processes keep identity addressing with no cost. Decided by the user on 2026-11-27: M7's translation is
+designed as a general per-process delta from the start, covering both non-PIE images and fork children.

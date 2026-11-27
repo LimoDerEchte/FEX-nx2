@@ -3,6 +3,7 @@
 // docs/MultithreadingPlan.md lists the checks. Runs every check in order, writes sdmc:/fex/mtprobe.log (flushed per line)
 // and shows the same lines on screen. Each check logs "check <name>: start" first, so a crash names the check it died in
 // (the console delivers no fault to user code: a crash ends the app). The risky stack-size check runs last.
+#include "GuestArena.h"
 #include "MtBlobs.h"
 
 #include <FEXCore/Config/Config.h>
@@ -34,7 +35,7 @@
 
 namespace {
 constexpr const char* LogPath = "sdmc:/fex/mtprobe.log";
-constexpr const char* Version = "mtprobe 3";
+constexpr const char* Version = "mtprobe 5";
 // Run 3 repeats only what runs 1 and 2 left open; `sdmc:/fex/mtprobe.full` (a sidecar file, any content) runs every check.
 constexpr const char* FullSidecar = "sdmc:/fex/mtprobe.full";
 constexpr int GuestPriority = 0x2c;
@@ -406,6 +407,127 @@ void CheckCoreScaling(bool Full) {
     }
   }
   Say("check core_scaling: INFO");
+}
+
+// Runs 4-5: do threads that each walk their own memory slow each other down? A random walk through 64 MiB per thread
+// misses the caches on every step (latency bound); a sequential read of 64 MiB per thread is bandwidth bound. Run 5
+// adds the walk as x86 code through FEXCore, and the same walks in memory the guest arena maps (svcMapPhysicalMemory in
+// the alias region, like the runtime's guest memory) instead of heap memory.
+constexpr size_t WalkWords = 16u << 20; // 64 MiB of uint32_t
+
+void FillWalk(uint32_t* Memory, const uint32_t* First) {
+  if (First) {
+    std::memcpy(Memory, First, WalkWords * sizeof(uint32_t));
+    return;
+  }
+  // One random cycle through every word (Sattolo).
+  for (uint32_t W = 0; W < WalkWords; ++W) Memory[W] = W;
+  uint64_t Random = 88172645463325252ull;
+  for (uint32_t W = WalkWords - 1; W > 0; --W) {
+    Random ^= Random << 13, Random ^= Random >> 7, Random ^= Random << 17;
+    std::swap(Memory[W], Memory[Random % W]);
+  }
+}
+
+enum class MemoryWork { NativeWalk, NativeRead, JitWalk };
+
+void ScaleMemory(const char* Where, const std::vector<uint32_t*>& Buffers, MemoryWork Work, FEXCore::Context::Context* Ctx) {
+  constexpr uint64_t WalkSteps = 4'000'000;
+  constexpr int ReadPasses = 4;
+  const char* Name = Work == MemoryWork::NativeWalk ? "native random walk (4M steps)" :
+                     Work == MemoryWork::NativeRead ? "native sequential read (4 passes)" : "x86 random walk through FEX (4M steps)";
+  double Single = 0;
+  for (size_t N : {size_t {1}, size_t {2}, size_t {4}, Buffers.size()}) {
+    if (N > Buffers.size()) continue;
+    std::vector<std::unique_ptr<GuestRun>> Guests;
+    if (Work == MemoryWork::JitWalk) {
+      for (size_t I = 0; I < N; ++I) Guests.push_back(NewGuest(*Ctx));
+      if (std::any_of(Guests.begin(), Guests.end(), [](auto& G) { return !G; })) {
+        Say("  FAIL could not create %zu guest threads", N);
+        return;
+      }
+    }
+    std::atomic<bool> Go {false};
+    std::vector<uint64_t> Sink(N);
+    using Body = std::function<void()>;
+    std::vector<std::unique_ptr<Spawned<Body>>> Threads;
+    for (size_t I = 0; I < N; ++I) {
+      Threads.push_back(Spawn<Body>([&, I] {
+        while (!Go.load()) svcSleepThread(0);
+        const uint32_t* Memory = Buffers[I];
+        uint64_t Value = 0;
+        if (Work == MemoryWork::NativeWalk) {
+          uint32_t Index = 0;
+          for (uint64_t Step = 0; Step < WalkSteps; ++Step) Index = Memory[Index];
+          Value = Index;
+        } else if (Work == MemoryWork::NativeRead) {
+          for (int Pass = 0; Pass < ReadPasses; ++Pass) {
+            for (size_t W = 0; W < WalkWords; W += 4) Value += Memory[W] + Memory[W + 1] + Memory[W + 2] + Memory[W + 3];
+          }
+        } else {
+          Execute(*Guests[I], MtBlobs::walk, WalkSteps, reinterpret_cast<uint64_t>(Memory));
+          Value = Guests[I]->Result;
+        }
+        Sink[I] = Value;
+      }, ExecStack, -2, nullptr, -1, static_cast<uint32_t>(CoreMask)));
+    }
+    const uint64_t Start = NowNs();
+    Go.store(true);
+    for (auto& T : Threads) Join(T);
+    const uint64_t Elapsed = NowNs() - Start;
+    if (N == 1) Single = Ms(Elapsed);
+    size_t Same = 0;
+    for (size_t I = 0; I < N; ++I) Same += Sink[I] == Sink[0];
+    Say("  %s, %s, %zu thread(s), each on its own 64 MiB: %.1f ms (one alone %.1f ms = perfect scaling), %zu/%zu results equal",
+        Where, Name, N, Ms(Elapsed), Single, Same, N);
+    for (auto& G : Guests) FreeGuest(G);
+  }
+}
+
+void CheckMemoryScaling() {
+  Say("check memory_scaling: start");
+  auto Ctx = MakeContext(TsoOn);
+  std::vector<uint32_t*> Heap;
+  for (size_t I = 0; I < Cores.size(); ++I) {
+    auto* Memory = static_cast<uint32_t*>(std::aligned_alloc(0x1000, WalkWords * sizeof(uint32_t)));
+    if (!Memory) break;
+    FillWalk(Memory, I ? Heap[0] : nullptr);
+    Heap.push_back(Memory);
+  }
+  Say("  %zu heap buffers of 64 MiB", Heap.size());
+  for (auto Work : {MemoryWork::NativeWalk, MemoryWork::NativeRead, MemoryWork::JitWalk}) {
+    if (Work != MemoryWork::JitWalk || Ctx) ScaleMemory("heap memory", Heap, Work, Ctx.get());
+    consoleUpdate(nullptr);
+  }
+
+  uint64_t Base {};
+  size_t Size {};
+  auto Backend = ::Switch2Guest::MakeHostArenaBackend(Base, Size);
+  const size_t Bytes = Heap.size() * WalkWords * sizeof(uint32_t);
+  if (!Backend || Size < Bytes || !Backend->Commit(Base, Bytes)) {
+    Say("  FAIL could not commit %zu MiB of arena memory (%s)", Bytes >> 20, Backend ? "commit" : "no alias region");
+  } else {
+    std::vector<uint32_t*> Arena;
+    for (size_t I = 0; I < Heap.size(); ++I) {
+      auto* Memory = reinterpret_cast<uint32_t*>(Base + I * WalkWords * sizeof(uint32_t));
+      FillWalk(Memory, Heap[0]);
+      Arena.push_back(Memory);
+    }
+    MemoryInfo Info {};
+    u32 Page {};
+    svcQueryMemory(&Info, &Page, Base);
+    Say("  arena memory at %#llx: type %#x attr %#x perm %#x, region %#llx+%#llx", static_cast<unsigned long long>(Base), Info.type,
+        Info.attr, Info.perm, static_cast<unsigned long long>(Info.addr), static_cast<unsigned long long>(Info.size));
+    svcQueryMemory(&Info, &Page, reinterpret_cast<uint64_t>(Heap[0]));
+    Say("  heap memory at %p: type %#x attr %#x perm %#x", static_cast<void*>(Heap[0]), Info.type, Info.attr, Info.perm);
+    for (auto Work : {MemoryWork::NativeWalk, MemoryWork::NativeRead, MemoryWork::JitWalk}) {
+      if (Work != MemoryWork::JitWalk || Ctx) ScaleMemory("arena memory", Arena, Work, Ctx.get());
+      consoleUpdate(nullptr);
+    }
+    Backend->Decommit(Base, Bytes);
+  }
+  for (auto* Memory : Heap) std::free(Memory);
+  Say("check memory_scaling: INFO");
 }
 
 void CheckWakeLatency() {
@@ -820,7 +942,7 @@ int main() {
   FILE* Sidecar = std::fopen(FullSidecar, "r");
   const bool Full = Sidecar != nullptr;
   if (Sidecar) std::fclose(Sidecar);
-  Say("Mode: %s", Full ? "every check (mtprobe.full present)" : "run 3: stack ladder, then TSO cost per CPU feature set");
+  Say("Mode: %s", Full ? "every check (mtprobe.full present)" : "run 5: memory scaling, native and through FEX, heap and arena");
   CheckInfo();
   consoleUpdate(nullptr);
   if (Full) {
@@ -839,18 +961,7 @@ int main() {
       }
     }
   } else {
-    CheckExecStack();
-    consoleUpdate(nullptr);
-    // Feature ladder, least risky first. Each set: TSO off/on cost, then the litmus with TSO on (must stay 0).
-    for (const FeatureSet& Set : {FeatureSet {"LSE atomics", true, false, false}, FeatureSet {"LSE atomics + RCPC (LDAPR)", true, true, false},
-                                  FeatureSet {"LSE atomics + RCPC + LRCPC2 (TSOImm9)", true, true, true}}) {
-      Say("feature set: %s (a crash right after this line means the CPU lacks it)", Set.Name);
-      Features = Set;
-      CheckTsoCost({TsoOff, TsoOn, TsoVector});
-      consoleUpdate(nullptr);
-      CheckTsoLitmus({TsoOn}, 1);
-      consoleUpdate(nullptr);
-    }
+    CheckMemoryScaling();
   }
   Say("--- mtprobe finished. Press + to exit. ---");
   while (appletMainLoop()) {
@@ -865,3 +976,10 @@ int main() {
   consoleExit(nullptr);
   return 0;
 }
+
+// HostArena.cpp logs through the runtime's WriteLog.
+namespace Switch2Guest {
+void WriteLog(const char* Text) {
+  Say("arena: %s", Text);
+}
+} // namespace Switch2Guest

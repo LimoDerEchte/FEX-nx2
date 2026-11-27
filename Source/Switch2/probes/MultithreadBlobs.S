@@ -133,3 +133,13 @@ chase:
   dec rdi
   jnz 1b
   EXIT_WITH rsi
+
+# walk(rdi steps, rsi base): follows eax = base[eax] (32-bit indices, like ThreadSuite's random walk); returns eax.
+.globl walk
+walk:
+  xor eax, eax
+1:
+  mov eax, [rsi + rax*4]
+  dec rdi
+  jnz 1b
+  EXIT_WITH rax

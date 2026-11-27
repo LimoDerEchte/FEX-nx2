@@ -50,6 +50,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <new>
 #include <variant>
 #include <bit>
 #include <charconv>
@@ -60,6 +61,7 @@
 #include <elf.h>
 #include <map>
 #include <set>
+#include <unordered_map>
 
 namespace Switch2Guest {
 namespace {
@@ -260,21 +262,78 @@ Result SdReadGuest(FsFile* File, s64 Offset, void* Data, u64 Count, u64* Receive
   return 0;
 }
 constexpr size_t MainStackSize = 1024 * 1024;
+// Host threads that run guest code (Task 1B). The stack holds the JIT's host frames and the syscall handlers; the
+// priority is one below the launcher UI's 0x2c so the UI stays responsive; the watchdog checks every 5 ms.
+constexpr size_t GuestHostStackSize = 4 * 1024 * 1024;
+constexpr int32_t GuestThreadPriority = 0x2d;
+constexpr uint64_t GuestPreemptCheckNs = 5'000'000;
+// Where a syscall that must leave the JIT jumps to: the buffer of the host thread's own Dispatch. Per host
+// thread, so several threads can run guest code at once.
+thread_local std::jmp_buf* HostReturn {};
+[[noreturn]] void ReturnToHostLoop() { std::longjmp(*HostReturn, 1); }
+// The cores this process may use. Host threads that run guest code get all of them: a thread created on the default
+// core stays there, one with the full mask starts on an idle core (mtprobe 2, docs/MultithreadingSdk.md).
+uint32_t ProcessCoreMask() {
+  static const uint32_t Mask = [] {
+    u64 Cores {};
+    return R_SUCCEEDED(svcGetInfo(&Cores, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) ? static_cast<uint32_t>(Cores) : 0u;
+  }();
+  return Mask;
+}
+// Gives a created, not yet started host thread the all-cores mask. Failure only costs placement, so it is logged.
+void SpreadOverCores(Thread& Host) {
+  if (const auto Mask = ProcessCoreMask(); Mask && R_FAILED(svcSetThreadCoreMask(Host.handle, -1, Mask))) {
+    WriteLog("Could not give a host thread the all-cores mask.");
+  }
+}
 constexpr uint64_t LinuxWriteSyscall = 1;
 constexpr uint64_t LinuxExitSyscall = 60;
 
-// Timed preemption (GuestPreempt.h). The scheduler publishes the running
-// guest thread; a watchdog thread sets the poll request word in its FEXCore
-// interrupt page when it must yield. Generated code polls that word at block
-// entries and backward branches and returns from ExecuteThread.
+// Timed preemption (GuestPreempt.h). Every thread that runs guest code registers itself here; a watchdog
+// thread sets the poll request word in the FEXCore interrupt page of each one that has run a whole quantum.
+// Generated code polls the word at block entries and backward branches and returns from ExecuteThread.
+// Entries are written with the runtime lock held and read by the watchdog with Lock held, so a Core the
+// watchdog sees is always alive (a thread unregisters before anything may destroy its Core).
+constexpr size_t PreemptSlots = 32;
+// EXPERIMENT (multithreading scaling): this host thread's time waiting for the runtime lock.
+thread_local uint64_t HostLockWaitTicks {};
+// EXPERIMENT (multithreading scaling): the syscall this host thread handles (-1: its host loop), for the hold log.
+thread_local int64_t HostSyscallNumber = -1;
+// EXPERIMENT (multithreading scaling): when the runtime lock was taken, and log time then, to log long holds.
+uint64_t LockTakenTicks {}, LockTakenLogTicks {}, LockTakenCpuTicks {};
+uint32_t LockTakenCore {};
+int LockTakenSite {};
+// EXPERIMENT: where this host thread took the lock: 0 other, 1 syscall entry, 2 back from guest code, 3 woke from a wait.
+thread_local int LockSite {};
+const char* const LockSiteNames[] {"runtime", "syscall entry", "back from guest code", "woke from a wait"};
+uint32_t LongHoldLogs {}, LongBlockLogs {};
+// EXPERIMENT (multithreading scaling): how often guest threads compile code and wait for the runtime's locks.
+struct ThreadPerfCounters {
+  std::atomic<uint64_t> Compiles {}, CompileWaits {}, CompileWaitTicks {}, RuntimeLockWaits {}, RuntimeLockWaitTicks {},
+    Invalidations {};
+} ThreadPerf;
+// Guest host threads that want a core: started and not asleep in BlockSlot. Horizon does not time-slice threads of one
+// priority, so preemption (and the yield after it) is only needed while more of them want a core than the process has;
+// below that, stopping a thread every quantum only moves it between cores.
+std::atomic<int32_t> GuestThreadsWantingCore {};
+int32_t GuestCoreCount() {
+  static const int32_t Count = [] {
+    const auto Mask = ProcessCoreMask();
+    return Mask ? static_cast<int32_t>(std::popcount(Mask)) : 1;
+  }();
+  return Count;
+}
+bool CoresOversubscribed() { return GuestThreadsWantingCore.load(std::memory_order_relaxed) > GuestCoreCount(); }
+struct PreemptEntry {
+  FEXCore::Core::InternalThreadState* Core {};
+  uint64_t Since {};
+  bool Armed {};
+  bool Serial {};  // a SerialGuest process: its siblings wait for this thread's quantum to end, whatever the core count
+  bool Profile {}; // EXPERIMENT: a .profile process: stopped every quantum so its guest RIP can be sampled
+};
 struct PreemptControl {
   Mutex Lock {};
-  // Guarded by Lock. Running changes only on the scheduler thread.
-  FEXCore::Core::InternalThreadState* Running {};
-  uint64_t RunningSince {};
-  uint64_t NextDeadline {};
-  PreemptInputs Hints {};
-  bool Armed {};
+  std::array<PreemptEntry, PreemptSlots> Entries {};
   std::atomic<bool> StopWatchdog {};
   uint64_t Switches {}, Unresolved {};
   Thread Watchdog {};
@@ -305,17 +364,14 @@ std::atomic_ref<uint64_t> PollWord(FEXCore::Core::InternalThreadState* Thread, s
 
 void PreemptWatchdog(void*) {
   while (!Preempt.StopWatchdog.load()) {
-    svcSleepThread(PreemptQuantumNs / 2);
+    svcSleepThread(static_cast<int64_t>(GuestPreemptCheckNs));
+    const bool Oversubscribed = CoresOversubscribed();
+    const auto Now = armTicksToNs(armGetSystemTick());
     mutexLock(&Preempt.Lock);
-    if (Preempt.Running && !Preempt.Armed) {
-      auto Inputs = Preempt.Hints;
-      Inputs.Now = armTicksToNs(armGetSystemTick());
-      Inputs.RunningSince = Preempt.RunningSince;
-      Inputs.TimerDue = Inputs.TimerDue || (Preempt.NextDeadline && Inputs.Now >= Preempt.NextDeadline);
-      if (ShouldPreempt(Inputs)) {
-        PollWord(Preempt.Running, FEXCore::Core::InterruptPollRequestOffset).store(1, std::memory_order_release);
-        Preempt.Armed = true;
-      }
+    for (auto& Entry : Preempt.Entries) {
+      if (!Entry.Core || Entry.Armed || (!Oversubscribed && !Entry.Serial && !Entry.Profile) || !ShouldPreempt(Now, Entry.Since)) continue;
+      PollWord(Entry.Core, FEXCore::Core::InterruptPollRequestOffset).store(1, std::memory_order_release);
+      Entry.Armed = true;
     }
     mutexUnlock(&Preempt.Lock);
   }
@@ -336,8 +392,11 @@ const TraceMapping* FindTraceMapping(uint64_t RIP) {
   return nullptr;
 }
 
+// EXPERIMENT: a .profile session records mappings too, to name sampled guest addresses.
+bool ProfileMappings {};
+
 void RecordMapping(uint64_t Start, size_t Size, uint64_t Offset, std::string_view Path) {
-  if (Logging == LogLevel::Trace) TraceMappings.push_back({Start, Size, Offset, std::string {Path}});
+  if (Logging == LogLevel::Trace || ProfileMappings) TraceMappings.push_back({Start, Size, Offset, std::string {Path}});
 }
 
 unsigned FirstDispatchCompileCheckpoints {};
@@ -414,6 +473,7 @@ public:
     LoadInodeStore();
     CleanStaleTmpfs();
     Task = &Processes.try_emplace(ProcessID).first->second;
+    Task->ForkView->Resident = ProcessID;
     EnsureCardMountPoint();  // needs Task: a native creation records the creator as owner
     Task->Ns = NsRegistry.Initial;
     Task->Ns.Uts->Hostname = "fex-switch2";
@@ -436,7 +496,7 @@ public:
       // gone (never listed, never run) once the first session's process runs.
       SessionNs = Task->Ns;
       SessionFs = *Task->Fs;
-      Task->Exited = Task->Reaped = Task->PidRetired = true;
+      Task->Exited = Task->Reaped = Task->PidRetired = Task->Retired = true;
       StartPreemptWatchdog();
       return;
     }
@@ -509,6 +569,7 @@ public:
     // A higher priority on the guest's core lets the watchdog run while the
     // guest computes; it sleeps between checks.
     const auto Status = threadCreate(&Preempt.Watchdog, PreemptWatchdog, nullptr, nullptr, 0x4000, Priority - 1, -2);
+    if (R_SUCCEEDED(Status)) SpreadOverCores(Preempt.Watchdog);
     Preempt.WatchdogStarted = R_SUCCEEDED(Status) && R_SUCCEEDED(threadStart(&Preempt.Watchdog));
     StartedWatchdog = Preempt.WatchdogStarted;
     if (!Preempt.WatchdogStarted) {
@@ -530,6 +591,12 @@ public:
 
   ~GuestSyscalls() override {
     StopPreemptWatchdog();
+    // A host thread that was made and never started (RunThreads did not run) has no one to join it.
+    for (auto& Thread : Threads) {
+      if (!Thread.HostCreated) continue;
+      DestroyCore(Thread);
+      JoinHostThread(Thread);
+    }
     FlushAllTmpfs();
     if (SaveInodeStore() < 0) WriteLog("Failed to save guest inode metadata.");
     // The session's journal becomes a checkpoint, so the next launch starts
@@ -585,105 +652,124 @@ public:
     LastRows = static_cast<uint32_t>(Rows);
   }
 
+  // The runtime lock. Every read or write of runtime state happens with it held; generated guest code runs without
+  // it, so a handler sees one consistent state. It is not recursive: only the outermost entries take it (the service
+  // loop, GuestThreadMain, Dispatch after ExecuteThread, HandleSyscall, QueryGuestExecutableRange and the waits
+  // below, which give it back and retake it).
+  // MapLock is held with RuntimeLock, except while the runtime waits for or holds a FEX CodeInvalidationMutex
+  // (InvalidateExecutableRange). FEX compiles with that mutex held shared and asks QueryGuestExecutableRange, which
+  // takes MapLock only: taking RuntimeLock there would deadlock against a handler waiting for the mutex.
+  void LockRuntime() {
+    if (!mutexTryLock(&RuntimeLock)) {
+      const auto Start = armGetSystemTick();
+      mutexLock(&RuntimeLock);
+      const auto Waited = armGetSystemTick() - Start;
+      ThreadPerf.RuntimeLockWaits.fetch_add(1, std::memory_order_relaxed);
+      ThreadPerf.RuntimeLockWaitTicks.fetch_add(Waited, std::memory_order_relaxed);
+      HostLockWaitTicks += Waited;
+    }
+    mutexLock(&MapLock);
+    LockTakenTicks = armGetSystemTick();
+    LockTakenLogTicks = LogWriteTicks;
+    LockTakenCore = svcGetCurrentProcessorNumber();
+    LockTakenSite = LockSite;
+    {
+      u64 Cpu {};
+      svcGetInfo(&Cpu, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, TickCountInfo_Total);
+      LockTakenCpuTicks = Cpu;
+    }
+  }
+  void UnlockRuntime() {
+    // EXPERIMENT (multithreading scaling): a hold over 20 ms is logged once the lock is given back.
+    const auto Held = armGetSystemTick() - LockTakenTicks;
+    char Line[256];
+    Line[0] = 0;
+    if (Logging != LogLevel::Standard && armTicksToNs(Held) > 20'000'000 && LongHoldLogs < 300) {
+      ++LongHoldLogs;
+      u64 Cpu {};
+      svcGetInfo(&Cpu, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, TickCountInfo_Total);
+      std::snprintf(Line, sizeof(Line),
+                    "Runtime lock held %llu ms by tid %u (syscall %lld, taken at %s on core %u, given back on core %u), "
+                    "%llu ms of it on the CPU, %llu ms writing the log",
+                    static_cast<unsigned long long>(armTicksToNs(Held) / 1'000'000), HostSlot ? HostSlot->TID : 0,
+                    static_cast<long long>(HostSyscallNumber), LockSiteNames[LockTakenSite], LockTakenCore,
+                    svcGetCurrentProcessorNumber(),
+                    static_cast<unsigned long long>(armTicksToNs(Cpu - LockTakenCpuTicks) / 1'000'000),
+                    static_cast<unsigned long long>(armTicksToNs(LogWriteTicks - LockTakenLogTicks) / 1'000'000));
+    }
+    mutexUnlock(&MapLock);
+    mutexUnlock(&RuntimeLock);
+    if (Line[0]) WriteLog(Line);
+  }
+
   std::optional<uint64_t> RunThreads() {
-    while (!ProcessExited && !HostStop) {
+    LockRuntime();
+    Serving = true;
+    for (auto& Slot : Threads) {
+      // Host threads of slots made before the runtime served (the main thread) wait to be started until here.
+      if (Slot.Core && Slot.HostCreated && Slot.HostState == GuestThread::HostRun::None && !StartHostThread(Slot)) {
+        PrintStage("Could not start the guest host thread.");
+        DispatchFailed = true;
+      }
+    }
+    while (!ProcessExited && !HostStop && !DispatchFailed) {
+      Current = &ServiceSlot;
+      const auto Seen = ServiceWake.load();
       HostPoll();
       if (HostStop) break;
-      bool Ran = false;
-      // Preemption can return a busy thread every quantum; keep the
-      // terminal responsive while guests compute.
+      // The console's line discipline turns Ctrl+C, Ctrl+Z and Ctrl+\ into signals whether or not a thread reads the
+      // terminal, so a busy loop with no reader (a shell's own `while :; do :; done`) must still have its keyboard
+      // polled: this thread does that, however long the guest threads run.
       if (Interactive) PollTerminalInput();
       FireTimers();
       if (!ClosedFiles.empty() || !ClosedPtys.empty()) DrainClosedFiles();
       // Host sockets raise events on their own: poll them once per pass while a thread waits on one.
-      if (NetWaiting()) PollNet(0);
-      for (size_t Index = 0; Index < Threads.size() && !ProcessExited && !HostStop; ++Index) {
-        auto& Thread = Threads[Index];
-        if (!Thread.Core) continue;
-        if (Thread.Exited) {
-          Thread.Core->CTX->DestroyThread(Thread.Core);
-          Thread = {};
-          continue;
-        }
-        if (!Ready(Thread)) continue;
-        if (!ActivateProcess(Thread.PID)) {
-          PrintStage("Could not save the guest process address space.");
-          DispatchFailed = true;
-          break;
-        }
-        Current = &Thread;
-        if (Current->SetTidOnStart) {
-          CopyOut(Current->SetTidOnStart, OwnTid(*Current));
-          Current->SetTidOnStart = 0;
-        }
-        const auto Before = CurrentThreadTicks();
-        QuantumStart = Before;
-        InDispatch = true;
-        if (Task->TraceFirstDispatch && Logging == LogLevel::Trace) {
-          LogFirstDispatch(*Thread.Core->CurrentFrame);
-          FirstDispatchCompileCheckpoints = 11;
-        }
-        Task->TraceFirstDispatch = false;
-        // Also drops unblocked ignored signals, as Linux get_signal does.
-        if (Thread.RerunBeforeSignals) Thread.RerunBeforeSignals = false;
-        else if (DeliverableSignals(Thread)) DeliverSignals(Thread);
-        // A dropped stop signal can leave a sleep or futex wait unfinished.
-        if (!Thread.Exited && !Task->Stopped && Thread.Waiting == WaitKind::None) Dispatch(*Thread.Core->CTX);
-        FirstDispatchCompileCheckpoints = 0;
-        const auto Used = CurrentThreadTicks() - Before;
-        InDispatch = false;
-        Task->CpuTicks += Used;
-        Thread.CpuTicks += Used;
-        if (Task->StartupSyscallCheckpoints && Task->LastStartupSyscall) {
-          char Message[112];
-          std::snprintf(Message, sizeof(Message), "%s syscall %llu completed",
-                        Task->Image ? "Replacement" : "Fork continuation",
-                        static_cast<unsigned long long>(Task->LastStartupSyscall - 1));
-          ProcessCheckpoint(Message);
-          Task->LastStartupSyscall = 0;
-          --Task->StartupSyscallCheckpoints;
-        }
-        if (PendingFork) CompleteFork();
-        if (Task->Exited && Task->PID != ProcessID) {
-          ProcessCheckpoint("Child exit, retiring process");
-          RetireProcess(Task->PID);
-          if (Task->AutoReap) Task->Reaped = true;
-          ProcessCheckpoint("Child exit, process retired");
-        } else if (Task->PendingExec) {
-          ProcessCheckpoint("Exec request, replacing guest image");
-          if (!InstallExec()) DispatchFailed = true;
-          else ProcessCheckpoint("Exec request, replacement ready");
-        }
-        Ran = true;
+      const bool Net = NetWaiting();
+      if (Net) PollNet(0);
+      ReapFinishedThreads();
+      AfterRuntimeEntry();
+      if (ProcessExited || HostStop || DispatchFailed) break;
+      if (!Service && std::none_of(Threads.begin(), Threads.end(), [](const auto& Thread) { return Thread.Core; })) break;
+      if (!ActiveHost && !appletMainLoop()) break;
+      const auto TimerDue = NextTimerDeadline();
+      // Every guest thread waits and nothing can end the waits: no thread will ever run again. (CPU-clock timers do
+      // not count: nothing runs to use CPU time.)
+      if (!Service && !NextTimerDeadline(false) && std::all_of(Threads.begin(), Threads.end(), [&](auto& Thread) {
+            return !Thread.Core || (!Thread.Exited && Thread.HostState == GuestThread::HostRun::Blocked && !Thread.Deadline &&
+                                    !Thread.CpuDeadline && Thread.Waiting != WaitKind::Terminal && Thread.Waiting != WaitKind::Net &&
+                                    !Ready(Thread));
+          })) {
+        PrintStage("Guest threads are blocked with no remaining producer.");
+        break;
       }
-      if (!Ran && !ProcessExited && !HostStop) {
-        if (!Service && !std::any_of(Threads.begin(), Threads.end(), [](const auto& Thread) { return Thread.Core; })) break;
-        if (!ActiveHost && !appletMainLoop()) break;
-        const auto TimerDue = NextTimerDeadline(false);
-        // The launcher's tabs are a producer: typed bytes arrive from the UI thread at any time.
-        if (!Service && !TimerDue && std::none_of(Threads.begin(), Threads.end(), [](const auto& Thread) {
-              return Thread.Deadline || Thread.Waiting == WaitKind::Terminal || Thread.Waiting == WaitKind::Net;
-            })) {
-          PrintStage("Guest threads are blocked with no remaining producer.");
-          break;
-        }
-        if (Interactive) PollTerminalInput();
-        // Sleep until the next deadline, at most 8 ms.
-        uint64_t Wake = TimerDue;
-        for (const auto& Thread : Threads) {
-          if (Thread.Core && !Thread.Exited && Thread.Deadline) Wake = Wake ? std::min(Wake, Thread.Deadline) : Thread.Deadline;
-        }
-        const auto Now = MonotonicNs();
-        const auto Nanoseconds = Wake ? std::clamp<int64_t>(static_cast<int64_t>(Wake - std::min(Wake, Now)), 0, 8'000'000) : 8'000'000;
-        // A thread that waits on a host socket sleeps in the host's poll instead, so the socket can end the sleep.
-        if (NetWaiting() && Nanoseconds >= 1'000'000) PollNet(static_cast<int>(Nanoseconds / 1'000'000));
-        else svcSleepThread(Nanoseconds);
-      }
-      if (DispatchFailed) break;
+      // Sleep until the next timer, at most 8 ms (1 ms while a thread waits on a host socket, which only polling sees).
+      const auto Now = MonotonicNs();
+      int64_t Nanoseconds = TimerDue ? std::clamp<int64_t>(static_cast<int64_t>(TimerDue - std::min(TimerDue, Now)), 100'000, 8'000'000) : 8'000'000;
+      if (Net) Nanoseconds = std::min<int64_t>(Nanoseconds, 1'000'000);
+      // AfterRuntimeEntry wakes this thread early when a guest thread arms an earlier timer or starts a host socket wait.
+      ServiceSleepUntil = Now + Nanoseconds;
+      ServiceNetPolling = Net;
+      WaitUnlocked(ServiceWake, Seen, Nanoseconds);
+      ServiceSleepUntil = 0;
+    }
+    // The run ends: every guest thread is told to end and joined, then what the loop left is cleaned up.
+    HostStop = true;
+    Current = &ServiceSlot;
+    for (auto& Thread : Threads) {
+      if (Thread.Core) Thread.Exited = true;
+    }
+    for (;;) {
+      AfterRuntimeEntry();
+      const bool Running = std::any_of(Threads.begin(), Threads.end(), [](const auto& Thread) {
+        return Thread.HostCreated && Thread.HostState != GuestThread::HostRun::None && Thread.HostState != GuestThread::HostRun::Finished;
+      });
+      if (!Running) break;
+      WaitUnlocked(ServiceWake, ServiceWake.load(), 1'000'000);
     }
     for (auto& Thread : Threads) {
-      if (Thread.Core) Thread.Core->CTX->DestroyThread(Thread.Core);
-      Thread = {};
+      if (Thread.HostCreated) JoinHostThread(Thread);
+      DestroyCore(Thread); // one whose host thread never started
+      ResetSlot(Thread);
     }
     Current = nullptr;
     if (Service) EndSessions();
@@ -692,8 +778,20 @@ public:
     std::snprintf(Summary, sizeof(Summary), "Guest preemption: %llu switches, %llu unresolved",
                   static_cast<unsigned long long>(Preempt.Switches), static_cast<unsigned long long>(Preempt.Unresolved));
     WriteLog(Summary);
+    char Counters[256];
+    std::snprintf(Counters, sizeof(Counters),
+                  "Perf: threads: %llu block lookups (compiles), %llu waited %llu ms for the map lock; runtime lock waited "
+                  "%llu times, %llu ms; %llu code invalidations",
+                  static_cast<unsigned long long>(ThreadPerf.Compiles.load()), static_cast<unsigned long long>(ThreadPerf.CompileWaits.load()),
+                  static_cast<unsigned long long>(armTicksToNs(ThreadPerf.CompileWaitTicks.load()) / 1'000'000),
+                  static_cast<unsigned long long>(ThreadPerf.RuntimeLockWaits.load()),
+                  static_cast<unsigned long long>(armTicksToNs(ThreadPerf.RuntimeLockWaitTicks.load()) / 1'000'000),
+                  static_cast<unsigned long long>(ThreadPerf.Invalidations.load()));
+    WriteLog(Counters);
+    UnlockRuntime();
     return ProcessExited ? std::optional {ExitStatus} : std::nullopt;
   }
+
 
   struct ExecImage {
     uint64_t Inode {};
@@ -795,6 +893,7 @@ public:
     GuestThread Probe;
     Probe.PID = Probe.TID = PID;
     Probe.Descriptors = Child.PendingDescriptors;
+    Child.ForkView->Resident = PID; // a new program has its own view
     Task = &Child;
     Current = &Probe;
     ExecImage Loaded;
@@ -852,10 +951,7 @@ public:
     Current = SavedCurrent;
     if (!Ok) {
       for (auto& Thread : Threads) {
-        if (Thread.Core && Thread.PID == PID) {
-          Thread.Core->CTX->DestroyThread(Thread.Core);
-          Thread = {};
-        }
+        if (Thread.Core && Thread.PID == PID) AbandonSlot(Thread);
       }
       Child.Ctty.reset();
       Tty->Master.reset();
@@ -864,6 +960,11 @@ public:
     Child.Host = Host;
     Child.TraceFirstDispatch = true;
     Child.HasDispatched = false;
+    Child.SerialGuest = Launch.SingleThread;
+    Child.NoTso = Launch.NoTso;
+    Child.Profile = Launch.Profile;
+    if (Launch.Profile) ProfileMappings = true;
+    if (Launch.SingleThread) WriteLog(("Guest session " + std::to_string(Host->Id) + ": single-thread mode").c_str());
     WriteLog(("Guest session " + std::to_string(Host->Id) + ": " + Image.Path + " as process " + std::to_string(PID) + " on /dev/pts/" +
               std::to_string(Tty->Index)).c_str());
     Sessions.push_back({Host, Tty, PID, Activity, Cols, Rows});
@@ -994,8 +1095,30 @@ public:
     }
   }
 
+  // Generated code calls this on the host thread of the slot whose guest thread made the syscall, without the lock.
+  // The handler runs with it, then either returns to the guest (the lock is given back) or leaves the JIT for the
+  // slot's host loop with ReturnToHostLoop (the lock stays held, and the loop expects that).
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
     using namespace FEXCore::X86State;
+    auto* const Slot = HostSlot;
+    if (!Slot) {
+      PrintStage("A syscall came from a thread that has no guest slot.");
+      std::abort();
+    }
+    LockSite = 1;
+    LockRuntime();
+    LockSite = 0;
+    HostSyscallNumber = static_cast<int64_t>(Frame->State.gregs[FEXCore::X86State::REG_RAX]);
+    LeftGuest(*Slot);
+    Enter(*Slot);
+    // The thread must not run the call now: it ends, or its process is held (another thread's exec, a fork snapshot,
+    // a memory view swap, a stop). Leaving before anything of the call ran makes the guest run the syscall
+    // instruction again when the thread continues, since rip is untouched.
+    if (Slot->Exited || HostStop || ProcessExited || DispatchFailed || Task->Exited || Task->PendingExec || Task->StopRequests ||
+        Task->Stopped) {
+      ReturnToHostLoop();
+    }
+    YieldRequested = false;
     auto& Registers = Frame->State.gregs;
     if (Logging == LogLevel::Trace) {
       char Message[224];
@@ -1018,7 +1141,7 @@ public:
           })) {
         ExitProcess(Registers[REG_RDI] & 0xff, 0);
       }
-      std::longjmp(ReturnToHost, 1);
+      ReturnToHostLoop();
     }
 
     constexpr int64_t LinuxEnosys = -38;
@@ -1101,7 +1224,7 @@ public:
     case 13: Result = SignalAction(A, B, C, Registers[REG_R10]); break;
     case 14: Result = SignalMask(A, B, C, Registers[REG_R10]); break;
     case 15:
-      if (ReturnGuestSignal(Frame)) std::longjmp(ReturnToHost, 1);
+      if (ReturnGuestSignal(Frame)) ReturnToHostLoop();
       Result = Fault;
       break;
     case 127: Result = PendingSignalsGuest(A, B); break;
@@ -1367,7 +1490,11 @@ public:
     case FEX_NX2_PRESENT_RGBA: Result = PresentGuestFrame(A); break;
     case FEX_NX2_POLL_INPUT: Result = PollGameInput(); break;
     case FEX_NX2_TICKS_MS: Result = armTicksToNs(armGetSystemTick() - StartTick) / 1'000'000; break;
-    case FEX_NX2_DELAY_MS: svcSleepThread(std::min<uint64_t>(A, 1000) * 1'000'000); Result = 0; break;
+    case FEX_NX2_DELAY_MS:
+      SleepUnlocked(std::min<uint64_t>(A, 1000) * 1'000'000);
+      if (Current->Exited) ReturnToHostLoop(); // killed while the lock was off: its descriptors are gone
+      Result = 0;
+      break;
     case 257: // openat
       Result = OpenGuest(static_cast<uint32_t>(A), B, static_cast<uint32_t>(C), Registers[REG_R10]);
       break;
@@ -1403,7 +1530,7 @@ public:
     PerfCounters.SyscallTicks[PerfNumber] += armGetSystemTick() - PerfStart;
     if (Result == RetrySyscall || Task->PendingExec) {
       if (Result == RetrySyscall) Current->SeccompRetryRip = Frame->State.rip;
-      std::longjmp(ReturnToHost, 1);
+      ReturnToHostLoop();
     }
     if (Current->SuspendMask && MaskedWait(Registers[REG_RAX]) && Result != -4) {
       Current->SignalMask = *std::exchange(Current->SuspendMask, std::nullopt);
@@ -1420,15 +1547,19 @@ public:
     Current->Deadline = 0;
     Current->TimedSocketWait = false;
     Current->WaitSignals = 0;
+    Current->SignalRerunDone = false; // the call completed: the next wait may rescan once again
     if (const auto Due = NextTimerDeadline(); Due && MonotonicNs() >= Due) FireTimers();
     if (HasActionableSignal(*Current)) {
       Registers[REG_RAX] = Result;
       Frame->State.rip += 2;
       DeliverSignals(*Current);
-      std::longjmp(ReturnToHost, 1);
+      ReturnToHostLoop();
     }
     if (DeliverableSignals(*Current)) DeliverSignals(*Current); // only ignored ones: dropped
-    if (Logging == LogLevel::Trace || (Logging == LogLevel::Detailed && Result < 0 && Result >= -4095)) {
+    // A futex that changed under the caller (EAGAIN) or timed out is how locks work, not a failure. Threads contend
+    // on futexes constantly, and every log line is written to the SD card at once with the runtime lock held.
+    const bool RoutineFutex = Registers[REG_RAX] == 202 && (Result == -11 || Result == -110);
+    if (Logging == LogLevel::Trace || (Logging == LogLevel::Detailed && Result < 0 && Result >= -4095 && !RoutineFutex)) {
       char Message[160];
       std::snprintf(Message, sizeof(Message), "Guest syscall %llu at %#llx returned %lld",
                     static_cast<unsigned long long>(Registers[REG_RAX]), static_cast<unsigned long long>(Frame->State.rip),
@@ -1441,17 +1572,31 @@ public:
       Task->LastStartupSyscall = Registers[REG_RAX] + 1;
       Registers[REG_RAX] = Result;
       Frame->State.rip += 2;
-      std::longjmp(ReturnToHost, 1);
+      ReturnToHostLoop();
     }
     Registers[REG_RAX] = Result;
     Frame->State.rip += 2;
-    if (std::exchange(YieldRequested, false) || std::any_of(Threads.begin(), Threads.end(), [&](auto& Thread) {
-          return &Thread != Current && Thread.Core && !Thread.Exited &&
-                 Thread.PID == Current->PID && Ready(Thread);
-        })) {
-      std::longjmp(ReturnToHost, 1);
+    // Other threads of the process run on host threads of their own, so a ready sibling no longer needs this thread
+    // to leave the JIT. It leaves when something needs it out: a signal, an exit, a stop request.
+    if (NeedsStop(*Current) || (Task->SerialGuest && SerialSiblingInGuest(*Current))) ReturnToHostLoop();
+    const bool Yield = YieldRequested; // sched_yield: give the core up once the lock is back
+    if (Yield && Task->SerialGuest && SerialSiblingWaiting(*Current)) {
+      Task->SerialYielder = Current->TID; // the call is done (rip and rax are set): the host loop passes the turn on
+      ReturnToHostLoop();
     }
-    RefreshPreemptHints();
+    BeginGuest(*Current);
+    ReleaseRuntime();
+    if (Yield) svcSleepThread(-1);
+  }
+
+  // A call that sleeps (a delay of the console probe) must not hold the lock. The process's memory may be taken
+  // by another process of its fork group meanwhile, so the thread puts it back before it goes on.
+  void SleepUnlocked(uint64_t Nanoseconds) {
+    auto* const Slot = Current;
+    ReleaseRuntime();
+    svcSleepThread(static_cast<int64_t>(Nanoseconds));
+    LockRuntime();
+    Enter(*Slot);
   }
 
   void PreCompile() override {
@@ -1460,12 +1605,27 @@ public:
     }
   }
 
-  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Address) override {
-    const auto Range = Task->Memory.Query(Address);
-    if (Range.Flags & PF_X) {
-      return {Range.Start, Range.Size, (Range.Flags & PF_W) != 0};
+  // FEX asks while it compiles, on the host thread of the slot that owns Thread and without the lock: the answer is
+  // about that slot's process, which is not Task (the process of whichever thread last held the lock).
+  FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
+    const bool Held = mutexIsLockedByCurrentThread(&MapLock);
+    ThreadPerf.Compiles.fetch_add(1, std::memory_order_relaxed);
+    if (!Held && !mutexTryLock(&MapLock)) {
+      const auto Start = armGetSystemTick();
+      mutexLock(&MapLock);
+      ThreadPerf.CompileWaits.fetch_add(1, std::memory_order_relaxed);
+      ThreadPerf.CompileWaitTicks.fetch_add(armGetSystemTick() - Start, std::memory_order_relaxed);
     }
-    return {};
+    FEXCore::HLE::ExecutableRangeInfo Info {};
+    const auto Owner = std::find_if(Threads.begin(), Threads.end(), [&](const auto& Slot) { return Slot.Core == Thread; });
+    const auto Process = Owner == Threads.end() ? Processes.end() : Processes.find(Owner->PID);
+    // Task belongs to RuntimeLock, which this thread does not hold: a thread that is not a slot's gets no range.
+    if (Process != Processes.end()) {
+      const auto Range = Process->second.Memory.Query(Address);
+      if (Range.Flags & PF_X) Info = {Range.Start, Range.Size, (Range.Flags & PF_W) != 0};
+    }
+    if (!Held) mutexUnlock(&MapLock);
+    return Info;
   }
 
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t) override {
@@ -1560,6 +1720,7 @@ private:
     uint64_t WaitSignals {};
     uint64_t CpuTicks {};
     bool RerunBeforeSignals {}; // see Ready()
+    bool SignalRerunDone {};    // the call already rescanned once for a pending signal: deliver it now (see Ready())
     // Bytes a blocking stream write already queued before it waited for
     // space; the rerun continues after them (Linux pipe_write and
     // unix_stream_sendmsg loop inside one call).
@@ -1619,11 +1780,514 @@ private:
     uint64_t CpuMask {~uint64_t {0}};
     uint16_t IoPriority {};
     uint64_t IoContext {};
+    // One host thread per guest thread (Task 1B). Host is the libnx thread, HostCreated says it was made
+    // and must be joined, HostState is where it is in its life, and WakeWord is the address its host thread
+    // sleeps on while the guest thread waits.
+    ::Thread Host {};
+    bool HostCreated {};
+    enum class HostRun : uint8_t { None, Starting, Ready, Blocked, InGuest, Finished } HostState {};
+    std::atomic<int32_t> WakeWord {};
+    // EXPERIMENT (multithreading scaling): the host cores this thread entered guest code on, and how often it did.
+    uint32_t CoresSeen {};
+    uint64_t Dispatches {};
+    // Where the host thread's time went (MonotonicNs): created, first guest entry, in guest code, asleep in BlockSlot,
+    // in the yield after a preemption.
+    uint64_t BornNs {}, FirstGuestNs {}, InGuestNs {}, BlockedNs {}, YieldNs {};
+    // When the thread entered guest code (MonotonicNs) and its host thread's tick count then, so the
+    // watchdog and the CPU clocks can tell how long this thread alone has run. StopArmed: the watchdog
+    // already asked it to stop.
+    uint64_t GuestSince {};
+    uint64_t EnteredNs {}; // EXPERIMENT: when the thread last went into guest code (dispatch or syscall return)
+    uint64_t DispatchStartTicks {};
+    std::atomic<bool> StopArmed {};
+    GuestSyscalls* Owner {}; // the runtime its host thread serves
   };
 
-  bool AddThread(ContextType& Context, FEXCore::Core::CPUState& State, uint32_t TID, uint64_t ClearTid, uint32_t PID) {
-    const auto Slot = std::find_if(Threads.begin(), Threads.end(), [](const auto& Thread) { return !Thread.Core; });
-    if (Slot == Threads.end()) return false;
+  // std::atomic cannot be copied, so a slot cannot be reset by assigning {}. Destroy it and build a fresh one in place.
+  static void ResetSlot(GuestThread& Slot) {
+    Slot.~GuestThread();
+    new (&Slot) GuestThread();
+  }
+
+  // Resets a slot but keeps its host thread: the exec'ing thread carries on in the same host thread.
+  static void ResetSlotKeepHost(GuestThread& Slot) {
+    auto* const Owner = Slot.Owner;
+    const auto Host = Slot.Host;
+    const auto State = Slot.HostState;
+    const auto Wake = Slot.WakeWord.load();
+    const auto Since = Slot.GuestSince;
+    ResetSlot(Slot);
+    Slot.Owner = Owner;
+    Slot.Host = Host;
+    Slot.HostCreated = true;
+    Slot.HostState = State;
+    Slot.WakeWord = Wake;
+    Slot.GuestSince = Since;
+  }
+
+  // The slot whose guest code the calling host thread runs (set when the thread starts). Generated code reaches
+  // HandleSyscall on that thread, so this is how a syscall finds its slot.
+  static inline thread_local GuestThread* HostSlot {};
+  // Wakes for threads that wait for a change of the runtime: the service thread (a host thread finished), and the
+  // threads in WaitForQuiesce (a thread left guest code, or a slot lost its Core).
+  std::atomic<int32_t> ServiceWake {}, QuiesceWord {}, QuiesceWaiters {};
+  // The runtime serves (RunThreads runs): host threads start when their slot is made.
+  bool Serving {};
+  // Current while the service thread has the lock: handlers run for a thread, and a few runtime paths read Current.
+  GuestThread ServiceSlot {.Descriptors = std::make_shared<DescriptorState>()};
+
+  // Every unlock goes through here: it wakes the threads this thread made ready and stops the ones it made
+  // stoppable (AfterRuntimeEntry), and no code keeps Current across the unlock.
+  void ReleaseRuntime() {
+    AfterRuntimeEntry();
+    Current = nullptr;
+    UnlockRuntime();
+  }
+
+  static void SignalWord(std::atomic<int32_t>& Word, int32_t Count) {
+    Word.fetch_add(1);
+    svcSignalToAddress(&Word, SignalType_Signal, 0, Count);
+  }
+
+  // Sleeps on Word (until it changes from Seen, or Timeout ns pass; -1: no limit) with the lock given back. Current and Task
+  // are what they were when it returns: the callers hold pointers to both. The service thread has no process of its
+  // own: Task stays what the last thread that ran left (a process another thread's Enter dropped meanwhile must not come back).
+  void WaitUnlocked(std::atomic<int32_t>& Word, int32_t Seen, int64_t Timeout) {
+    auto* const SavedCurrent = Current;
+    auto* const SavedTask = Task;
+    ReleaseRuntime();
+    svcWaitForAddress(&Word, ArbitrationType_WaitIfEqual, Seen, Timeout);
+    LockSite = 3;
+    LockRuntime();
+    LockSite = 0;
+    Current = SavedCurrent;
+    if (SavedCurrent != &ServiceSlot) Task = SavedTask;
+  }
+
+  // The thread that runs Slot's guest code has the lock: Current and Task name the slot and its process. With
+  // Resident the process's memory is also the one in place (it may take the lock off for that, see EnsureResident).
+  void Enter(GuestThread& Slot, bool Resident = true) {
+    Current = &Slot;
+    const auto Owner = Processes.find(Slot.PID);
+    if (Owner == Processes.end()) return;
+    if (Task != &Owner->second) {
+      Task = &Owner->second;
+      // Only now that Task names a process that is not one of these: they can go.
+      std::erase_if(Processes, [&](const auto& Item) { return Item.second.Reaped && Item.second.Retired && &Item.second != Task; });
+    }
+    if (Resident && !Slot.Exited && Slot.Core) EnsureResident(Slot);
+  }
+
+  // Slots whose host thread sleeps on the wake word are woken when they can run (or must end), and slots in guest
+  // code are asked to leave it when something needs them out (a signal, an exit, a stop request). Runs before every
+  // unlock, so no waker in the handlers has to know about the threads it makes ready.
+  void AfterRuntimeEntry() {
+    // The service thread sleeps until the timer it knew of, polling host sockets only while a thread waited on one.
+    if (ServiceSleepUntil && Current != &ServiceSlot) {
+      const auto Due = NextTimerDeadline();
+      if ((Due && Due < ServiceSleepUntil) || (!ServiceNetPolling && NetWaiting())) {
+        ServiceSleepUntil = 0;
+        SignalWord(ServiceWake, 1);
+      }
+    }
+    for (auto& Slot : Threads) {
+      if (!Slot.Core) continue;
+      if (Slot.HostState == GuestThread::HostRun::Blocked) {
+        if (Slot.Exited || HostStop || ProcessExited || (Ready(Slot) && Runnable(Slot))) WakeSlot(Slot);
+      } else if (Slot.HostState == GuestThread::HostRun::InGuest && NeedsStop(Slot)) {
+        PollWord(Slot.Core, FEXCore::Core::InterruptPollRequestOffset).store(1, std::memory_order_release);
+      }
+    }
+  }
+
+  void WakeSlot(GuestThread& Slot) { SignalWord(Slot.WakeWord, 1); }
+
+  // True when a slot in guest code must come back to its host loop now.
+  bool NeedsStop(const GuestThread& Slot) const {
+    if (Slot.Exited || HostStop || ProcessExited || DispatchFailed) return true;
+    const auto& Owner = Processes.at(Slot.PID);
+    // A slot dispatched to rescan its blocking call (SignalRerunDone) is at the syscall instruction, and the call itself
+    // answers the pending signal (EINTR, or blocking again so the next pass delivers it). Stopping it before the
+    // instruction would deliver the signal with no call in progress, and the call would restart instead of failing.
+    return Owner.Stopped || Owner.Exited || Owner.PendingExec || Owner.StopRequests ||
+           (!Slot.SignalRerunDone && HasActionableSignal(Slot));
+  }
+
+  // Another thread of a process that runs one thread at a time is in guest code.
+  bool SerialSiblingInGuest(const GuestThread& Slot) const {
+    return std::any_of(Threads.begin(), Threads.end(), [&](const auto& Other) {
+      return &Other != &Slot && Other.Core && Other.PID == Slot.PID && Other.HostState == GuestThread::HostRun::InGuest;
+    });
+  }
+
+  // A ready slot may enter guest code: nobody holds its process out of it (StopThreads) and, in a SerialGuest process,
+  // no sibling is in it.
+  bool Runnable(const GuestThread& Slot) const {
+    const auto& Owner = Processes.at(Slot.PID);
+    if (Owner.StopRequests) return false;
+    if (!Owner.SerialGuest) return true;
+    if (Owner.SerialYielder == Slot.TID && SerialSiblingWaiting(Slot)) return false;
+    return !SerialSiblingInGuest(Slot);
+  }
+
+  // Another thread of a SerialGuest process waits only for its turn (its host thread sleeps with nothing else to wait for).
+  bool SerialSiblingWaiting(const GuestThread& Slot) const {
+    return std::any_of(Threads.begin(), Threads.end(), [&](const auto& Other) {
+      return &Other != &Slot && Other.Core && Other.PID == Slot.PID && !Other.Exited && Other.Waiting == WaitKind::None &&
+             Other.HostState == GuestThread::HostRun::Blocked;
+    });
+  }
+
+  // The slot's host thread has nothing to run: it sleeps on its wake word until a thread that changed the state calls
+  // WakeSlot, or until the slot's deadline. The wake word is read before the lock is given back, so a wake that
+  // comes in between is not lost.
+  void BlockSlot(GuestThread& Slot) {
+    const auto Seen = Slot.WakeWord.load();
+    int64_t Timeout = -1;
+    if (Slot.Deadline) {
+      const auto Now = MonotonicNs();
+      // A deadline that already passed with the slot still not ready (nothing ends such a wait by time) must not spin.
+      Timeout = Slot.Deadline > Now ? static_cast<int64_t>(Slot.Deadline - Now) : 1'000'000;
+    }
+    // A CPU-clock sleep ends when the clock's process has used the time: nothing wakes it, so look again soon.
+    // A clock set moves the deadline of an absolute realtime sleep the same way.
+    if (Slot.CpuDeadline || Slot.RealtimeTarget) Timeout = Timeout < 0 ? 10'000'000 : std::min<int64_t>(Timeout, 10'000'000);
+    Slot.HostState = GuestThread::HostRun::Blocked;
+    GuestThreadsWantingCore.fetch_sub(1, std::memory_order_relaxed);
+    const auto BlockStart = MonotonicNs();
+    const auto LockWaitBefore = HostLockWaitTicks;
+    WaitUnlocked(Slot.WakeWord, Seen, Timeout);
+    const auto BlockTook = MonotonicNs() - BlockStart;
+    Slot.BlockedNs += BlockTook;
+    // EXPERIMENT (multithreading scaling): long sleeps of a thread, with what it waited for.
+    if (Logging != LogLevel::Standard && BlockTook > 20'000'000 && LongBlockLogs < 300) {
+      ++LongBlockLogs;
+      char Line[200];
+      std::snprintf(Line, sizeof(Line), "Thread %u blocked %llu ms (%llu ms of it for the runtime lock): wait %d, syscall %lld, stop requests %u",
+                    Slot.TID, static_cast<unsigned long long>(BlockTook / 1'000'000),
+                    static_cast<unsigned long long>(armTicksToNs(HostLockWaitTicks - LockWaitBefore) / 1'000'000),
+                    static_cast<int>(Slot.Waiting), static_cast<long long>(HostSyscallNumber),
+                    static_cast<unsigned>(Processes.at(Slot.PID).StopRequests));
+      WriteLog(Line);
+    }
+    GuestThreadsWantingCore.fetch_add(1, std::memory_order_relaxed);
+    Slot.HostState = GuestThread::HostRun::Ready;
+  }
+
+  // Wakes the threads that wait in WaitForQuiesce: a thread left guest code, or a slot finished.
+  void NotifyQuiesce() {
+    if (QuiesceWaiters.load() > 0) SignalWord(QuiesceWord, -1);
+  }
+
+  void WaitForQuiesce(int64_t Timeout) {
+    const auto Seen = QuiesceWord.load();
+    QuiesceWaiters.fetch_add(1);
+    WaitUnlocked(QuiesceWord, Seen, Timeout);
+    QuiesceWaiters.fetch_sub(1);
+  }
+
+  // Keeps the threads of process PID, except Except, out of guest code and keeps them from entering it again until
+  // released: a stop request on the process makes AfterRuntimeEntry call them back and Runnable refuse them. The
+  // lock is given back while it waits. With MinRunNs a thread that entered guest code more recently than that is
+  // left alone first (a view swap must not take the memory from a process that just got it). With Pin the
+  // process's memory stays in place meanwhile: no view swap takes it (Pins). Without Pin the call waits for such a
+  // holder. Returns false when the process is gone.
+  bool StopThreads(uint32_t PID, const GuestThread* Except, uint64_t MinRunNs, bool Pin) {
+    auto Found = Processes.find(PID);
+    if (Found == Processes.end()) return false;
+    if (Pin) ++Found->second.Pins;
+    bool Raised = false;
+    const auto Started = MonotonicNs();
+    for (;;) {
+      Found = Processes.find(PID);
+      if (Found == Processes.end()) return true;
+      auto& Owner = Found->second;
+      const auto Now = MonotonicNs();
+      bool Any = false, Young = false;
+      for (const auto& Slot : Threads) {
+        if (!Slot.Core || Slot.PID != PID || &Slot == Except || Slot.HostState != GuestThread::HostRun::InGuest) continue;
+        Any = true;
+        // Politeness has a limit: a thread that keeps re-entering guest code stays young, so after two quanta the
+        // swap takes the memory anyway.
+        if (MinRunNs && Now - Slot.GuestSince < MinRunNs && Now - Started < 2 * MinRunNs) Young = true;
+      }
+      const bool Held = !Pin && Owner.Pins > 0;
+      if (!Any && !Held) break;
+      if (!Young && !Held && !Raised) {
+        ++Owner.StopRequests;
+        Raised = true;
+      }
+      WaitForQuiesce(1'000'000);
+    }
+    if (!Raised) ++Found->second.StopRequests;
+    return true;
+  }
+
+  void ReleaseStop(uint32_t PID, bool Pinned) {
+    const auto Found = Processes.find(PID);
+    if (Found == Processes.end()) return;
+    if (Pinned && Found->second.Pins) --Found->second.Pins;
+    if (Found->second.StopRequests) --Found->second.StopRequests;
+  }
+
+  struct ProcessStop {
+    ProcessStop(GuestSyscalls& Runtime, uint32_t Process, const GuestThread* Except, uint64_t MinRunNs, bool Pin)
+      : Owner {Runtime}, PID {Process}, Pinned {Pin} {
+      Held = Owner.StopThreads(PID, Except, MinRunNs, Pin);
+    }
+    ~ProcessStop() {
+      if (Held) Owner.ReleaseStop(PID, Pinned);
+    }
+    ProcessStop(const ProcessStop&) = delete;
+    ProcessStop& operator=(const ProcessStop&) = delete;
+    GuestSyscalls& Owner;
+    uint32_t PID;
+    bool Pinned;
+    bool Held {};
+  };
+
+  // The slot's process memory must be in place before its thread runs: in a fork group the view holds one process's
+  // private pages, so another process's thread takes the view over, which needs the resident process out of guest code.
+  void EnsureResident(GuestThread& Slot) {
+    for (;;) {
+      if (Slot.Exited) return;
+      const auto& Owner = Processes.at(Slot.PID);
+      if (!Owner.ForkView || Owner.ForkView->Resident == Slot.PID) return;
+      const auto Old = Owner.ForkView->Resident;
+      // Only a live process that still shares the view has pages in memory to save (exec and exit leave the group);
+      // stopping any other one would hold up an unrelated process for nothing.
+      const auto Resident = Processes.find(Old);
+      if (Resident == Processes.end() || Resident->second.Exited || Resident->second.ForkView != Owner.ForkView) {
+        if (!SwapView(Slot.PID)) {
+          PrintStage("Could not save the guest process address space.");
+          DispatchFailed = true;
+        }
+        return;
+      }
+      ProcessStop Hold(*this, Old, nullptr, PreemptQuantumNs, false);
+      // The lock was off: look at the state again.
+      if (Slot.Exited) return;
+      const auto& Now = Processes.at(Slot.PID);
+      if (Now.ForkView->Resident == Slot.PID) return;
+      if (Now.ForkView->Resident != Old) continue; // another process took the view meanwhile: hold that one instead
+      if (!SwapView(Slot.PID)) {
+        PrintStage("Could not save the guest process address space.");
+        DispatchFailed = true;
+      }
+      return;
+    }
+  }
+
+  // Marks a slot ended. Its own host thread destroys its Core (Slot ownership); nothing else may.
+  static void MarkSlotExited(GuestThread& Slot) {
+    Slot.Exited = true;
+    Slot.Descriptors.reset();
+    Slot.PendingFifo.reset();
+  }
+
+  void DestroyCore(GuestThread& Slot) {
+    if (!Slot.Core) return;
+    Slot.Core->CTX->DestroyThread(Slot.Core);
+    Slot.Core = nullptr;
+  }
+
+  // For a slot that no code ever ran in (a failed fork or spawn): its Core goes now. A slot with a host thread keeps
+  // it and ends through the thread; one without is freed.
+  void AbandonSlot(GuestThread& Slot) {
+    DestroyCore(Slot);
+    MarkSlotExited(Slot);
+    if (!Slot.HostCreated) ResetSlot(Slot);
+  }
+
+  // Waits until every slot of the process except Except has lost its Core (their host threads destroy them). The
+  // slots must be marked exited first. Process teardown needs this: a Core must not outlive its FEX context or
+  // the memory it translated.
+  // An exec that waits must give up when its own process dies meanwhile (GiveUp): the thread that retires the
+  // process then waits for this one's Core, and neither could go on. Returns false when it gave up.
+  bool WaitForCoresGone(uint32_t PID, const GuestThread* Except, bool GiveUp = false) {
+    for (;;) {
+      const bool Any = std::any_of(Threads.begin(), Threads.end(), [&](const auto& Slot) { return Slot.Core && Slot.PID == PID && &Slot != Except; });
+      if (!Any) return true;
+      if (GiveUp && Except->Exited) return false;
+      WaitForQuiesce(1'000'000);
+    }
+  }
+
+  // ---- Host threads ----
+
+  static void GuestThreadEntry(void* Argument) {
+    auto& Slot = *static_cast<GuestThread*>(Argument);
+    Slot.Owner->GuestThreadMain(Slot);
+  }
+
+  bool StartHostThread(GuestThread& Slot) {
+    Slot.HostState = GuestThread::HostRun::Starting;
+    if (R_FAILED(threadStart(&Slot.Host))) {
+      Slot.HostState = GuestThread::HostRun::None;
+      return false;
+    }
+    return true;
+  }
+
+  // The host thread of a slot: runs its guest thread until the slot ends, then destroys the slot's Core.
+  void GuestThreadMain(GuestThread& Slot) {
+    HostSlot = &Slot;
+    std::jmp_buf Fallback;
+    HostReturn = &Fallback;
+    GuestThreadsWantingCore.fetch_add(1, std::memory_order_relaxed);
+    LockRuntime();
+    Slot.HostState = GuestThread::HostRun::Ready;
+    for (;;) {
+      // A longjmp to Fallback would come from a leave outside Dispatch (none exists); the lock is held then too.
+      if (setjmp(Fallback) != 0) continue;
+      if (!GuestThreadPass(Slot)) break;
+    }
+    if (Logging != LogLevel::Standard && Slot.Dispatches) {
+      char Line[320];
+      const auto Ms = [](uint64_t Ns) { return static_cast<unsigned long long>(Ns / 1'000'000); };
+      const auto Now = MonotonicNs();
+      std::snprintf(Line, sizeof(Line),
+                    "Thread %u of process %u: %llu guest entries on cores %#x, cpu %llu ms; lived %llu ms: first guest entry "
+                    "after %llu ms, in guest %llu ms, blocked %llu ms, yielding %llu ms, waiting for the runtime lock %llu ms",
+                    Slot.TID, Slot.PID, static_cast<unsigned long long>(Slot.Dispatches), Slot.CoresSeen, Ms(ThreadCpuNs(Slot)),
+                    Ms(Now - Slot.BornNs), Ms(Slot.FirstGuestNs - Slot.BornNs), Ms(Slot.InGuestNs), Ms(Slot.BlockedNs),
+                    Ms(Slot.YieldNs), Ms(armTicksToNs(HostLockWaitTicks)));
+      WriteLog(Line);
+    }
+    Slot.CoresSeen = 0;
+    Slot.Dispatches = 0;
+    Slot.BornNs = Slot.FirstGuestNs = Slot.InGuestNs = Slot.BlockedNs = Slot.YieldNs = 0;
+    HostLockWaitTicks = 0;
+    DestroyCore(Slot);
+    Slot.HostState = GuestThread::HostRun::Finished;
+    GuestThreadsWantingCore.fetch_sub(1, std::memory_order_relaxed);
+    NotifyQuiesce();
+    SignalWord(ServiceWake, 1);
+    ReleaseRuntime();
+  }
+
+  // One turn of the host loop (the per-thread block RunThreads had): false ends the thread.
+  bool GuestThreadPass(GuestThread& Slot) {
+    Enter(Slot, false);
+    if (Slot.Exited || DispatchFailed || HostStop || ProcessExited) return false;
+    if (!Ready(Slot) || !Runnable(Slot)) {
+      BlockSlot(Slot);
+      return true;
+    }
+    Enter(Slot);
+    if (Slot.Exited || DispatchFailed || HostStop || ProcessExited) return false;
+    if (!Ready(Slot) || !Runnable(Slot)) return true; // the lock was off for the memory: start again
+    if (!Task->HasDispatched) {
+      if (Task->Image) ProcessCheckpoint("Replacement image entering dispatch");
+      else if (Task->PID == ProcessID) ProcessCheckpoint("Initial image entering dispatch");
+      else ProcessCheckpoint("Child private memory restored, entering dispatch");
+      Task->HasDispatched = true;
+    }
+    if (Slot.SetTidOnStart) {
+      CopyOut(Slot.SetTidOnStart, OwnTid(Slot));
+      Slot.SetTidOnStart = 0;
+    }
+    const auto Before = CurrentThreadTicks();
+    Slot.DispatchStartTicks = Before;
+    if (Task->TraceFirstDispatch && Logging == LogLevel::Trace) {
+      LogFirstDispatch(*Slot.Core->CurrentFrame);
+      FirstDispatchCompileCheckpoints = 11;
+    }
+    Task->TraceFirstDispatch = false;
+    // Also drops unblocked ignored signals, as Linux get_signal does.
+    if (Slot.RerunBeforeSignals) {
+      Slot.RerunBeforeSignals = false;
+      Slot.SignalRerunDone = true;
+    } else {
+      Slot.SignalRerunDone = false;
+      if (DeliverableSignals(Slot)) DeliverSignals(Slot);
+    }
+    // A dropped stop signal can leave a sleep or futex wait unfinished.
+    const bool Run = !Slot.Exited && !Task->Stopped && Slot.Waiting == WaitKind::None;
+    if (Run) Dispatch(*Slot.Core->CTX);
+    FirstDispatchCompileCheckpoints = 0;
+    const auto Used = CurrentThreadTicks() - Before;
+    Slot.DispatchStartTicks = 0;
+    Task->CpuTicks += Used;
+    Slot.CpuTicks += Used;
+    if (Task->StartupSyscallCheckpoints && Task->LastStartupSyscall) {
+      char Message[112];
+      std::snprintf(Message, sizeof(Message), "%s syscall %llu completed",
+                    Task->Image ? "Replacement" : "Fork continuation",
+                    static_cast<unsigned long long>(Task->LastStartupSyscall - 1));
+      ProcessCheckpoint(Message);
+      Task->LastStartupSyscall = 0;
+      --Task->StartupSyscallCheckpoints;
+    }
+    if (PendingFork && PendingForkBy == &Slot) CompleteFork();
+    if (Task->Exited && Task->PID != ProcessID && !Task->Retiring) {
+      ProcessCheckpoint("Child exit, retiring process");
+      const auto PID = Task->PID;
+      RetireProcess(PID);
+      auto& Process = Processes.at(PID);
+      if (Process.AutoReap) Process.Reaped = true;
+      ProcessCheckpoint("Child exit, process retired");
+    } else if (Task->PendingExec && Task->ExecBy == &Slot) {
+      ProcessCheckpoint("Exec request, replacing guest image");
+      if (!InstallExec()) DispatchFailed = true;
+      else ProcessCheckpoint("Exec request, replacement ready");
+    }
+    if (!Run && !Slot.Exited) {
+      // Nothing ran (a stopped process, or a wait the signals left open): let the others have the lock before looking again.
+      ReleaseRuntime();
+      svcSleepThread(-1);
+      LockRuntime();
+    }
+    return true;
+  }
+
+  // A finished host thread's slot is freed once the thread is joined (a slot is never reused before: its host thread
+  // still holds the Thread record).
+  void JoinHostThread(GuestThread& Slot) {
+    if (Slot.HostState != GuestThread::HostRun::None) threadWaitForExit(&Slot.Host);
+    threadClose(&Slot.Host);
+    Slot.HostCreated = false;
+  }
+
+  void ReapFinishedThreads() {
+    for (auto& Slot : Threads) {
+      if (Slot.HostState != GuestThread::HostRun::Finished) continue;
+      JoinHostThread(Slot);
+      ResetSlot(Slot);
+    }
+  }
+
+  // Makes the slot's host thread (stack, priority, all-cores mask) and, once the runtime serves, starts it. Before that
+  // (the main thread, made while the launcher still sets up) RunThreads starts it.
+  bool CreateHostThread(GuestThread& Slot) {
+    Slot.Owner = this;
+    Slot.BornNs = MonotonicNs();
+    if (R_FAILED(threadCreate(&Slot.Host, &GuestThreadEntry, &Slot, nullptr, GuestHostStackSize, GuestThreadPriority, -2))) return false;
+    Slot.HostCreated = true;
+    SpreadOverCores(Slot.Host);
+    if (Serving && !StartHostThread(Slot)) {
+      threadClose(&Slot.Host);
+      Slot.HostCreated = false;
+      return false;
+    }
+    return true;
+  }
+
+  // Reuse is the slot of the exec'ing thread: its host thread carries on as the new image's main thread.
+  bool AddThread(ContextType& Context, FEXCore::Core::CPUState& State, uint32_t TID, uint64_t ClearTid, uint32_t PID,
+                 GuestThread* Reuse = nullptr) {
+    const auto Found = std::find_if(Threads.begin(), Threads.end(), [](const auto& Thread) { return !Thread.Core && Thread.HostState == GuestThread::HostRun::None; });
+    GuestThread* Slot = Reuse;
+    if (!Slot) {
+      auto Free = Found;
+      if (Free == Threads.end()) {
+        // Slots of finished host threads are only freed once joined: do that now rather than refuse the thread.
+        ReapFinishedThreads();
+        Free = std::find_if(Threads.begin(), Threads.end(), [](const auto& Thread) { return !Thread.Core && Thread.HostState == GuestThread::HostRun::None; });
+      }
+      if (Free == Threads.end()) return false;
+      Slot = &*Free;
+    }
     constexpr auto Size = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
     Slot->ReturnStack.reset(std::aligned_alloc(GuestPageSize, Size));
     if (!Slot->ReturnStack) return false;
@@ -1645,30 +2309,66 @@ private:
       Slot->IoContext = Current->IoContext;
       Slot->Seccomp = Current->Seccomp; // fork and clone inherit the filters
     }
+    if (!Reuse && !CreateHostThread(*Slot)) {
+      DestroyCore(*Slot);
+      ResetSlot(*Slot);
+      return false;
+    }
     return true;
   }
 
+  // The guest thread of the current slot runs until it needs the runtime again: a syscall (HandleSyscall, which
+  // jumps back to here when the thread must leave the JIT), or a poll that preemption or a stop request set. The
+  // lock is held on entry and on return, and not while guest code runs.
   void Dispatch(ContextType& Context) {
-    auto* Frame = Current->Core->CurrentFrame;
+    auto& Slot = *Current;
+    auto* Frame = Slot.Core->CurrentFrame;
     // The syscall trampoline spills the guest registers. Its host call/return
     // cache is dispensable and may contain entries invalidated by another guest thread.
-    Frame->State.callret_sp = Current->ReturnStackTop;
+    Frame->State.callret_sp = Slot.ReturnStackTop;
     Frame->InSyscallInfo = 0;
-    OpenPreemptWindow();
-    if (setjmp(ReturnToHost) == 0) {
-      Context.ExecuteThread(Current->Core);
+    std::jmp_buf Return;
+    auto* const Previous = HostReturn;
+    HostReturn = &Return;
+    if (setjmp(Return) == 0) {
+      Slot.GuestSince = MonotonicNs();
+      BeginGuest(Slot);
+      ReleaseRuntime(); // also asks the thread to leave again at once when a stop is already due
+      Context.ExecuteThread(Slot.Core);
+      HostSyscallNumber = -1;
+      LockSite = 2;
+      LockRuntime();
+      LockSite = 0;
+      LeftGuest(Slot);
+      Enter(Slot);
       if (!ResumeAfterPreemption()) {
         DispatchFailed = true;
         PrintStage("Dispatcher returned before the guest reached its syscall.");
+      } else {
+        // Horizon does not time-slice host threads of one priority: give the core up, to a thread that waits for one or
+        // to another core, before running guest code again. A process that runs one thread at a time must give its
+        // sibling time to take the lock first.
+        const bool Serial = Task->SerialGuest;
+        if (Serial) Task->SerialYielder = Slot.TID;
+        // The stop was a quantum's (more threads want a core than there are) or a stop request's: only the first
+        // needs the core given up, and only while that is still so.
+        if (Serial || CoresOversubscribed()) {
+          ReleaseRuntime();
+          const auto YieldStart = MonotonicNs();
+          svcSleepThread(Serial ? 100'000 : -1);
+          Slot.YieldNs += MonotonicNs() - YieldStart;
+          LockRuntime();
+          Enter(Slot);
+        }
       }
     }
-    ClosePreemptWindow();
+    HostReturn = Previous;
   }
 
   // ExecuteThread returned through a preemption poll: the stop handler has
   // spilled the guest registers, and the poll stored the host address of the
-  // entry point or backward-branch target it stopped at. OpenPreemptWindow
-  // clears that word, so any other stop leaves it 0. Rebuild the guest RIP.
+  // entry point or backward-branch target it stopped at. BeginGuest/LeftGuest
+  // clear that word, so any other stop leaves it 0. Rebuild the guest RIP.
   bool ResumeAfterPreemption() {
     auto* Thread = Current->Core;
     const auto Target = PollWord(Thread, FEXCore::Core::InterruptPollTargetOffset).load(std::memory_order_relaxed);
@@ -1680,6 +2380,7 @@ private:
     }
     Thread->CurrentFrame->State.rip = RIP;
     ++Preempt.Switches;
+    if (Task->Profile) ++Task->ProfileSamples[RIP];
     if (Logging == LogLevel::Trace) {
       char Message[96];
       std::snprintf(Message, sizeof(Message), "Preempted tid=%u at rip=%#llx", Current->TID, static_cast<unsigned long long>(RIP));
@@ -1688,46 +2389,40 @@ private:
     return true;
   }
 
-  // Publishes the thread about to run and what the watchdog needs to decide
-  // whether it must yield.
-  void OpenPreemptWindow() {
-    PollWord(Current->Core, FEXCore::Core::InterruptPollTargetOffset).store(0, std::memory_order_relaxed);
+  // The slot's thread goes into guest code (its Dispatch, or the return of a syscall) and the lock is about to be given
+  // back: publishes it to the watchdog, which decides when it has run long enough to yield. GuestSince is the time of
+  // the Dispatch, so a thread that makes many syscalls is still preempted a quantum after it was dispatched.
+  void BeginGuest(GuestThread& Slot) {
+    PollWord(Slot.Core, FEXCore::Core::InterruptPollTargetOffset).store(0, std::memory_order_relaxed);
+    PollWord(Slot.Core, FEXCore::Core::InterruptPollRequestOffset).store(0, std::memory_order_relaxed);
     mutexLock(&Preempt.Lock);
-    Preempt.Running = Current->Core;
-    Preempt.RunningSince = MonotonicNs();
+    Preempt.Entries[&Slot - Threads.data()] = {Slot.Core, Slot.GuestSince, false, Processes.at(Slot.PID).SerialGuest,
+                                               Processes.at(Slot.PID).Profile};
+    Slot.CoresSeen |= 1u << svcGetCurrentProcessorNumber();
+    ++Slot.Dispatches;
+    if (!Slot.FirstGuestNs) Slot.FirstGuestNs = MonotonicNs();
+    Slot.EnteredNs = MonotonicNs();
+    if (auto& Owner = Processes.at(Slot.PID); Owner.SerialYielder != Slot.TID) Owner.SerialYielder = 0; // the turn passed on
+    Slot.StopArmed = false;
     mutexUnlock(&Preempt.Lock);
-    RefreshPreemptHints();
+    Slot.HostState = GuestThread::HostRun::InGuest;
   }
 
-  // Ready() may complete another thread's wait; that thread runs on the next
-  // scheduler pass anyway. Called again after every syscall, since a syscall
-  // can make another thread or process ready.
-  void RefreshPreemptHints() {
-    bool Other {};
-    uint64_t NextDeadline {};
-    for (auto& Thread : Threads) {
-      if (&Thread == Current || !Thread.Core || Thread.Exited) continue;
-      if (Ready(Thread)) Other = true;
-      if (Thread.Deadline) NextDeadline = NextDeadline ? std::min(NextDeadline, Thread.Deadline) : Thread.Deadline;
-    }
-    if (const auto Timer = NextTimerDeadline()) NextDeadline = NextDeadline ? std::min(NextDeadline, Timer) : Timer;
-    mutexLock(&Preempt.Lock);
-    Preempt.NextDeadline = NextDeadline;
-    Preempt.Hints = {};
-    Preempt.Hints.OtherRunnable = Other;
-    // The console's line discipline turns Ctrl+C, Ctrl+Z and Ctrl+\ into
-    // signals whether or not a thread reads the terminal, so a busy loop
-    // with no reader (a shell's own `while :; do :; done`) must still return
-    // to the scheduler to poll the keyboard.
-    Preempt.Hints.TerminalInput = Interactive || Service;
-    mutexUnlock(&Preempt.Lock);
+  // The slot's thread is back from guest code and holds the lock again. Nothing that waits for it to leave
+  // guest code (StopThreads) may wait longer.
+  void LeftGuest(GuestThread& Slot) {
+    if (Slot.EnteredNs) Slot.InGuestNs += MonotonicNs() - Slot.EnteredNs;
+    Slot.EnteredNs = 0;
+    Slot.HostState = GuestThread::HostRun::Ready;
+    ClosePreemptWindow(Slot);
+    NotifyQuiesce();
   }
 
-  void ClosePreemptWindow() {
+  void ClosePreemptWindow(GuestThread& Slot) {
     mutexLock(&Preempt.Lock);
-    if (Preempt.Running) PollWord(Preempt.Running, FEXCore::Core::InterruptPollRequestOffset).store(0, std::memory_order_relaxed);
-    Preempt.Armed = false;
-    Preempt.Running = nullptr;
+    Preempt.Entries[&Slot - Threads.data()] = {};
+    PollWord(Slot.Core, FEXCore::Core::InterruptPollRequestOffset).store(0, std::memory_order_relaxed);
+    Slot.StopArmed = false;
     mutexUnlock(&Preempt.Lock);
   }
 
@@ -1740,11 +2435,31 @@ private:
   }
 
   struct GuestProcess;
-  // CPU time the running thread has used in its current quantum; the scheduler only adds it to
-  // the stored ticks once the guest returns.
-  uint64_t LiveTicks() const { return InDispatch ? CurrentThreadTicks() - QuantumStart : 0; }
-  uint64_t ProcessTicks(const GuestProcess& Process) const { return Process.CpuTicks + (&Process == Task ? LiveTicks() : 0); }
-  uint64_t ThreadTicks(const GuestThread& Thread) const { return Thread.CpuTicks + (&Thread == Current ? LiveTicks() : 0); }
+  // The private pages a fork group shares one address view for: Resident is the PID whose private pages are
+  // in memory now. A process with its own view (spawn, exec) is always its own Resident.
+  struct MemoryView {
+    uint32_t Resident {};
+  };
+  // CPU time a slot's thread has used in its current dispatch; it is only added to the stored ticks once the
+  // dispatch ends. The running slot reads its own host thread; another slot in guest code is read through its host
+  // thread's handle (the kernel may count the quantum in progress late, so this can lag a little).
+  uint64_t LiveTicks(const GuestThread& Slot) const {
+    if (!Slot.DispatchStartTicks) return 0;
+    u64 Ticks {};
+    if (&Slot == Current) Ticks = CurrentThreadTicks();
+    else if (Slot.HostCreated && Slot.HostState == GuestThread::HostRun::InGuest) {
+      svcGetInfo(&Ticks, InfoType_ThreadTickCount, Slot.Host.handle, TickCountInfo_Total);
+    } else return 0;
+    return Ticks > Slot.DispatchStartTicks ? Ticks - Slot.DispatchStartTicks : 0;
+  }
+  uint64_t ProcessTicks(const GuestProcess& Process) const {
+    auto Total = Process.CpuTicks;
+    for (const auto& Slot : Threads) {
+      if (Slot.Core && Slot.PID == Process.PID) Total += LiveTicks(Slot);
+    }
+    return Total;
+  }
+  uint64_t ThreadTicks(const GuestThread& Thread) const { return Thread.CpuTicks + LiveTicks(Thread); }
   uint64_t ProcessCpuNs(const GuestProcess& Process) const { return armTicksToNs(ProcessTicks(Process)); }
   uint64_t ThreadCpuNs(const GuestThread& Thread) const { return armTicksToNs(ThreadTicks(Thread)); }
 
@@ -1765,8 +2480,11 @@ private:
     // Like Linux do_wait or pipe_read, a woken blocking call rescans before
     // it checks for signals: the syscall reruns first and a pending signal
     // is delivered when it completes or blocks again.
+    // Only once: like pipe_read, the rescan that finds nothing returns -ERESTARTSYS for the pending signal instead of
+    // sleeping again. (Sending a signal moves IOEpoch, so without the limit every new signal or epoch change by another
+    // thread would rescan again and the signal would never be delivered.)
     if ((Thread.Waiting == WaitKind::IO || Thread.Waiting == WaitKind::Net || Thread.Waiting == WaitKind::Terminal || Thread.Waiting == WaitKind::Lock) &&
-        Thread.WaitAddress != IOEpoch && HasActionableSignal(Thread)) {
+        Thread.WaitAddress != IOEpoch && HasActionableSignal(Thread) && !Thread.SignalRerunDone) {
       Thread.Waiting = WaitKind::None;
       Thread.RerunBeforeSignals = true;
       return true;
@@ -3750,7 +4468,24 @@ private:
     std::array<FEXCore::Core::CPUState::gdt_segment, 32> GDT {};
     // Only fork descendants can share a private host address view. Exec
     // builds a fresh address space with independently owned backing.
-    std::shared_ptr<const uint8_t> ForkView {std::make_shared<const uint8_t>(0)};
+    std::shared_ptr<MemoryView> ForkView {std::make_shared<MemoryView>()};
+    // Task 1B runs the process's threads one at a time (<program>.single-thread). Inherited by fork and clone
+    // children and kept across exec.
+    bool SerialGuest {};
+    bool NoTso {}; // EXPERIMENT: the session's .no-tso sidecar; its processes' contexts translate without TSO
+    bool Profile {}; // EXPERIMENT: the session's .profile sidecar: guest RIP samples per process
+    std::unordered_map<uint64_t, uint32_t> ProfileSamples;
+    // SerialGuest: the thread that gave up guest code (yield, preemption) waits until a sibling that was waiting for its
+    // turn has run, so the turn passes on instead of going back to the thread that left.
+    uint32_t SerialYielder {};
+    // Task 1B: how many holders keep the process's threads out of guest code (StopThreads) and how many need its
+    // memory to stay in place (a view swap waits for them). Retiring: one thread tears the process down; Retired:
+    // it is done, and a reaped process can leave the table. ExecBy: the thread whose execve is pending.
+    uint32_t StopRequests {};
+    uint32_t Pins {};
+    bool Retiring {};
+    bool Retired {};
+    GuestThread* ExecBy {};
     // The directory state (cwd, umask) a CLONE_FS child shares with its parent.
     std::shared_ptr<FsState> Fs {std::make_shared<FsState>()};
     bool NoNewPrivileges {};
@@ -4538,6 +5273,8 @@ private:
     Features.SupportsAtomics = true;
     Features.SupportsRCPC = true;
     Features.SupportsTSOImm9 = true;
+    // FEX reads its configuration when it creates the context.
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_TSOENABLED, Process.NoTso ? "0" : "1");
     Process.Context = ContextType::CreateNewContext(Features);
     Process.Context->SetSignalDelegator(&Process.Signals);
     Process.Context->SetSyscallHandler(this);
@@ -4576,39 +5313,78 @@ private:
     });
   }
 
-  bool ActivateProcess(uint32_t PID) {
-    if (Task->PID != PID) {
-      SuspendPipePages(*Task);
-      if (!Task->Exited && Task->ForkView.use_count() > 1) {
-        if (!Task->Memory.SavePrivatePages(ValidateSnapshotRange)) return false;
-        Task->RestorePending = true;
-      }
-      Task = &Processes.at(PID);
-      if (Task->RestorePending) {
-        Task->Memory.RestorePrivatePages();
-        Task->RestorePending = false;
-      }
-      for (const auto& Weak : Task->PrivatePipePages) {
-        if (const auto Pin = Weak.lock()) Pin->Suspended = false;
-      }
-      std::erase_if(Processes, [&](const auto& Item) { return Item.second.Reaped && &Item.second != Task; });
+  // Puts the private pages of process PID into memory when its fork group's view holds another process's. A
+  // process with its own view is always resident, so this does nothing for it. Every thread of the resident process
+  // must be out of guest code (EnsureResident arranges that). Only a page swap makes the live pipe pages wrong, so the
+  // resident process's are suspended here and the new process's are live again; processes with separate views
+  // keep their memory in place.
+  bool SwapView(uint32_t PID) {
+    auto& Next = Processes.at(PID);
+    auto& View = *Next.ForkView;
+    if (View.Resident == PID) return true;
+    // The resident process saves its pages only while it is live and still shares the view (exec leaves the group).
+    if (const auto Resident = Processes.find(View.Resident);
+        Resident != Processes.end() && !Resident->second.Exited && Resident->second.ForkView == Next.ForkView &&
+        Next.ForkView.use_count() > 1) {
+      SuspendPipePages(Resident->second);
+      if (!Resident->second.Memory.SavePrivatePages(ValidateSnapshotRange)) return false;
+      Resident->second.RestorePending = true;
     }
-    if (!Task->HasDispatched) {
-      if (Task->Image) ProcessCheckpoint("Replacement image entering dispatch");
-      else if (PID == ProcessID) ProcessCheckpoint("Initial image entering dispatch");
-      else ProcessCheckpoint("Child private memory restored, entering dispatch");
-      Task->HasDispatched = true;
+    if (Next.RestorePending) {
+      Next.Memory.RestorePrivatePages();
+      Next.RestorePending = false;
     }
+    for (const auto& Weak : Next.PrivatePipePages) {
+      if (const auto Pin = Weak.lock()) Pin->Suspended = false;
+    }
+    View.Resident = PID;
     return true;
   }
 
-  void RetireProcess(uint32_t PID) {
-    for (auto& Thread : Threads) {
-      if (!Thread.Core || Thread.PID != PID) continue;
-      Thread.Core->CTX->DestroyThread(Thread.Core);
-      Thread = {};
+  // Tears an exited process down: its threads, memory and context. It runs on the host thread of one of the process's
+  // slots (RetireProcess is only reached once). The other threads are held out of guest code and end on their own host
+  // threads, each destroying its Core; the memory and the context go once every Core is gone, since a Core must not
+  // outlive either. This slot's own Core goes here, it does not return to guest code.
+  // EXPERIMENT (.profile): the process's guest RIP samples, by file and by block, hottest first.
+  static void LogProfile(const GuestProcess& Process) {
+    if (Process.ProfileSamples.empty()) return;
+    uint64_t Total = 0;
+    std::map<std::string, uint64_t> Files;
+    std::vector<std::pair<uint64_t, uint32_t>> Blocks(Process.ProfileSamples.begin(), Process.ProfileSamples.end());
+    for (const auto& [RIP, Count] : Blocks) {
+      Total += Count;
+      const auto* Mapping = FindTraceMapping(RIP);
+      Files[Mapping && !Mapping->Path.empty() ? Mapping->Path : std::string {"(anonymous)"}] += Count;
     }
+    std::sort(Blocks.begin(), Blocks.end(), [](const auto& A, const auto& B) { return A.second > B.second; });
+    char Line[384];
+    std::snprintf(Line, sizeof(Line), "Profile of process %u: %llu samples", Process.PID, static_cast<unsigned long long>(Total));
+    WriteLog(Line);
+    for (const auto& [File, Count] : Files) {
+      std::snprintf(Line, sizeof(Line), "Profile file %s: %llu samples", File.c_str(), static_cast<unsigned long long>(Count));
+      WriteLog(Line);
+    }
+    for (size_t Index = 0; Index < Blocks.size() && Index < 40; ++Index) {
+      const auto [RIP, Count] = Blocks[Index];
+      const auto* Mapping = FindTraceMapping(RIP);
+      std::snprintf(Line, sizeof(Line), "Profile block %#llx: %u samples, %s+%#llx", static_cast<unsigned long long>(RIP), Count,
+                    Mapping && !Mapping->Path.empty() ? Mapping->Path.c_str() : "(anonymous)",
+                    static_cast<unsigned long long>(Mapping ? RIP - Mapping->Start + Mapping->Offset : RIP));
+      WriteLog(Line);
+    }
+  }
+
+  void RetireProcess(uint32_t PID) {
     auto& Process = Processes.at(PID);
+    Process.Retiring = true;
+    LogProfile(Process);
+    auto* const Self = Current;
+    ProcessStop Hold(*this, PID, Self, 0, true);
+    for (auto& Thread : Threads) {
+      if (Thread.Core && Thread.PID == PID) MarkSlotExited(Thread);
+    }
+    WaitForCoresGone(PID, Self);
+    if (Self && Self->PID == PID) DestroyCore(*Self);
     Process.PendingDescriptors.reset();
     for (auto It = FlockHolders.begin(); It != FlockHolders.end();) {
       std::erase_if(It->second, [](const auto& Weak) { return Weak.expired(); });
@@ -4623,6 +5399,7 @@ private:
     Process.InheritedImages.clear();
     Process.Image.reset();
     Process.Context.reset();
+    Process.Retired = true;
     ++IOEpoch;
   }
 
@@ -4718,6 +5495,7 @@ private:
     uint32_t ExitSignal {SigChld};
   };
   std::optional<ForkRequest> PendingFork;
+  GuestThread* PendingForkBy {}; // the slot whose clone is pending: its host loop completes it, with the lock held all along
 
   int64_t CloneGuest(CoreFrame* Frame, uint64_t Flags, uint64_t Stack, uint64_t ParentTid, uint64_t ChildTid, uint64_t TLS) {
     if ((Flags & ClonePidfd) && (Flags & CloneThread_)) return Invalid;
@@ -4805,15 +5583,24 @@ private:
     if ((Flags & ClonePidfd) && Available(Request.PidfdAddress, PF_W) < sizeof(int32_t)) return Fault;
     if ((Flags & CloneSettls) && !IsGuestUserRange(Request.TLS, 1)) return -1;
     if (NprocExceeded()) return -11;
-    if (Processes.size() >= Threads.size()) return -11;
+    // Reaped entries linger until their retirement finishes; they hold no slot.
+    if (static_cast<size_t>(std::count_if(Processes.begin(), Processes.end(), [](const auto& Item) { return !Item.second.Reaped; })) >=
+        Threads.size())
+      return -11;
     if (Current->Sched.Policy == Switch2Guest::Sched::Deadline && !Current->Sched.ResetOnFork) return -11; // sched_fork: EAGAIN
     PendingFork = Request;
+    PendingForkBy = Current;
     return RetrySyscall;
   }
 
   void CompleteFork() {
     const auto Request = *PendingFork;
     PendingFork.reset();
+    // The snapshot of the parent's memory must be one state: the process's other threads leave guest code for it
+    // (this is a no-op for a single-threaded process) and its memory stays in place.
+    auto* const Self = Current;
+    ProcessStop Hold(*this, Task->PID, Self, 0, true);
+    if (Self->Exited) return; // killed meanwhile: it never sees the result
     auto* Frame = Current->Core->CurrentFrame;
     const auto Result = ForkGuest(Frame, Request); // the child's global process number, or an error
     Frame->State.gregs[FEXCore::X86State::REG_RAX] = Result > 0 ? PidOut(static_cast<uint32_t>(Result)) : Result;
@@ -4878,7 +5665,10 @@ private:
     Child.ShmAttached = Task->ShmAttached;
     if (Flags & 0x40000) Child.SemUndo = Task->SemUndo;
     Child.GDT = Task->GDT;
-    Child.ForkView = Task->ForkView;
+    Child.ForkView = Task->ForkView; // Resident stays the parent until the first swap to the child
+    Child.SerialGuest = Task->SerialGuest;
+    Child.NoTso = Task->NoTso;
+    Child.Profile = Task->Profile;
     Child.RestorePending = true;
     if (Flags & CloneFiles) Child.PendingDescriptors = Current->Descriptors; // one table, two processes
     else *Child.PendingDescriptors = Descriptors();
@@ -4910,7 +5700,7 @@ private:
       Processes.erase(PID);
       return -11;
     }
-    const auto Thread = std::find_if(Threads.begin(), Threads.end(), [PID](const auto& Entry) { return Entry.TID == PID; });
+    const auto Thread = std::find_if(Threads.begin(), Threads.end(), [PID](const auto& Entry) { return Entry.Core && Entry.TID == PID; });
     if (Flags & ChildSetTid) Thread->SetTidOnStart = ChildTid;
     Thread->AltStack = Current->AltStack; // fork keeps sigaltstack; new threads do not
     Switch2Guest::Sched::ForkInherit(Thread->Sched, Child.Nice);
@@ -4920,8 +5710,7 @@ private:
       // Installed after the child copied the descriptor table, as in Linux.
       const auto Pidfd = OpenPidfd(PID, 0);
       if (Pidfd < 0) {
-        Thread->Core->CTX->DestroyThread(Thread->Core);
-        *Thread = {};
+        AbandonSlot(*Thread); // its host thread has not run (the lock is held) and ends on its own
         ChildNs.Pid->Release(PID);
         Processes.erase(PID); // owns the context the thread used
         return Pidfd;
@@ -4937,7 +5726,7 @@ private:
   static uint64_t TicksToMicroseconds(uint64_t Ticks) { return armTicksToNs(Ticks) / 1000; }
 
   // struct rusage: only ru_utime is measured (guest CPU time); the
-  // cooperative runtime has no system time, page faults or context switches.
+  // runtime has no system time, page faults or context switches.
   int64_t CopyUsage(uint64_t Address, uint64_t Ticks) {
     std::array<uint64_t, 18> Usage {};
     const auto Microseconds = TicksToMicroseconds(Ticks);
@@ -4973,7 +5762,10 @@ private:
                                  Child.CpuTicks + Child.ChildTicks};
         if (!Keep) {
           Task->ChildTicks += Child.CpuTicks + Child.ChildTicks;
-          Processes.erase(It);
+          // A child whose threads are still being torn down on their host threads stays in the table until that is done
+          // (they look it up); Enter drops it afterwards.
+          if (Child.Retired) Processes.erase(It);
+          else Child.Reaped = true;
         }
         return Report;
       }
@@ -5143,7 +5935,36 @@ private:
 
   // n_tty isig: the terminal's signal goes to its foreground process group.
   void SignalForeground(const GuestTty& Tty, uint32_t Signal) {
+    if (Tty.Foreground && Signal == SigInt) LogGroupThreads(Tty.Foreground);
     if (Tty.Foreground) SignalGroup(Tty.Foreground, Signal);
+  }
+
+  // Ctrl+C at Detailed level: what every thread of the foreground group was doing, so a run that seems stuck shows
+  // whether its threads wait (and for what) or run.
+  void LogGroupThreads(uint32_t Group) {
+    if (Logging == LogLevel::Standard) return;
+    static constexpr const char* Waits[] = {"run", "futex", "io", "terminal", "lock", "sleep", "signal", "vfork", "net"};
+    static constexpr const char* Hosts[] = {"none", "starting", "ready", "blocked", "in-guest", "finished"};
+    const auto Now = MonotonicNs();
+    char Line[256];
+    std::snprintf(Line, sizeof(Line), "Ctrl+C: group %u, %d host threads want a core", Group,
+                  GuestThreadsWantingCore.load(std::memory_order_relaxed));
+    WriteLog(Line);
+    for (const auto& Thread : Threads) {
+      if (!Thread.Core) continue;
+      const auto& Owner = Processes.at(Thread.PID);
+      if (Owner.Group != Group) continue;
+      std::snprintf(Line, sizeof(Line),
+                    "  tid %u pid %u: %s, host %s, wait address 0x%llx, deadline %lld ms, cpu %llu ms, rip 0x%llx, exited %d, "
+                    "process stop requests %u",
+                    Thread.TID, Thread.PID, Waits[static_cast<int>(Thread.Waiting)], Hosts[static_cast<int>(Thread.HostState)],
+                    static_cast<unsigned long long>(Thread.WaitAddress),
+                    Thread.Deadline ? static_cast<long long>(Thread.Deadline - Now) / 1'000'000 : -1LL,
+                    static_cast<unsigned long long>(ThreadCpuNs(Thread) / 1'000'000),
+                    static_cast<unsigned long long>(Thread.Core->CurrentFrame->State.rip), Thread.Exited ? 1 : 0,
+                    static_cast<unsigned>(Owner.StopRequests));
+      WriteLog(Line);
+    }
   }
 
   // session_clear_tty: no process of Session has Tty as its controlling terminal any more.
@@ -5381,7 +6202,7 @@ private:
   }
 
   // getpriority/setpriority. Nice values are stored and reported; the
-  // cooperative scheduler does not weight threads by them.
+  // runtime does not weight threads by them (Horizon schedules the host threads).
   template<typename F>
   int64_t ForPriorityTargets(uint64_t Which, uint64_t Who, F&& Visit) {
     if (Which > 2) return Invalid;
@@ -5529,11 +6350,22 @@ private:
           !Request.Interpreter.Interpreter.empty()) return -80; // ELIBBAD
     }
     Task->PendingExec = std::move(Request);
+    Task->ExecBy = Current;
     return 0;
   }
 
   bool InstallExec() {
     const auto PID = Task->PID;
+    // The other threads of the process leave guest code and stay out of it (they are about to end), and the
+    // process's memory stays in place meanwhile. This host thread goes on as the new image's main thread.
+    auto* const Self = Current;
+    ProcessStop Hold(*this, PID, Self, 0, true);
+    // The process was killed while this thread waited for the others: it ends, and its Core with it.
+    if (Self->Exited) {
+      Task->PendingExec.reset();
+      Task->ExecBy = nullptr;
+      return true;
+    }
     auto* OldThread = Current->Core;
     FEXCore::Core::CPUState State {};
     const auto Mask = Current->SignalMask;
@@ -5563,11 +6395,18 @@ private:
     // The dispatcher is process infrastructure. Keep its native mapping
     // published across exec, but clear all translations for the old image.
     OldThread->CTX->ClearCodeCache(OldThread, false);
+    // Each other thread's own host thread destroys its Core (a Core is only destroyed by its slot's thread); the
+    // old image's memory goes only after that. This slot keeps its host thread.
     for (auto& Thread : Threads) {
-      if (!Thread.Core || Thread.PID != PID) continue;
-      Thread.Core->CTX->DestroyThread(Thread.Core);
-      Thread = {};
+      if (Thread.Core && Thread.PID == PID && &Thread != Self) MarkSlotExited(Thread);
     }
+    if (!WaitForCoresGone(PID, Self, true)) {
+      Task->PendingExec.reset();
+      Task->ExecBy = nullptr;
+      return true;
+    }
+    DestroyCore(*Self);
+    ResetSlotKeepHost(*Self);
     Current = nullptr;
     SuspendPipePages(*Task, 0, UINT64_MAX, true);
     InitializeExecCPU(*Task, State);
@@ -5576,7 +6415,8 @@ private:
     Task->LockFuture = false;
     Task->MembarrierRegistered = 0;
     Task->ShmAttached.clear(); // exec detaches every segment; SEM_UNDO adjustments survive it
-    Task->ForkView = std::make_shared<const uint8_t>(0);
+    Task->ForkView = std::make_shared<MemoryView>();
+    Task->ForkView->Resident = Task->PID;
     Task->RestorePending = false;
     Task->HeapStart = Task->HeapEnd = 0;
     Task->Image = std::make_shared<ExecImage>(std::move(*Task->PendingExec));
@@ -5589,6 +6429,7 @@ private:
       std::memcpy(Task->Name.data(), Base.data(), std::min<size_t>(Base.size(), Task->Name.size() - 1));
     }
     Task->PendingExec.reset();
+    Task->ExecBy = nullptr;
     Task->InheritedImages.clear();
     for (size_t FD = 0; FD < Descriptors().Files.size(); ++FD) {
       if (Descriptors().Flags[FD]) CloseGuest(FD);
@@ -5614,12 +6455,19 @@ private:
     }
     State.rip = Image.Interpreter.Entry ? Image.Interpreter.Entry : Image.Program.Entry;
     const auto Base = CreateStack(MainStackSize);
-    if (!Base) return false;
+    if (!Base) {
+      Self->Exited = true;
+      return false;
+    }
     State.gregs[FEXCore::X86State::REG_RSP] =
       BuildInitialStack(Base, Image.Path, Image.Arguments, Image.Environment, &Image.Program, Image.Interpreter.Base,
                         Switch2Guest::AuxvIds(Task->Creds));
-    if (!AddThread(*Task->Context, State, PID, 0, PID)) return false;
-    const auto Thread = std::find_if(Threads.begin(), Threads.end(), [PID](const auto& Entry) { return Entry.TID == PID; });
+    if (!AddThread(*Task->Context, State, PID, 0, PID, Self)) {
+      Self->Exited = true;
+      return false;
+    }
+    const auto Thread = Self;
+    Current = Self;
     Thread->SignalMask = Mask;
     Thread->Pending = std::move(Pending);
     Thread->Sched = KeptSched; // exec keeps the scheduling policy, CPU mask and I/O priority
@@ -7076,7 +7924,7 @@ private:
     });
     if (Process || Last) ExitProcess(0, Signal);
     else ExitThread();
-    std::longjmp(ReturnToHost, 1);
+    ReturnToHostLoop();
   }
 
   // seccomp(2) and prctl(PR_SET_SECCOMP). USER_NOTIF notification fds are not implemented: the flag
@@ -17048,13 +17896,21 @@ private:
       Address = Run.Size ? Run.Start + Run.Size : (Address & ~(GuestPageSize - 1)) + GuestPageSize;
     }
     if (!Invalidate) return;
+    ThreadPerf.Invalidations.fetch_add(1, std::memory_order_relaxed);
     // Each process has its own FEX context and code buffers.
     auto* Context = Owner->Context ? Owner->Context.get() : Frame->Thread->CTX;
-    std::unique_lock Lock {Context->GetCodeInvalidationMutex()};
-    Context->InvalidateCodeBuffersCodeRange(Start, Size);
-    for (const auto& Guest : Threads) {
-      if (Guest.Core && Guest.PID == Owner->PID) Context->InvalidateThreadCachedCodeRange(Guest.Core, Start, Size);
+    // A sibling may be compiling with the mutex held shared and waiting for MapLock in QueryGuestExecutableRange:
+    // drop MapLock while the mutex is wanted or held. Nothing here changes what MapLock guards.
+    const bool HadMap = mutexIsLockedByCurrentThread(&MapLock);
+    if (HadMap) mutexUnlock(&MapLock);
+    {
+      std::unique_lock Lock {Context->GetCodeInvalidationMutex()};
+      Context->InvalidateCodeBuffersCodeRange(Start, Size);
+      for (const auto& Guest : Threads) {
+        if (Guest.Core && Guest.PID == Owner->PID) Context->InvalidateThreadCachedCodeRange(Guest.Core, Start, Size);
+      }
     }
+    if (HadMap) mutexLock(&MapLock);
   }
 
   // A runtime store into guest memory (read, recv, process_vm_writev) may land
@@ -17884,7 +18740,10 @@ private:
   std::string RootPath;
   std::array<GuestThread, GuestThreadCount> Threads {};
   GuestThread* Current {};
-  std::jmp_buf ReturnToHost;
+  Mutex RuntimeLock {};
+  Mutex MapLock {};
+  uint64_t ServiceSleepUntil {};  // when the sleeping service thread wakes by itself (0: it is awake)
+  bool ServiceNetPolling {};      // it sleeps 1 ms at a time, polling host sockets  // the guest memory maps and the slot table, for FEX's compile-time queries (see LockRuntime)
   uint64_t ExitStatus {};
   mutable uint64_t IOEpoch {};
   uint32_t NextTid {ProcessID + 1};
@@ -17946,9 +18805,6 @@ private:
   // Guest CLOCK_REALTIME: the Horizon RTC second at startup, then real elapsed time. Process-global
   // for this launch; clock_settime and friends change it, never Horizon's clock, and it is not persisted.
   Switch2Guest::RealtimeBase Realtime {static_cast<int64_t>(time(nullptr)) * 1'000'000'000, MonotonicNs()};
-  // The running quantum of the guest thread: its thread tick count when the dispatch began.
-  uint64_t QuantumStart {};
-  bool InDispatch {};
   // settimeofday's timezone (gettimeofday reports it) and the NTP state adjtimex reads and writes.
   int32_t TimezoneMinutesWest {}, TimezoneDstTime {};
   struct NtpState {

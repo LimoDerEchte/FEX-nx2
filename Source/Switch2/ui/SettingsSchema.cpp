@@ -116,6 +116,9 @@ std::vector<SettingDef> BuildSchema() {
     D.PickerTitle = "Choose an ELF file";
     D.PickerStart = "fex";
     S.push_back(D);
+    D = Dev("final_pass", "Final Pass Suite", "Runs every suite a milestone's final pass needs and adds up the results", "Run");
+    D.ShownWhenFile = "sdmc:/fex/games/final-pass-suite.elf";
+    S.push_back(D);
   }
   return S;
 }

@@ -182,6 +182,8 @@ void SettingsScreen::BuildRows() {
   Items.back()->IconStroke = 2.0f;
 
   for (const SettingDef& D : Schema) {
+    if (!D.ShownWhenFile.empty() && !Be.GetStorage().Exists(D.ShownWhenFile))
+      continue;
     RowInfo Info;
     Info.Def = &D;
     Info.Section = int(std::find(Sections.begin(), Sections.end(), D.Section) - Sections.begin());

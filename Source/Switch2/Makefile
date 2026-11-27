@@ -595,9 +595,9 @@ FILESYSTEM_TEST_DIR ?= $(BUILD)/guest/sd
 # Stages only test programs, sidecars and helper scripts into
 # $(FILESYSTEM_TEST_DIR)/fex/games: nothing that would overwrite the installed
 # Ubuntu RootFS. The folder is removed first so stale files disappear.
-filesystem-runtime: $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf $(BUILD)/pty-suite-debian.elf
+filesystem-runtime: $(BUILD)/op-bench-debian.elf $(BUILD)/final-pass-suite-debian.elf $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf $(BUILD)/pty-suite-debian.elf $(BUILD)/thread-suite-debian.elf
 	rm -rf "$(FILESYSTEM_TEST_DIR)/fex"
-	python3 tools/StageDebian.py --games "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 1,3,$^) --filesystem-probe $(word 4,$^) --fs-suite $(word 5,$^) --name-limit-probe $(word 6,$^) --proc-suite $(word 7,$^) --process-acceptance $(word 8,$^) --comm-suite $(word 9,$^) --comm-acceptance $(word 10,$^) --container-suite $(word 11,$^) --container-acceptance $(word 12,$^) --pty-suite $(word 13,$^)
+	python3 tools/StageDebian.py --games "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 3,5,$^) --filesystem-probe $(word 6,$^) --fs-suite $(word 7,$^) --name-limit-probe $(word 8,$^) --proc-suite $(word 9,$^) --process-acceptance $(word 10,$^) --comm-suite $(word 11,$^) --comm-acceptance $(word 12,$^) --container-suite $(word 13,$^) --container-acceptance $(word 14,$^) --pty-suite $(word 15,$^) --thread-suite $(word 16,$^) --op-bench $(word 1,$^) --final-pass-suite $(word 2,$^)
 
 # Filesystem compatibility suite: the Debian guest ELF and a native reference
 # run on the host kernel, as the current user and, where user namespaces
@@ -682,6 +682,34 @@ check-pty-suite-native: $(BUILD)/pty-suite-host
 		echo "Skipping the Debian glibc run: no debian-sysroot (make debian-sysroot)"; \
 	fi
 
+# Multithreading suite (multithreading Task 1): same layout as the process suite.
+.PHONY: thread-suite check-thread-suite-native
+thread-suite: $(BUILD)/thread-suite-debian.elf
+
+# EXPERIMENT (xz slowness): operation microbenchmark.
+$(BUILD)/op-bench.o: tests/guest/OpBench.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+# Final pass of a milestone: runs every required suite (StageDebian.py FINAL_PASS_SUITES) and adds up the results.
+$(BUILD)/final-pass-suite.o: tests/guest/FinalPassSuite.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/thread-suite.o: tests/guest/ThreadSuite.c | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
+
+$(BUILD)/thread-suite-host: tests/guest/ThreadSuite.c | $(BUILD)
+	$(HOST_X86_CC) -std=gnu11 -O2 -Wall -Wextra -Werror $< -o $@
+
+check-thread-suite-native: $(BUILD)/thread-suite-host
+	mkdir -p $(BUILD)/thread-suite-native
+	cd $(BUILD)/thread-suite-native && { ../thread-suite-host; test $$? -eq 42; }
+	if [ -x "$(DEBIAN_LIBS)/ld-linux-x86-64.so.2" ]; then \
+		$(MAKE) $(BUILD)/thread-suite-debian.elf && \
+		cd $(BUILD)/thread-suite-native && { "$(DEBIAN_LIBS)/ld-linux-x86-64.so.2" --library-path "$(DEBIAN_LIBS)" ../thread-suite-debian.elf; test $$? -eq 42; }; \
+	else \
+		echo "Skipping the Debian glibc run: no debian-sysroot (make debian-sysroot)"; \
+	fi
+
 # Memory and communication suite (milestone 3): same layout as the process
 # suite. The native reference needs no network beyond 127.0.0.1.
 .PHONY: comm-suite check-comm-suite-native
@@ -734,7 +762,7 @@ filesystem-probe: $(BUILD)/filesystem-probe-debian.elf
 $(BUILD)/filesystem-probe.o: tests/guest/FilesystemProbe.c | $(BUILD)
 	$(HOST_X86_CC) -m64 -march=x86-64 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
 
-$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf $(BUILD)/pty-suite-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
+$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf $(BUILD)/pty-suite-debian.elf $(BUILD)/thread-suite-debian.elf $(BUILD)/op-bench-debian.elf $(BUILD)/final-pass-suite-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
 	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(DEBIAN_LIBS)" \
 		"$(DEBIAN_CRT)/Scrt1.o" "$(DEBIAN_CRT)/crti.o" $< "$(DEBIAN_LIBS)/libc.so.6" "$(DEBIAN_CRT)/crtn.o" -o $@
 

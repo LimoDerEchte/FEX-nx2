@@ -66,7 +66,7 @@ on the way are in `.superpowers/sdd/m3-console1-report.md` (local).
 | `RLIMIT_DATA` | Enforced for `brk` growth only (the old break is returned); `mmap` ignores it |
 | `brk` area | The heap reserves 1 GiB of address space at the first `brk`; pages above the break are unmapped (as on Linux), but the space stays reserved: other mappings land there only with MAP_FIXED, and a shared MAP_FIXED there returns ENOMEM. Pages below the break cannot be unmapped, remapped or replaced (EINVAL) |
 | `munmap` of image pages | Registered ELF and stack pages cannot be given back: a range that includes them returns EINVAL (holes are skipped as on Linux) |
-| Futex priority inheritance | PI futexes have no priority boosting: one host thread runs every guest thread cooperatively. PI waiters are queued FIFO and UNLOCK_PI hands the lock to the oldest waiter |
+| Futex priority inheritance | PI futexes have no priority boosting: Horizon schedules each guest thread's host thread and the runtime does not map guest priorities to it. PI waiters are queued FIFO and UNLOCK_PI hands the lock to the oldest waiter |
 | Futex keys of vfork children | A private futex key is (address, pid): a `CLONE_VM\|CLONE_VFORK` child has its own pid, so it does not share private futex waits or wakes with its parent on the same word (Linux keys by mm). Only matters when a vfork child waits on or wakes a futex its parent uses |
 | Futex ownership of a dead thread | A PI or robust futex whose owner exits without a robust list is never recovered (Linux does the same); `LOCK_PI` on a word whose owner TID is not a live thread returns ESRCH |
 | Fork and returned memory | While a fork relative maps the same address space, pages are cleared from the table but stay committed in the arena until the last relative lets go |
@@ -111,7 +111,7 @@ on the way are in `.superpowers/sdd/m3-console1-report.md` (local).
 | 311 | `process_vm_writev` | Routed | As process_vm_readv; writes into the target's translated pages drop the target's translations (its own FEX context) |
 | 319 | `memfd_create` | Routed | Storage reserves arena address space for the file size (power of two, 4 MiB to 1 GiB) and commits pages as they are written or mapped; see Deliberate differences |
 | 323 | `userfaultfd` | Unrouted | ENOSYS (deliberate; needs fault delivery) |
-| 324 | `membarrier` | Routed | All commands. Barriers return 0 (one host thread runs every guest thread). Private expedited commands need registration (EPERM). Registrations are inherited by fork and cleared by exec |
+| 324 | `membarrier` | Routed | All commands. Barriers return 0 without interrupting the other threads of the process: they run in parallel on host threads of their own, with TSO ordering on for every process, but no thread is made to execute a barrier (tracked, not Linux behavior). Private expedited commands need registration (EPERM). Registrations are inherited by fork and cleared by exec |
 | 325 | `mlock2` | Routed | MLOCK_ONFAULT only; accounting as mlock |
 | 329 | `pkey_mprotect` | Routed | pkey -1 behaves as mprotect; any other key returns EINVAL |
 | 330 | `pkey_alloc` | Routed | ENOSPC: FEX CPUID reports no PKU |

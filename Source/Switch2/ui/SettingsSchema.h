@@ -53,6 +53,7 @@ struct SettingDef {
   bool Honored = false;                // the runtime really uses it today
   std::string DisabledReason = "Not available yet";
   std::string EnabledWhenKey, EnabledWhenValue;  // enabled only while that setting has that value
+  std::string ShownWhenFile;           // listed only when this file exists (Storage path) as Settings opens
 };
 
 const std::vector<SettingDef>& DefaultSchema();

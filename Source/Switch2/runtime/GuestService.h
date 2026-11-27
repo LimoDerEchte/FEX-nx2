@@ -28,6 +28,9 @@ struct SessionLaunch {
   std::optional<std::pair<uint32_t, uint32_t>> Credentials;  // uid, gid; none = the default unprivileged user
   std::string Folder;                     // the launch folder (host side, as RunGuest took it)
   std::string WorkingDirectory;           // the initial working directory
+  bool SingleThread {};                   // <program>.single-thread: the process's threads run one at a time
+  bool Profile {};                        // EXPERIMENT <program>.profile: sample where guest code spends its time
+  bool NoTso {};                          // EXPERIMENT <program>.no-tso: FEX translates without x86 memory ordering
 };
 
 // One session as the launcher and the runtime share it.

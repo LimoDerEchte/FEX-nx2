@@ -36,6 +36,8 @@ $end_info$
 
 #ifdef __SWITCH2__
 #include <FEXCore/Utils/Switch2/GuestTrace.h>
+#include <cstdlib>
+#include <mutex>
 #endif
 
 #include <cstdio>
@@ -544,6 +546,42 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
 
 #endif
 
+#ifdef __SWITCH2__
+// Switch 2 block linking. Published code cannot be patched while it may run (the executable view is only written
+// through the loader's publish call, which must not touch running blocks), so a direct exit is linked through data:
+// its jump thunk loads the target from a link slot in ordinary writable memory and branches to it, or calls the
+// exit linker while the slot is 0. Linking stores the target into the slot; delinking (the target was invalidated)
+// stores 0 again. Slots are never freed: a thunk of a retired code buffer may still name one, and the slot memory
+// is 8 bytes per compiled exit.
+namespace {
+std::mutex LinkSlotLock;
+uint64_t* LinkSlotChunk {};
+size_t LinkSlotsLeft {};
+
+uint64_t* AllocateLinkSlot() {
+  std::lock_guard Lock {LinkSlotLock};
+  if (!LinkSlotsLeft) {
+    constexpr size_t SlotsPerChunk = 8192;
+    LinkSlotChunk = static_cast<uint64_t*>(std::calloc(SlotsPerChunk, sizeof(uint64_t)));
+    if (!LinkSlotChunk) {
+      ERROR_AND_DIE_FMT("Out of memory for Switch 2 block link slots");
+    }
+    LinkSlotsLeft = SlotsPerChunk;
+  }
+  --LinkSlotsLeft;
+  return LinkSlotChunk++;
+}
+
+std::atomic_ref<uint64_t> LinkSlot(const FEXCore::Context::ExitFunctionLinkData* Record) {
+  return std::atomic_ref<uint64_t>(*reinterpret_cast<uint64_t*>(Record->HostCode));
+}
+
+void SlotBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
+  LinkSlot(Record).store(0, std::memory_order_release);
+}
+} // namespace
+#endif
+
 uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
   auto Thread = Frame->Thread;
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
@@ -625,7 +663,14 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
   }
 #else
-  // The executable view is read-only. Leave branches routed through the linker.
+  {
+    // The record's HostCode field holds the address of the exit's link slot (see AllocateLinkSlot).
+    auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
+    // Lock here is necessary to prevent simultaneous linking and delinking
+    auto lk = Thread->LookupCache->AcquireWriteLock();
+    LinkSlot(Record).store(HostCode, std::memory_order_release);
+    Thread->LookupCache->AddBlockLink(GuestRip, Record, SlotBlockDelinker, lk);
+  }
 #endif
   return HostCode;
 }
@@ -1066,6 +1111,23 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
     ARMEmitter::ForwardLabel l_DoLink;
     uint64_t ThunkAddress = GetCursorAddress<uint64_t>();
     BindOrRestart(&PendingJumpThunk.Label);
+#ifdef __SWITCH2__
+    // Linked through the exit's slot: 00 ldr TMP1, Record.HostCode (the slot address); 04 ldr TMP1, [TMP1];
+    // 08 cbz TMP1, 0x10; 0c br TMP1; 10 ldr TMP1, <shared exit linker>; 14 blr TMP1; 18 the record (blr leaves LR on it).
+    ARMEmitter::ForwardLabel l_Record;
+    ldr(TMP1, &l_Record);
+    ldr(TMP1, TMP1, 0);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_DoLink);
+    br(TMP1);
+    BindOrRestart(&l_DoLink);
+    ldr(TMP1, &l_ExitLink);
+    blr(TMP1);
+
+    // This is a ExitFunctionLinkData struct
+    BindOrRestart(&l_Record);
+    BindOrRestart(&l_ExitLink);
+    dc64(reinterpret_cast<uint64_t>(AllocateLinkSlot())); // HostCode: the link slot
+#else
     b_OrRestart(&l_DoLink);
     br(TMP1);
     BindOrRestart(&l_DoLink);
@@ -1075,6 +1137,7 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
     // This is a ExitFunctionLinkData struct
     BindOrRestart(&l_ExitLink);
     dc64(0); // HostCode
+#endif
     if (PendingJumpThunk.PatchSiteAddress) {
       // GuestRIP with an extra step
       PlaceNamedSymbolLiteral(

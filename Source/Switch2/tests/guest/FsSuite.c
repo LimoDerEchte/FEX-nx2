@@ -297,7 +297,16 @@ int main(int argc, char **argv) {
   if (rmdir(Scratch) < 0) printf("# scratch directory %s was not empty\n", Scratch);
   // Repeat the failures last so they survive a truncated console log.
   for (unsigned Index = 0; Index < Failed; ++Index) printf("# failed: %s\n", FailedNames[Index]);
-  printf("# fs-suite summary: %u passed, %u failed, %u skipped\n", Passed, Failed, Skipped);
+  // Same result format in every suite: passed/failed/skipped, the failed names above, exit 42 when none failed.
+  printf("# fs-suite summary: %u/%u/%u (passed/failed/skipped)\n", Passed, Failed, Skipped);
+  // final-pass-suite collects the counts through this file.
+  const char* ResultsPath = getenv("FEX_SUITE_RESULTS");
+  // The runner creates the file; opening it without O_CREAT also works in a sticky /tmp (protected_regular).
+  const int Results = ResultsPath ? open(ResultsPath, O_WRONLY | O_APPEND | O_CLOEXEC) : -1;
+  if (Results >= 0) {
+    dprintf(Results, "fs-suite %u %u %u\n", Passed, Failed, Skipped);
+    close(Results);
+  }
   return Failed ? 1 : 42;
 }
 

@@ -54,7 +54,7 @@ Not provided: `/proc/<pid>/environ`, `maps`, `smaps`, `io`, `sched`, `oom_score`
 | inotify sources | Events come from guest syscalls only. Changes by the FTP server, the rootfs setup or another program on the console do not notify; IN_UNMOUNT never occurs. Limits are fixed: 128 instances, 8192 watches per instance, 16384 queued events (`fs.inotify.*`) |
 | Remaining `Partial` rows | Their Notes name the gap (wait4/getrusage/times without system time, vfork copying memory, clone sharing limits, prctl options, restart_syscall EINTR); none changed in Tasks 10-15 |
 | Clocks | See [Clocks: deliberate differences](#clocks-deliberate-differences) |
-| Process model | One worker runs all guest threads through `GuestSyscalls::RunThreads`. Syscalls and the timed watchdog return execution to the scheduler. Launcher tabs start separate session leaders in this worker, with a controlling pty and per-launch credentials and working directory. |
+| Process model | Every guest thread runs on a host thread of its own (libnx thread, 4 MiB stack, all cores allowed, priority 0x2d), in parallel with the others. One runtime lock protects all runtime state: a syscall takes it, runs its handler, and gives it back when it returns to guest code; generated code runs without it. A thread that waits sleeps on its own address-arbiter word and is woken when its wait can end. `GuestSyscalls::RunThreads` is the service thread: it polls the launcher, the terminal, timers and host sockets, and joins finished host threads. A watchdog preempts a thread that has run 10 ms in guest code (Horizon does not time-slice threads of one priority). Processes made by `fork` share one memory view until `exec`: a view holds one process's private pages, so the processes of such a group run one at a time (a swap needs the resident process's threads out of guest code); after `exec` a process runs in parallel with the others. `<program>.single-thread` runs a process's threads one at a time (`SerialGuest`, inherited by fork and clone children, kept across exec). Launcher tabs start separate session leaders in this runtime, with a controlling pty and per-launch credentials and working directory. |
 | Signal core dumps | Core-action signals terminate without a core file; WCOREDUMP is never set |
 | Signal dequeue order | Lowest number first; Linux takes synchronous fault signals (SEGV, BUS, ILL, TRAP, FPE, SYS) first. No fault generates a signal yet |
 | Interrupted socket timeouts | Socket waits with SO_RCVTIMEO/SO_SNDTIMEO restart under SA_RESTART; Linux returns EINTR |
@@ -121,7 +121,7 @@ needs `restart_syscall` (219).
 | 124 | `getsid` | Routed |  |
 | 135 | `personality` | Partial | Value stored and reported; flags such as ADDR_NO_RANDOMIZE change nothing (no ASLR). |
 | 140 | `getpriority` | Partial | Nice values stored and reported per process; PRIO_USER matches real uid. |
-| 141 | `setpriority` | Partial | Linux permission rules (EPERM, EACCES with RLIMIT_NICE 0); the cooperative scheduler does not weight threads by nice. |
+| 141 | `setpriority` | Partial | Linux permission rules (EPERM, EACCES with RLIMIT_NICE 0); the runtime does not weight threads by nice (Horizon schedules the host threads). |
 | 157 | `prctl` | Partial | PDEATHSIG (1/2), DUMPABLE (3/4), NAME (15/16), CHILD_SUBREAPER (36/37), NO_NEW_PRIVS (38/39), KEEPCAPS (7/8), CAPBSET_READ/DROP (23/24), CAP_AMBIENT (47). SECUREBITS (27/28) and other options return EINVAL. |
 | 158 | `arch_prctl` | Routed |  |
 | 160 | `setrlimit` | Routed | `do_prlimit` order: EFAULT, EINVAL (resource, soft above hard), EPERM for NOFILE above 1024 (nr_open) or a raised hard limit without CAP_SYS_RESOURCE. Enforced: NOFILE (allocation EMFILE, `dup2` EBADF, `F_DUPFD` EINVAL, `poll` EINVAL), NPROC (clone EAGAIN for non-root), SIGPENDING (queued RT signals, timers), CPU (SIGXCPU at the soft limit, which moves up a second each time; SIGKILL at the hard limit). See deliberate differences for the others. |
@@ -130,7 +130,7 @@ needs `restart_syscall` (219).
 | 231 | `exit_group` | Routed | Ends every thread; reparents children (subreaper or pid 1), sends PDEATHSIG, hangs up newly orphaned stopped groups and a led terminal, notifies the parent. |
 | 247 | `waitid` | Partial | P_ALL, P_PID, P_PGID, P_PIDFD with WEXITED/WSTOPPED/WCONTINUED/WNOWAIT/WNOHANG; rusage as wait4. |
 | 302 | `prlimit64` | Routed | As setrlimit; another pid or tid needs matching real/effective/saved uids and gids or CAP_SYS_RESOURCE (EPERM); missing pid ESRCH; the new value is read before the target is looked up. Case `proc/prlimit_other_pid`. |
-| 309 | `getcpu` | Routed | Always CPU 0, node 0 (one host thread runs the guest). |
+| 309 | `getcpu` | Routed | Always CPU 0, node 0 (guest threads run on any host core; the runtime does not report which). |
 | 322 | `execveat` | Routed | AT_EMPTY_PATH needs a descriptor opened by path. |
 | 434 | `pidfd_open` | Routed | PIDFD_NONBLOCK accepted; pidfds cannot be polled yet (Task 12). |
 | 435 | `clone3` | Partial | As clone (flags per [ContainerInventory.md](ContainerInventory.md)); set_tid still returns EPERM/EINVAL (not implemented), CLONE_INTO_CGROUP EINVAL. |

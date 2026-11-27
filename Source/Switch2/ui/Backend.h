@@ -178,7 +178,8 @@ public:
   // The settings the launcher itself uses ("log_level", "start_folder"): called for every schema key after the settings load and
   // after Settings saved them.
   virtual void ApplySetting(const std::string& Key, const std::string& Value) { (void)Key; (void)Value; }
-  // Developer actions of Settings > Developer: "root_shell" (opened by the app itself), "run_elf", "run_elf_single".
+  // Developer actions of Settings > Developer: "root_shell" (opened by the app itself), "run_elf", "run_elf_single",
+  // "final_pass" (sdmc:/fex/games/final-pass-suite.elf, listed only when that file exists).
   virtual Capability DevAction(const std::string& Id) { (void)Id; return Capability {}; }
   // Starts a developer program asynchronously and returns its terminal tab handle.
   virtual std::unique_ptr<ShellSession> StartDevSession(const std::string& Id, const std::string& Path, std::string& Error);

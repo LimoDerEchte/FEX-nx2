@@ -1,6 +1,9 @@
 # Guest-to-host multithreading (plan, 2026-11-26)
 
-Status: Task 0 (probe) complete; Task 1 next, after the 0.17.17 CPU feature fix. Replaces the sketch in [Milestone5Plan.md](Milestone5Plan.md) Task 0. Discuss with the user
+Status: Task 0 (probe) complete; CPU features shipped (0.17.17, `e7a4bd8b2`). Task 1 done (accepted on console 0.18.14, final-pass-suite 11/11 clean). Implementation plan
+[MultithreadingTask1.md](MultithreadingTask1.md) (1A preparation, 1B host threads). Found while planning: processes
+that share memory after `fork` (until `exec`) swap their pages on every switch, so they run one at a time (fork group
+exclusivity); every other process runs in parallel. Replaces the sketch in [Milestone5Plan.md](Milestone5Plan.md) Task 0. Discuss with the user
 before starting; recommended order: after UI Task 8 (ptys and tabs), before the 32-bit work of Milestone 5.
 
 ## Decisions (user, 2026-11-27)

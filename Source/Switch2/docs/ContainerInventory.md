@@ -385,7 +385,7 @@ thread). A syscall that blocks and runs again is filtered once.
 
 | Interface | Behavior |
 | --- | --- |
-| Scheduling is bookkeeping | Policy, priority, nice, slice, deadline parameters and clamps are stored per thread and reported with Linux's validation, but the cooperative scheduler (one host thread) and the Horizon scheduler ignore them: a SCHED_FIFO thread does not preempt, SCHED_DEADLINE has no admission control (no EBUSY) and no deadline guarantee |
+| Scheduling is bookkeeping | Policy, priority, nice, slice, deadline parameters and clamps are stored per thread and reported with Linux's validation, but the runtime and the Horizon scheduler (which runs each guest thread's host thread) ignore them: a SCHED_FIFO thread does not preempt, SCHED_DEADLINE has no admission control (no EBUSY) and no deadline guarantee |
 | Nice is per process | Linux keeps nice per thread. `setpriority`, `sched_setattr` and `sched_setscheduler` change the whole process; a `SCHED_RESET_ON_FORK` thread clone leaves nice alone (a fork child resets it) |
 | CPU affinity is reporting only | The mask is stored per thread and `sched_getaffinity` returns it, clamped to the 6 (console `svcGetInfo` core mask) CPUs. Threads are never pinned. More than 64 CPUs are not modeled (one 8 byte word) |
 | Policies ISO and EXT | EINVAL: the emulated kernel is built without them (the host kernel the checks ran on has SCHED_EXT) |
@@ -403,7 +403,7 @@ thread). A syscall that blocks and runs again is filtered once.
 | `clone3` `set_tid` | Not implemented (EPERM without CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE, else EINVAL) |
 | `iopl`, `ioperm` | Not an unconditional EPERM: the calls that change nothing (iopl level 0, clearing ioperm bits, range errors) return what Linux returns; every request that would grant I/O privilege is EPERM |
 | `perf_event_open` argument order | Only the first 8 bytes of `attr` are checked (EFAULT) before EPERM; Linux validates `attr->size` (E2BIG/EINVAL) first |
-| Seccomp notification fds | `SECCOMP_FILTER_FLAG_NEW_LISTENER` and `WAIT_KILLABLE_RECV` return EINVAL (the cooperative single host thread cannot block a thread on a supervisor and the notification ioctls are not implemented). A filter may still return `USER_NOTIF`: the syscall gets ENOSYS, as on Linux for a filter without a listener. `GET_ACTION_AVAIL(USER_NOTIF)` therefore reports EOPNOTSUPP (native: 0). `GET_NOTIF_SIZES` returns Linux 7.3's sizes |
+| Seccomp notification fds | `SECCOMP_FILTER_FLAG_NEW_LISTENER` and `WAIT_KILLABLE_RECV` return EINVAL (the notification ioctls and the supervisor wait are not implemented). A filter may still return `USER_NOTIF`: the syscall gets ENOSYS, as on Linux for a filter without a listener. `GET_ACTION_AVAIL(USER_NOTIF)` therefore reports EOPNOTSUPP (native: 0). `GET_NOTIF_SIZES` returns Linux 7.3's sizes |
 | Seccomp logging and core files | `SECCOMP_FILTER_FLAG_LOG` is stored; no action is logged. A SIGSYS kill sets no core-dump flag in the wait status (native: core dumped) |
 | Seccomp no_new_privs | The flag is per process (Linux: per thread); TSYNC therefore changes nothing for it |
 

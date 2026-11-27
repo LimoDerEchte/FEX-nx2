@@ -14,6 +14,10 @@ software on Switch 2 through the normal launcher.
 - **Real semantics.** Implement Linux behavior properly, verified through
   the normal entry point. No faked behavior or bypassed paths. Track any
   incomplete compatibility explicitly.
+- **Performance.** Hand-written AArch64 assembly is allowed for hot
+  paths (frequent calls, dispatch, syscall entry), as FEX itself does.
+  Keep a comment saying what it replaces and why, and measure the gain
+  on the console before keeping it.
 - **Root causes.** Fix the cause, not the symptom. Label diagnostic
   builds as experiments and revert any that regress or lack evidence.
 - **Evidence.** Report host build, native Linux and Switch 2 console
@@ -47,3 +51,10 @@ software on Switch 2 through the normal launcher.
   to resume from the checkout alone.
 - For a console run, hand off the artifact paths and a complete checklist
   with expected results.
+- Final pass of a milestone: run `final-pass-suite.elf` (Settings >
+  Developer > Final Pass Suite > Run). It runs every required suite as
+  its `.user` identity and prints the totals. Add each new suite to
+  `FINAL_PASS_SUITES` in `tools/StageDebian.py`. Every suite prints
+  `# <name> summary: P/F/S (passed/failed/skipped)` after `# failed:`
+  lines, writes its counts to `$FEX_SUITE_RESULTS`, and exits 42 when
+  nothing failed.

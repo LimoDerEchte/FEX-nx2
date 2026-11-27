@@ -24,6 +24,8 @@ extern std::atomic<LogLevel> Logging;
 extern bool GraphicsActive;
 
 void WriteLog(const char* Text);
+// EXPERIMENT (multithreading scaling): ticks this host thread spent in WriteLog.
+extern thread_local uint64_t LogWriteTicks;
 // Returns all guest arena memory and the loader's heap size; call once before the launcher exits.
 void ShutdownGuestArena();
 void WriteGuestOutput(const char* Text);
