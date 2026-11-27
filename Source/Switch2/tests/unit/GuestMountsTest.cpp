@@ -421,6 +421,32 @@ int main() {
     CHECK(PathContains("/a", "/a/b") && !PathContains("/a", "/ab") && PathContains("/a", "/a") && !PathContains("/a/b", "/a"));
   }
 
+  // ---- the SD card mount: root "/", read-only at /mnt/sd, FEX's folders hidden
+  {
+    CHECK(PathContains("/", "/") && PathContains("/", "/fex/games") && !PathContains("/", "fex"));
+    CHECK(PathBelow("/", "/") == "" && PathBelow("/", "/fex/games/a.elf") == "/fex/games/a.elf");
+    CHECK(PathBelow("/fex", "/fex/games") == "/games" && PathBelow("/fex", "/fex") == "");
+    World W;
+    auto Sb = Sd(W.I, W.Reg);
+    Sb->FsRoot = "/";
+    Sb->ReadOnly = true;
+    Sb->Hidden = {R, "/fex/.inode"};
+    const auto Card = MakeMount(W.T, W.I, W.Slash, R + "/mnt/sd", "/", Sb, MntReadonly | MntNosuid | MntNodev | MntRelatime);
+    CHECK(Cross(W.T, W.At(W.Slash, R + "/mnt/sd")).M == Card);
+    CHECK(VisiblePath(W.Root(), Card.get(), "/fex/games/a.elf") == std::optional<std::string> {"/mnt/sd/fex/games/a.elf"});
+    CHECK(VisiblePath(W.Root(), Card.get(), "/") == std::optional<std::string> {"/mnt/sd"});
+    CHECK(HidesPath(Card.get(), R) && HidesPath(Card.get(), R + "/usr") && HidesPath(Card.get(), "/FEX/RootFS/etc"));
+    CHECK(HidesPath(Card.get(), "/fex/.inode") && !HidesPath(Card.get(), "/fex/rootfs2") && !HidesPath(Card.get(), "/fex/games"));
+    CHECK(!HidesPath(W.Slash.get(), R + "/usr"));
+    CHECK(Card->ReadOnly());
+    const auto Info = MountInfo(W.T, W.Root());
+    CHECK(Info.find(" / /mnt/sd ro,nosuid,nodev,relatime") != std::string::npos);
+    // a bind of a card folder shows its folder as the root inside the file system
+    const auto Games = MakeMount(W.T, W.I, W.Slash, R + "/opt", "/fex/games", Sb, MntRelatime);
+    CHECK(MountInfo(W.T, W.Root()).find(" /fex/games /opt ") != std::string::npos);
+    CHECK(VisiblePath(W.Root(), Games.get(), "/fex/games/a.elf") == std::optional<std::string> {"/opt/a.elf"});
+  }
+
   std::printf("guest-mounts: ok\n");
   return 0;
 }

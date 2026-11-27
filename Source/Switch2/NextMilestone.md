@@ -8,6 +8,22 @@ comm 124/0/1, fs 81/0/2, pty 43/0/0, proc 241/2/6, container 53/1/0. The 3 failu
 `timer/alarm_survives_exec`, `seccomp/filter_inherited_and_kept_across_exec`) are not from this change: they re-exec
 `/proc/self/exe`, which names the card path `/fex/games/<suite>.elf`, and the guest cannot reach the card by absolute
 path (execve ENOENT). They passed at M4, when the suites ran from the RootFS `/bin`. Next: that fix, then Task 1.
+User decision (2026-11-27): the whole SD card appears in the guest at `/mnt/sd`, read-only ("not to mess with homebrew"),
+with FEX's internal folders hidden (`/fex/rootfs`, `/fex/.inode`, `/fex/.tmp` and older tmpfs areas, `/fex/.download`,
+`/fex/config`). Card launches then run as `/mnt/sd/<card path>` (cwd and `/proc/self/exe` inside that mount).
+
+### 0.17.20 accepted (2026-11-27): SD card at /mnt/sd (0.17.18 crashed at runtime start: EnsureCardMountPoint ran before Task existed; CreateNativeEntry read Task->Creds)
+`BuildInitialMounts` adds a read-only `msdos` mount of the card root "/" at `/mnt/sd` (`Superblock::Hidden`: RootFS,
+inode store, tmpfs areas, `/fex/.download`, `/fex/config`; lookups ENOENT, listings skip them). `EnsureCardMountPoint`
+creates `/mnt/sd` in a RootFS that has `/mnt`. `SpawnSession` starts a card program inside the mount (cwd, argv[0],
+`/proc/self/exe` = `/mnt/sd/...`). `Mounts::PathContains`/`PathBelow` handle a mount root of "/". Card programs can no
+longer write in their own folder (read-only by decision). Host: guest_nro 0 warnings, all 30 `check-guest-*` ok
+(`check-guest-mounts` has a new card-mount case). NRO `.superpowers/sdd/fex-switch2-guest-0.17.19.nro`. Console: the
+3 exec tests, `/mnt/sd` checks, then commit. 0.17.19 console (log `.superpowers/sdd/console-0.17.19.log`): `/mnt/sd` shell checks all passed; the 3
+exec tests still failed, now execve EACCES: card files without an inode record defaulted to 0644. 0.17.20: `RegularMode`
+gives SD card files outside the RootFS and tmpfs areas 0755, as a default vfat mount shows them
+(NRO `.superpowers/sdd/fex-switch2-guest-0.17.20.nro`). Console 0.17.20 (log `.superpowers/sdd/console-0.17.20.log`): proc 243/0/6, container
+54/0/0. Committed. Next: multithreading Task 1 (docs/MultithreadingPlan.md).
 Previous entry text:
 `InitializeProcessContext` (`runtime/GuestRuntime.cpp`) passes `SupportsAtomics`, `SupportsRCPC`, `SupportsTSOImm9`
 (LSE, LDAPR, LDAPUR/STLUR; mtprobe 3 ran all three). TSO stays on for every process until multithreading Task 1

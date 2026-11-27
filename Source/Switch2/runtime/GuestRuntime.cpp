@@ -414,6 +414,7 @@ public:
     LoadInodeStore();
     CleanStaleTmpfs();
     Task = &Processes.try_emplace(ProcessID).first->second;
+    EnsureCardMountPoint();  // needs Task: a native creation records the creator as owner
     Task->Ns = NsRegistry.Initial;
     Task->Ns.Uts->Hostname = "fex-switch2";
     Task->Ns.Mnt->Table = BuildInitialMounts();
@@ -775,6 +776,14 @@ public:
     Child.Fs->LaunchFolder = Launch.OnCard ? Launch.Folder : RootPath;
     Child.Fs->Folder = Launch.Folder;
     Child.Fs->WorkingDirectory = Launch.WorkingDirectory;
+    // A program of the SD card starts in its folder inside the /mnt/sd mount, so getcwd, argv[0] and /proc/self/exe
+    // name paths the guest can open again (a re-exec of itself).
+    const auto Card = Launch.OnCard ? CardMountOf(Child) : nullptr;
+    if (Card) {
+      Child.Fs->LaunchFolder = RootPath;
+      Child.Fs->FolderMount = Card;
+      Child.Fs->WorkingDirectory = std::string(CardMountPoint) + Launch.Folder;
+    }
     if (Launch.Credentials) Child.Creds = Switch2Guest::LaunchCredentialsFor(Launch.Credentials->first, Launch.Credentials->second);
     auto Fail = [&](const char* Error) {
       Child.Ns.Pid->Release(PID);
@@ -790,6 +799,7 @@ public:
     Current = &Probe;
     ExecImage Loaded;
     const char* Error = LoadLaunchImage(Launch, Loaded);
+    if (!Error && Card) Loaded.Path = Loaded.ProgramPath = std::string(CardMountPoint) + Launch.Program;
     Current = nullptr;
     if (Error) {
       Task = SavedTask;
@@ -3989,7 +3999,22 @@ private:
                                    Mn::MntNosuid | Mn::MntRelatime);
     Mn::MakeMount(*Table, MountIds, Dev, RootPath + "/dev/shm", RootPath + "/dev/shm", Make("tmpfs", "tmpfs", ShmDevice, RootPath + "/dev/shm"),
                   Mn::MntNosuid | Mn::MntNodev | Mn::MntRelatime);
+    // The SD card, read-only at /mnt/sd, without FEX's own folders (user decision 2026-11-27: the guest must not change
+    // homebrew). Programs started from the card run inside it, so getcwd and /proc/self/exe name paths the guest can open.
+    CardSb = Make("msdos", "sdmc", CardDevice, "/");
+    CardSb->ReadOnly = true;
+    CardSb->Hidden = {RootPath, InodeFiles::Directory, std::string(TmpfsArea), "/fex/.download", "/fex/config"};
+    for (const auto Old : OldTmpfsAreas) CardSb->Hidden.emplace_back(Old);
+    Mn::MakeMount(*Table, MountIds, Slash, RootPath + std::string(CardMountPoint), "/", CardSb, Mn::MntReadonly | Mn::MntNosuid | Mn::MntNodev | Mn::MntRelatime);
     return Table;
+  }
+
+  // The SD card mount (/mnt/sd) of a process's mount namespace, or null when it was unmounted there.
+  MountRef CardMountOf(const GuestProcess& P) const {
+    if (!CardSb || !P.Ns.Mnt || !P.Ns.Mnt->Table) return nullptr;
+    for (const auto& M : TableOf(*P.Ns.Mnt).List)
+      if (M->Sb == CardSb && M->Root == "/") return M;
+    return nullptr;
   }
 
   // The place that is a process's root or working directory.
@@ -4124,6 +4149,27 @@ private:
     if (R_FAILED(SdRetry(fsOpenSdCardFileSystem, &SdCard))) return;
     DeleteTmpfsTree(SdCard, std::string(TmpfsArea));
     for (const auto Old : OldTmpfsAreas) DeleteTmpfsTree(SdCard, std::string(Old));
+    fsFsClose(&SdCard);
+  }
+
+  // The SD card mount covers /mnt/sd: the directory is created once in a RootFS that has /mnt (a mount point must
+  // exist for ls /mnt and stat to show it). A missing RootFS is left alone.
+  void EnsureCardMountPoint() {
+    FsFileSystem SdCard {};
+    if (R_FAILED(SdRetry(fsOpenSdCardFileSystem, &SdCard))) return;
+    FsDirEntryType Type {};
+    const auto Point = RootPath + std::string(CardMountPoint);
+    if (!EntryType(SdCard, RootPath + "/mnt", Type) && Type == FsDirEntryType_Dir && EntryType(SdCard, Point, Type) == -2) {
+      if (const auto Error = CreateNativeEntry(SdCard, Point, 0755, true)) {
+        WriteLog(("Could not create the SD card mount point /mnt/sd (error " + std::to_string(-Error) + ").").c_str());
+      } else {
+        // a mount point of the system, as /mnt itself: root's, whoever launched first
+        const auto Inode = SdInode(Point);
+        Inodes[Inode].Owner.emplace(0, 0);
+        MarkInodeChanged(Inode);
+        SaveInodeStore();
+      }
+    }
     fsFsClose(&SdCard);
   }
 
@@ -5712,6 +5758,9 @@ private:
   };
   static_assert(sizeof(LinuxStat) == 144);
   static constexpr uint64_t ProcDevice = 2, DevDevice = 3, ShmDevice = 4, AnonDevice = 13; // anon_inodefs is 0:13 on Linux
+  static constexpr uint64_t CardDevice = 1;                        // /mnt/sd is the same SD card file system as /
+  static constexpr std::string_view CardMountPoint = "/mnt/sd";    // guest path of the SD card mount
+  std::shared_ptr<Switch2Guest::Mounts::Superblock> CardSb;
 
   // ---- Timers: itimers, POSIX timers and timerfds ----
 
@@ -8227,6 +8276,9 @@ private:
         return Path.empty() ? std::string {"/"} : std::string {Path};
       }
     }
+    // A program of the SD card: its path through the card mount (/mnt/sd/...).
+    if (const auto Card = CardMountOf(P))
+      if (const auto Visible = Switch2Guest::Mounts::VisiblePath(RootOf(P), Card.get(), std::string {Path})) return *Visible;
     return std::string {Path};
   }
 
@@ -8372,6 +8424,14 @@ private:
   }
 
   uint32_t RegularMode(std::string_view Path) const {
+    // A file of the SD card outside the RootFS (the /mnt/sd mount, a card launch folder): FAT has no mode bits, and
+    // Linux shows a vfat mount's files as 0755 by default (fmask = umask 022), so card programs can run.
+    namespace Mn = Switch2Guest::Mounts;
+    // Devices and /proc files keep their guest names ("/dev/pts/0"); anonymous files have none.
+    const bool GuestName = Path.empty() || Mn::PathContains("/dev", Path) || Mn::PathContains("/proc", Path);
+    if (!GuestName && !Mn::PathContains(RootPath, Path) && !Mn::PathContains(TmpfsArea, Path) &&
+        std::none_of(std::begin(OldTmpfsAreas), std::end(OldTmpfsAreas), [&](std::string_view Old) { return Mn::PathContains(Old, Path); }))
+      return 0100755;
     const auto Relative = Path.starts_with(RootPath) ? Path.substr(RootPath.size()) : Path;
     return Relative.starts_with("/bin/") || Relative.starts_with("/usr/bin/") ? 0100755 : 0100644;
   }
@@ -8672,7 +8732,8 @@ private:
         Entries.insert(Entries.end(), {{"dev", true}, {"proc", true}});
       }
       std::erase_if(Entries, [&](const DirectoryEntry& Entry) {
-        return IsInodeStorePath(File->Path + "/" + Entry.Name);
+        const auto Child = (File->Path.ends_with('/') ? File->Path : File->Path + "/") + Entry.Name;
+        return IsInodeStorePath(Child) || Switch2Guest::Mounts::HidesPath(File->Mount.get(), Child);
       });
       if (VirtualDir.empty()) AppendGuestDirectoryEntries(File->Path, Entries);
       *File->Directory = std::move(Entries);
@@ -9126,7 +9187,7 @@ private:
         if (!Path.ends_with('/')) Path += '/';
         Path += Component;
         if (Path.size() >= RootPath.size() + GuestPathMax) return -36;
-        if (IsInodeStorePath(Path)) return -2;
+        if (IsInodeStorePath(Path) || Switch2Guest::Mounts::HidesPath(WalkMount.get(), Path)) return -2;
         if (const auto Error = FollowMounts(Path, Resolve)) return Error;
         const bool Entered = LastCrossed;
         // The pid in /proc/self and /proc/<pid>/... is the one the proc mount being walked numbers it by (the

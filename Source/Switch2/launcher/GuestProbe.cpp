@@ -30,7 +30,7 @@
 
 namespace {
 // The launcher's version: the banner, the Home screen's version block and the NACP (CMakeLists.txt) all show it.
-constexpr char LauncherVersion[] = "0.17.17";
+constexpr char LauncherVersion[] = "0.17.20";
 } // namespace
 
 namespace Switch2Guest {

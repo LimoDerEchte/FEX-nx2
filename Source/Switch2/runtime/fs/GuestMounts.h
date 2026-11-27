@@ -25,6 +25,7 @@
 #include <string_view>
 #include <variant>
 #include <vector>
+#include <vector>
 
 namespace Switch2Guest::Mounts {
 using Switch2Guest::Ns::ErrInval;
@@ -69,6 +70,9 @@ struct Superblock {
   std::shared_ptr<Ns::UserNs> Owner;  // s_user_ns: who may reconfigure it
   std::shared_ptr<Ns::PidNs> Pid;     // a proc superblock shows the processes as this PID namespace numbers them
   std::shared_ptr<void> Cleanup;      // the runtime hangs what must happen when the last user is gone here
+  // Host paths this file system does not show: lookups give ENOENT and directory listings leave them out. The SD card
+  // mount (/mnt/sd) hides FEX's own folders (the RootFS, the inode store, tmpfs areas) this way.
+  std::vector<std::string> Hidden;
   bool Memory() const { return Type == "tmpfs" || Type == "ramfs"; }
 };
 
@@ -118,7 +122,28 @@ struct Ids {
 };
 
 inline bool PathContains(std::string_view Parent, std::string_view Entry) {
+  if (Parent == "/") return Entry.starts_with('/');  // the SD card root (the /mnt/sd mount) holds every host path
   return Entry == Parent || (Entry.size() > Parent.size() && Entry.starts_with(Parent) && Entry[Parent.size()] == '/');
+}
+
+// The part of Entry below Parent ("" for Parent itself, else starting with '/'); Entry must be inside Parent.
+inline std::string_view PathBelow(std::string_view Parent, std::string_view Entry) {
+  if (Parent == "/") return Entry == "/" ? std::string_view {} : Entry;
+  return Entry.substr(Parent.size());
+}
+
+// Whether a mount's file system hides the host path Path (Path or a folder above it is in Sb->Hidden). The SD card
+// compares names without case, so the match ignores ASCII case.
+inline bool HidesPath(const Mount* M, std::string_view Path) {
+  if (!M || !M->Sb || M->Sb->Hidden.empty()) return false;
+  const auto Lower = [](char C) { return C >= 'A' && C <= 'Z' ? static_cast<char>(C + ('a' - 'A')) : C; };
+  for (const auto& Hidden : M->Sb->Hidden) {
+    if (Path.size() < Hidden.size() || (Path.size() > Hidden.size() && Path[Hidden.size()] != '/')) continue;
+    bool Same = true;
+    for (size_t I = 0; I < Hidden.size() && Same; ++I) Same = Lower(Path[I]) == Lower(Hidden[I]);
+    if (Same) return true;
+  }
+  return false;
 }
 
 struct Table {
@@ -171,11 +196,11 @@ inline std::optional<std::string> VisiblePath(const Place& Root, const Mount* M,
   std::string Below;  // the components under Path that deeper mounts contributed
   for (;;) {
     if (M == Root.M.get() && PathContains(Root.Path, Path)) {
-      const std::string Full = std::string {Path.substr(Root.Path.size())} + Below;
+      const std::string Full = std::string {PathBelow(Root.Path, Path)} + Below;
       return Full.empty() ? std::string {"/"} : Full;
     }
     if (!M->Parent || !PathContains(M->Root, Path)) return std::nullopt;
-    Below = std::string {Path.substr(M->Root.size())} + Below;
+    Below = std::string {PathBelow(M->Root, Path)} + Below;
     Path = M->Mountpoint;
     M = M->Parent.get();
   }
@@ -186,7 +211,7 @@ inline std::optional<std::string> VisiblePath(const Place& Root, const Mount* M,
 inline std::string UnreachablePath(const Mount* M, std::string_view Path) {
   std::string Tail;
   for (;;) {
-    if (PathContains(M->Root, Path)) Tail = std::string {Path.substr(M->Root.size())} + Tail;
+    if (PathContains(M->Root, Path)) Tail = std::string {PathBelow(M->Root, Path)} + Tail;
     if (!M->Parent) break;
     Path = M->Mountpoint;
     M = M->Parent.get();
@@ -788,7 +813,7 @@ inline std::string MountInfo(const Table& T, const Place& Root) {
     const std::string& Where = *Visible;
     const auto& Sb = *M->Sb;
     std::string Inside = "/";
-    if (PathContains(Sb.FsRoot, M->Root) && M->Root.size() > Sb.FsRoot.size()) Inside = M->Root.substr(Sb.FsRoot.size());
+    if (PathContains(Sb.FsRoot, M->Root) && M->Root != Sb.FsRoot) Inside = PathBelow(Sb.FsRoot, M->Root);
     std::snprintf(Buffer, sizeof(Buffer), "%llu %llu 0:%llu ", static_cast<unsigned long long>(M->Id),
                   static_cast<unsigned long long>(M->Parent ? M->Parent->Id : 0), static_cast<unsigned long long>(Sb.Dev));
     Out += Buffer;
