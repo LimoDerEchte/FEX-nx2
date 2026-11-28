@@ -150,6 +150,12 @@ void TestRepeat() {
   Out.clear();
   St.Update(5000, Out);
   CHECK(Out.empty());
+  St.Feed(StickEv(0, 0.8f, 0, 5010), Out);
+  CHECK(CountNav(Out, Dir::Right) == 1);
+  Out.clear();
+  St.Feed(Event {.Kind = Event::Type::PadCancel, .TimeMs = 5020}, Out);
+  St.Update(6000, Out);
+  CHECK(Out.empty());
 }
 
 void TestModes() {
@@ -186,6 +192,11 @@ void TestModes() {
   CHECK(M.GetMode() == Mode::Mouse);
   CHECK(Count(Out, UiEvent::Type::PointerDown) == 1);
   M.Feed(MouseBtnEv(MouseButton::Left, false, 4210), Out);
+  M.Feed(MouseBtnEv(MouseButton::Left, true, 4220), Out);
+  Event Cancel = MouseBtnEv(MouseButton::Left, false, 4230);
+  Cancel.Kind = Event::Type::MouseCancel;
+  M.Feed(Cancel, Out);
+  CHECK(Out.back().Kind == UiEvent::Type::PointerUp && !Out.back().Tap);
   // Right click = B.
   Out.clear();
   M.Feed(MouseBtnEv(MouseButton::Right, true, 4300), Out);

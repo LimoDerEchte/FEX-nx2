@@ -39,6 +39,7 @@ struct DirectoryEntry {
   bool IsDirectory;
   bool IsSymlink {};
   uint8_t SpecialType {};
+  uint64_t Inode {};
 };
 class PackedFileExtents;
 const char* ReadElf(const char* Path, ElfImage& Image, uint64_t Limit = UINT64_MAX,

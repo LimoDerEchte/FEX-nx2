@@ -63,6 +63,7 @@ public:
   void Write(std::string_view In) override { Written.append(In); }
   bool Running() override { return Alive; }
   bool ChildRunning() override { return Child; }
+  void SetForeground(bool Value) override { Foreground = Value; }
   void Resize(int C, int R) override { Cols = C; Rows = R; }
   int Cols = 0, Rows = 0;
   std::string Title() override { return TitleText; }
@@ -70,7 +71,7 @@ public:
   std::string TitleText, Note;
   void Feed(const std::string& Bytes) { Pending += Bytes; }
   std::string Pending, Written;
-  bool Alive = true, Child = false;
+  bool Alive = true, Child = false, Foreground = false;
 };
 
 class FakeBackend : public LauncherBackend {

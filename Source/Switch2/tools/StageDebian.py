@@ -149,6 +149,9 @@ def stage_games(source, output, programs):
         elf(role, base + ".elf", ["-d", HOME_SCRATCH, *groups])
         elf(role, base + "-root.elf", ["-d", ROOT_SCRATCH, *groups], "0 0")
 
+    elf("kernel_files_suite", "kernel-files-suite.elf", ["-d", HOME_SCRATCH], "1000 1000")
+    elf("kernel_files_suite", "kernel-files-suite-root.elf", ["-d", ROOT_SCRATCH], "0 0")
+
     # The multithreading suite, and the same program under the .single-thread sidecar (one guest thread of the
     # process in guest code at a time) to compare.
     elf("thread_suite", "thread-suite.elf", ["-d", HOME_SCRATCH])
@@ -170,7 +173,8 @@ def stage_games(source, output, programs):
     # The final pass of a milestone: every suite above that runs under a plain launch, in one program run as root (it
     # starts each suite as the user of the suite's own .user file). Add a milestone's new suites here.
     if programs.get("final_pass_suite"):
-        FINAL_PASS_SUITES = [name for base in ("proc-suite", "comm-suite", "fs-suite", "pty-suite", "container-suite")
+        FINAL_PASS_SUITES = [name for base in ("proc-suite", "comm-suite", "fs-suite", "pty-suite",
+                                             "container-suite", "kernel-files-suite")
                              for name in (base + ".elf", base + "-root.elf")] + ["thread-suite.elf"]
         elf("final_pass_suite", "final-pass-suite.elf",
             [name for name in FINAL_PASS_SUITES if (games / name).is_file()], "0 0")
@@ -200,6 +204,7 @@ if __name__ == "__main__":
     parser.add_argument("--fs-suite", type=Path, help="Include the filesystem compatibility suite (--games only)")
     parser.add_argument("--name-limit-probe", type=Path, help="Include the name length probe (--games only)")
     parser.add_argument("--proc-suite", type=Path, help="Include the process and event compatibility suite (--games only)")
+    parser.add_argument("--kernel-files-suite", type=Path, help="Include the kernel files compatibility suite (--games only)")
     parser.add_argument("--process-acceptance", type=Path, help="Include the process acceptance wrapper and tools (--games only)")
     parser.add_argument("--comm-suite", type=Path, help="Include the memory and communication compatibility suite (--games only)")
     parser.add_argument("--comm-acceptance", type=Path, help="Include the communication acceptance wrapper and tools (--games only)")
@@ -216,6 +221,7 @@ if __name__ == "__main__":
         programs["fs_suite"] = args.fs_suite
         programs["name_limit_probe"] = args.name_limit_probe
         programs["proc_suite"] = args.proc_suite
+        programs["kernel_files_suite"] = args.kernel_files_suite
         programs["process_acceptance"] = args.process_acceptance
         programs["comm_suite"] = args.comm_suite
         programs["comm_acceptance"] = args.comm_acceptance

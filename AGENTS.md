@@ -35,16 +35,22 @@ software on Switch 2 through the normal launcher.
   in parallel. Then one Sonnet agent reviews the whole milestone. Then
   the Opus orchestrator fixes review findings, writes the test suite and
   hands the user console runs to debug until acceptance passes.
+- Codex only when the user asks for it. By default, tasks go to Sonnet
+  agents as above. The user used Codex for M5 Task 8 and for finishing M5;
+  a Codex session that takes over reads its handoff file first, as the
+  user names it.
 - The orchestrator does complex work itself: crashes, hangs, root-cause
   debugging of console failures and subtle runtime bugs. Delegate only
   well-specified, mechanical tasks (UI tweaks, docs, staging) to agents.
-- Graphics is in no milestone: it needs its own
-  architecture planning first.
+- Milestone order: M5 `/proc`, `/sys`, `/dev` and input; M6 non-PIE
+  executables; M7 Wayland compositor; M8 graphics acceleration; M9 32-bit
+  guests. Plans are in `Source/Switch2/docs/Milestone<N>Plan.md`. M7 and M8
+  need their own architecture plans before they start.
 - Start from the [restart checkpoint](Source/Switch2/NextMilestone.md#restart-checkpoint):
   run `git status --short --branch` and review diffs and untracked files
   first. Preserve the user's in-progress changes.
-- Graphics is shelved on branch `shelf/graphics` until the kernel syscall
-  milestones are complete. Keep it out of `nx2`.
+- Graphics is shelved on branch `shelf/graphics` until M7 starts. Keep it
+  out of `nx2` until then.
 - Keep the checkpoint current after each verified slice: status,
   done-when checks, next step, blockers, exact verification commands
   with results, and console artifact paths. A fresh session must be able

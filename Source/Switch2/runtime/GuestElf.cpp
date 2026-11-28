@@ -96,7 +96,7 @@ const char* LoadElf(std::span<const uint8_t> File, ElfImage& Image) {
   for (size_t Index = 0; Index < Loaded.SegmentCount; ++Index) {
     const auto& Load = Loads[Index];
     std::memcpy(Loaded.Storage.get() + Load.p_vaddr, File.data() + Load.p_offset, Load.p_filesz);
-    Loaded.Segments[Index] = {Base + Load.p_vaddr, Load.p_memsz, Load.p_flags};
+    Loaded.Segments[Index] = {Base + Load.p_vaddr, Load.p_memsz, Load.p_flags, Load.p_offset, Load.p_filesz};
   }
   if (DynamicSegment) {
     const auto& Dynamic = *DynamicSegment;

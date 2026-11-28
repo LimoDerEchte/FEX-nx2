@@ -6,6 +6,8 @@
 // with `dpkg --configure -a`. Portable, so it is tested natively.
 #pragma once
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -329,6 +331,45 @@ private:
 
 inline std::span<const uint8_t> Bytes(std::string_view Text) {
   return {reinterpret_cast<const uint8_t*>(Text.data()), Text.size()};
+}
+
+// Keep the distro's input GID. If it has no input group, allocate a free system GID as groupadd -r does.
+inline int64_t EnsureInputGroup(RootfsWriter& Writer, int64_t Time) {
+  std::vector<uint8_t> Data;
+  const auto Read = Writer.ReadWholeFile("/etc/group", Data);
+  if (Read < 0 && Read != -2) return Read;
+  std::string Text(Data.begin(), Data.end());
+  std::array<bool, 1000> Used {};
+  for (std::string_view Lines = Text; !Lines.empty();) {
+    const size_t End = std::min(Lines.find('\n'), Lines.size());
+    const auto Line = Lines.substr(0, End);
+    Lines.remove_prefix(std::min(End + 1, Lines.size()));
+    const auto NameEnd = Line.find(':');
+    if (NameEnd == Line.npos) continue;
+    const auto Name = Line.substr(0, NameEnd);
+    auto Fields = Line.substr(NameEnd + 1);
+    const auto PasswordEnd = Fields.find(':');
+    if (PasswordEnd == Fields.npos) continue;
+    Fields.remove_prefix(PasswordEnd + 1);
+    const auto GidField = Fields.substr(0, Fields.find(':'));
+    uint32_t Gid {};
+    const auto Parsed = std::from_chars(GidField.data(), GidField.data() + GidField.size(), Gid);
+    if (Parsed.ec != std::errc {} || Parsed.ptr != GidField.data() + GidField.size() || Gid == UINT32_MAX ||
+        GidField.size() == Fields.size()) {
+      if (Name == "input") return -22;
+      continue;
+    }
+    if (Name == "input") return Gid;
+    if (Gid < Used.size()) Used[Gid] = true;
+  }
+  for (uint32_t Gid = 999; Gid >= 100; --Gid) {
+    if (Used[Gid]) continue;
+    if (!Text.empty() && !Text.ends_with('\n')) Text += '\n';
+    Text += "input:x:" + std::to_string(Gid) + ":\n";
+    const auto Result = Writer.WriteFile("/etc/group", Bytes(Text), 0644, 0, 0, Time);
+    return Result < 0 ? Result : Gid;
+  }
+  return -28;
 }
 
 // ---------------------------------------------------------------------------

@@ -81,6 +81,17 @@ int main() {
   I.Emit(40, InModify, 0, "gone", false, true);
   CHECK(!I.Readable());
 
+  // devtmpfs creates the event node and resets its permissions before unlinking it.
+  const auto Input = I.AddWatch(50, InCreate | InAttrib | InDelete | InOnlyDir, true);
+  I.Emit(50, InCreate, 0, "event2", false);
+  I.Emit(50, InAttrib, 0, "event2", false);
+  I.Emit(50, InDelete, 0, "event2", false);
+  for (const auto Mask : {InCreate, InAttrib, InDelete}) {
+    const auto Event = Next(I);
+    CHECK(Event.Wd == Input && Event.Mask == Mask && Event.Name == "event2" && Event.Cookie == 0);
+  }
+  CHECK(!I.Readable());
+
   // Overflow: one IN_Q_OVERFLOW with wd -1 once the queue is full.
   InotifyInstance Full;
   Full.AddWatch(1, InModify, true);

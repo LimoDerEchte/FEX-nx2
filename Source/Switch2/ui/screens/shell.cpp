@@ -136,6 +136,11 @@ ShellScreen::ShellScreen(LauncherBackend& B, bool Root, std::unique_ptr<ShellSes
 
 ShellScreen::~ShellScreen() = default;
 
+void ShellScreen::SetForeground(bool Value) {
+  for (size_t Index = 0; Index < Tabs.size(); ++Index)
+    Tabs[Index]->Session->SetForeground(Value && Index == size_t(Active));
+}
+
 std::string ShellScreen::DefaultTitle(const Tab& T) const {
   const std::string Own = T.Session->Title();
   return !Own.empty() ? Own : T.Root ? "Root shell" : "Shell";

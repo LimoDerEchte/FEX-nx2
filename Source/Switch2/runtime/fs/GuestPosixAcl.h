@@ -10,6 +10,20 @@ namespace Switch2Guest {
 inline constexpr std::string_view AccessAcl = "system.posix_acl_access";
 inline constexpr std::string_view DefaultAcl = "system.posix_acl_default";
 
+// posix_acl_to_xattr encodes the devtmpfs mode 0660 plus the seat user's read/write entry.
+inline std::string EncodeSeatAccessAcl(uint32_t Uid) {
+  constexpr char Layout[] =
+    "\x02\0\0\0"                     // Version 2.
+    "\x01\0\x06\0\xff\xff\xff\xff" // ACL_USER_OBJ.
+    "\x02\0\x06\0\0\0\0\0"          // ACL_USER.
+    "\x04\0\x06\0\xff\xff\xff\xff" // ACL_GROUP_OBJ.
+    "\x10\0\x06\0\xff\xff\xff\xff" // ACL_MASK.
+    "\x20\0\0\0\xff\xff\xff\xff";  // ACL_OTHER.
+  std::string Bytes {Layout, sizeof(Layout) - 1};
+  for (size_t I = 0; I < 4; ++I) Bytes[16 + I] = static_cast<char>((Uid >> (8 * I)) & 0xff);
+  return Bytes;
+}
+
 struct PosixAclLayout {
   size_t Owner {}, Group {}, Mask {}, Other {};
   bool Extended {};

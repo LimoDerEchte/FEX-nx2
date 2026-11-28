@@ -581,7 +581,16 @@ static void SetupOnEmptyTree() {
   std::string Detail;
   CHECK(!EverydaySetup(Writer, {}, Env, Setup, Detail));
   CHECK(ReadText(Base + "/etc/passwd") == "root:x:0:0:root:/root:/bin/bash\nfex:x:1000:1000:fex:/home/fex:/bin/bash\n");
-  CHECK(ReadText(Base + "/etc/group") == "root:x:0:\nfex:x:1000:\n");
+  CHECK(ReadText(Base + "/etc/group") == "root:x:0:\nfex:x:1000:\ninput:x:999:\n");
+  CHECK(RootfsSetup::EnsureInputGroup(Writer, 0) == 999);
+  const std::string ExistingGroups = "root:x:0:\ninput:x:417:alice\n";
+  CHECK(Writer.WriteFile("/etc/group", RootfsSetup::Bytes(ExistingGroups), 0644, 0, 0, 0) == 0);
+  CHECK(RootfsSetup::EnsureInputGroup(Writer, 0) == 417);
+  CHECK(ReadText(Base + "/etc/group") == ExistingGroups);
+  const std::string OccupiedGid = "root:x:0:\nother:x:999:";
+  CHECK(Writer.WriteFile("/etc/group", RootfsSetup::Bytes(OccupiedGid), 0644, 0, 0, 0) == 0);
+  CHECK(RootfsSetup::EnsureInputGroup(Writer, 0) == 998);
+  CHECK(ReadText(Base + "/etc/group") == OccupiedGid + "\ninput:x:998:\n");
   CHECK(Table["/etc/shadow"].Mode == 0640 && Table["/etc/gshadow"].Mode == 0640);
   CHECK(ReadText(Base + "/etc/resolv.conf").find("nameserver 1.1.1.1\nnameserver 8.8.8.8\n") != std::string::npos);
   CHECK(ReadText(Base + "/etc/hosts").starts_with("127.0.0.1\tlocalhost\n"));

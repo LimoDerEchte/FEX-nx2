@@ -4,8 +4,8 @@ Status: Task 0 (probe) complete; CPU features shipped (0.17.17, `e7a4bd8b2`). Ta
 0.18.17); final review fixes accepted on console 0.18.18 (11/11 clean, 1134/0/10). Milestone complete. Implementation plan
 [MultithreadingTask1.md](MultithreadingTask1.md) (1A preparation, 1B host threads). Found while planning: processes
 that share memory after `fork` (until `exec`) swap their pages on every switch, so they run one at a time (fork group
-exclusivity); every other process runs in parallel. Replaces the sketch in [Milestone5Plan.md](Milestone5Plan.md) Task 0. Discuss with the user
-before starting; recommended order: after UI Task 8 (ptys and tabs), before the 32-bit work of Milestone 5.
+exclusivity); every other process runs in parallel. Replaces the sketch in [Milestone9Plan.md](Milestone9Plan.md) Task 0 (32-bit
+guests, Milestone 5 when this was written).
 
 ## Decisions (user, 2026-11-27)
 

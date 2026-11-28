@@ -38,6 +38,8 @@ struct Event {
     MouseWheel,  // DX and DY: wheel delta as the SDK reports it (positive Y = up; Joy-Con: the stick)
     KeyDown,    // KeyboardKey, Modifiers, Codepoint (for Key::Text)
     SizeChanged, // W and H: the new output size in pixels
+    MouseCancel, // Mouse: clear a held button without completing a click
+    PadCancel,   // Clear held sticks and controller navigation repeats.
   };
   Type Kind = Type::ButtonDown;
   uint64_t TimeMs = 0;

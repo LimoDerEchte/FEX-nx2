@@ -110,6 +110,13 @@ void InputModes::Feed(const Event& E, std::vector<UiEvent>& Out) {
       StickChanged(Now, Out);
     }
     break;
+  case T::PadCancel:
+    for (auto& Pad : Stick)
+      for (auto& Axes : Pad)
+        Axes[0] = Axes[1] = 0;
+    RightY = 0;
+    R.Active = false;
+    break;
   case T::Touch: {
     const float X = E.X / S, Y = E.Y / S;
     if (E.Phase == TouchPhase::Down) {
@@ -198,22 +205,24 @@ void InputModes::Feed(const Event& E, std::vector<UiEvent>& Out) {
     }
     break;
   }
+  case T::MouseCancel:
   case T::MouseButton: {
-    if (E.Mouse == ui::MouseButton::Left || E.Mouse == ui::MouseButton::Right) {
+    const bool Cancel = E.Kind == T::MouseCancel;
+    if (!Cancel && (E.Mouse == ui::MouseButton::Left || E.Mouse == ui::MouseButton::Right)) {
       SetMode(Mode::Mouse, Out);
       PointerEver = true;
       PointerActive = Now;
     }
     if (E.Mouse == ui::MouseButton::Left) {
-      LeftHeld = E.Pressed;
+      LeftHeld = !Cancel && E.Pressed;
       UiEvent U;
-      U.Kind = E.Pressed ? UiEvent::Type::PointerDown : UiEvent::Type::PointerUp;
+      U.Kind = LeftHeld ? UiEvent::Type::PointerDown : UiEvent::Type::PointerUp;
       U.Src = PointerSource::Mouse;
       U.X = PointerX();
       U.Y = PointerY();
-      U.Tap = !E.Pressed;
+      U.Tap = !Cancel && !LeftHeld;
       Out.push_back(U);
-    } else if (E.Mouse == ui::MouseButton::Right && E.Pressed) {
+    } else if (!Cancel && E.Mouse == ui::MouseButton::Right && E.Pressed) {
       UiEvent U;  // right click = B
       U.Kind = UiEvent::Type::Button;
       U.Btn = Button::B;

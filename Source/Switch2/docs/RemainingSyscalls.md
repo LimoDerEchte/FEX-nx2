@@ -9,8 +9,8 @@ The 90 below are in no inventory. Only `sched_getaffinity` (204) and
 `getrandom` (318) have a handler in `GuestRuntime.cpp`; the other 88
 return ENOSYS. Milestone 4 ([plan](Milestone4Plan.md)) implements or
 answers all of them except `modify_ldt`, `set_thread_area` and
-`get_thread_area`, which are in milestone 5 ([plan](Milestone5Plan.md)).
-Milestone 6 ([plan](Milestone6Plan.md)) covers `/proc`, `/sys`, `/dev`
+`get_thread_area`, which are in milestone 9 ([plan](Milestone9Plan.md)).
+Milestone 5 ([plan](Milestone5Plan.md)) covers `/proc`, `/sys`, `/dev`
 and input. `ptrace` stays EPERM (future work below).
 
 | Group | Syscalls (number) | Milestone |

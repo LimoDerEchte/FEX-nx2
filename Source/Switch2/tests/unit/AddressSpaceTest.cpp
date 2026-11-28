@@ -53,6 +53,32 @@ int main() {
   assert(Space.Set(Start, 5 * PageSize, Space.Unmapped, true));
   assert(!Space.Owns(Start, PageSize));
 
+  const auto Mixed = Space.Allocate(3 * PageSize, 0);
+  const auto Middle = Mixed + PageSize;
+  assert(Mixed && Space.CanReplace(Middle, PageSize, true));
+  assert(Space.Set(Middle, PageSize, PF_R | PF_W, true));
+  Space.ChangeAttribute(Middle, PageSize, Space.SharedPage, true);
+  assert(!Space.IsShared(Mixed, PageSize) && Space.IsShared(Middle, PageSize));
+  assert(Space.IsShared(Middle + 4, sizeof(uint32_t)) && !Space.IsShared(Mixed + 4, sizeof(uint32_t)));
+  assert(!Space.IsShared(Middle + PageSize, PageSize));
+  assert(Space.Set(Mixed, PageSize, PF_R | PF_W));
+  auto* Private = reinterpret_cast<uint8_t*>(Mixed);
+  auto* Shared = reinterpret_cast<uint8_t*>(Middle);
+  assert(*Shared == 0);
+  *Private = 12;
+  *Shared = 34;
+  assert(Space.SavePrivatePages());
+  {
+    auto Child = Space.ForkChild();
+    assert(!Child.CanReplace(Mixed, PageSize, true) && !Child.CanReplace(Middle, PageSize, false));
+    *Private = 56;
+    *Shared = 78;
+    Child.RestorePrivatePages();
+    assert(*Private == 12 && *Shared == 78);
+  }
+  assert(Space.CanReplace(Middle, PageSize, false));
+  assert(Space.Set(Mixed, 3 * PageSize, Space.Unmapped, true));
+
   alignas(PageSize) static char Image[3 * PageSize];
   const auto Base = reinterpret_cast<uint64_t>(Image);
   Space.Register(Base, 3 * PageSize, PF_R);

@@ -68,6 +68,11 @@ public:
   // ---- launcher thread ----
   // Queues a session. false when the runtime already decided to end (the caller joins this service and makes a new one).
   bool Add(const std::shared_ptr<HostSession>& Session);
+  void SetForeground(uint64_t Id, bool Value) {
+    if (Value) Foreground.store(Id, std::memory_order_relaxed);
+    else Foreground.compare_exchange_strong(Id, 0, std::memory_order_relaxed);
+  }
+  uint64_t ForegroundId() const { return Foreground.load(std::memory_order_relaxed); }
   bool List(const std::shared_ptr<SessionDirectory>& Directory);
   // Starts the runtime thread (the first session was added). SingleBlock: the runtime-wide single-block JIT mode.
   bool Start(bool SingleBlock);
@@ -96,6 +101,7 @@ public:
 private:
   struct Worker;
   std::mutex Mutex;
+  std::atomic<uint64_t> Foreground {};
   std::vector<std::shared_ptr<HostSession>> Pending;
   std::vector<std::shared_ptr<SessionDirectory>> Listings;
   bool Ending {};

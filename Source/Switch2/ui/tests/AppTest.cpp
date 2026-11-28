@@ -277,6 +277,16 @@ void TestShellAndDev() {
   const int Ticks = S.B.Ticks;
   S.Frames(4);
   CHECK(S.B.Ticks == Ticks + 4 && Tabs.TabCount() == 3);
+  CHECK(!S.B.Shells[0]->Foreground && !S.B.Shells[1]->Foreground && S.B.Shells[2]->Foreground);
+  S.Press(Button::L);
+  CHECK(!S.B.Shells[0]->Foreground && S.B.Shells[1]->Foreground && !S.B.Shells[2]->Foreground);
+  S.Press(Button::R);
+  CHECK(!S.B.Shells[0]->Foreground && !S.B.Shells[1]->Foreground && S.B.Shells[2]->Foreground);
+  S.Press(Button::Plus);
+  CHECK(S.A->TopKind() == ScreenKind::Settings);
+  CHECK(!S.B.Shells[0]->Foreground && !S.B.Shells[1]->Foreground && !S.B.Shells[2]->Foreground);
+  S.Press(Button::B);
+  CHECK(S.A->TopKind() == ScreenKind::Shell && S.B.Shells[2]->Foreground);
   S.Press(Button::A);
   CHECK(S.B.Shells[0]->Written.empty() && S.B.Shells[1]->Written.empty() && S.B.Shells[2]->Written == "\r");
   S.B.Shells[1]->Feed("\x1b]2;Second\aonly second\x1b[5n");

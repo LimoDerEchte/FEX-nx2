@@ -49,6 +49,7 @@ public:
   int ActiveTab() const { return Active; }
   Tab& GetTab(int I) { return *Tabs[size_t(I)]; }
   TabStrip& Strip() { return Strip_; }
+  void SetForeground(bool Value);
   TerminalView& Terminal() { return Term; }
   HintBar& Hints() { return Bar; }
   ConfirmDialog& Confirm() { return ConfirmM; }

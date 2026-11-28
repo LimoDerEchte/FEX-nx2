@@ -34,6 +34,7 @@ public:
   static constexpr uint16_t WipeOnFork = 0x20; // MADV_WIPEONFORK: zero in the fork child
   static constexpr uint16_t Sealed = 0x40;     // mseal
   static constexpr uint16_t Locked = 0x100;    // mlock accounting
+  static constexpr uint16_t SharedPage = 0x200;
 
   GuestAddressSpace() = default;
   explicit GuestAddressSpace(GuestArena& Arena) : Arena {&Arena} {}
@@ -172,9 +173,8 @@ public:
     for (const auto& Region : Regions) {
       if (Start < Region.Base + Region.Size && Region.Base < Start + Size) return false;
     }
-    Regions.emplace_back(Start, Size, Flags);
+    Regions.emplace_back(Start, Size, Flags | SharedPage);
     Regions.back().Storage = std::move(Storage);
-    Regions.back().Shared = true;
     Regions.back().FileBacked = true;
     Regions.back().MayWrite = MayWrite;
     return true;
@@ -201,9 +201,20 @@ public:
 
   // Anonymous or file mappings that more than one view shares (MAP_SHARED).
   bool IsShared(uint64_t Start, size_t Size) const {
-    return std::any_of(Regions.begin(), Regions.end(), [&](const auto& Region) {
-      return Region.Shared && Start < Region.Base + Region.Size && Region.Base < Start + Size;
-    });
+    if (!Size || Size > UINT64_MAX - Start || Start + Size > UINT64_MAX - (PageSize - 1)) return false;
+    const auto Base = Start & ~(PageSize - 1);
+    return AnyHave(Base, RoundUp(Start + Size - Base), SharedPage);
+  }
+
+  bool CanReplace(uint64_t Start, size_t Size, bool Shared) const {
+    for (const auto& Region : Regions) {
+      const auto [First, End] = Overlap(Region, Start, Size);
+      if (First == End || Region.Storage.use_count() <= 1) continue;
+      // shortcut: Conflicting shared backing needs per-process host mappings at the same address.
+      if (Shared || std::any_of(Region.Pages.begin() + First, Region.Pages.begin() + End,
+                               [](uint16_t Page) { return !(Page & Unmapped) && (Page & SharedPage); })) return false;
+    }
+    return true;
   }
 
   // True when every page in the range is private anonymous memory the guest owns.
@@ -219,7 +230,7 @@ public:
       if (!It->Contains(Address, Size)) continue;
       const auto Flags = It->Pages[(Address - It->Base) / PageSize];
       if ((Flags & Unmapped) || !Resident_(*It, Flags)) return {};
-      Shared = It->Shared;
+      Shared = Flags & SharedPage;
       return {It->Storage, reinterpret_cast<const uint8_t*>(Address)};
     }
     return {};
@@ -410,8 +421,12 @@ public:
     for (const auto& Part : Regions) {
       if (!(OldStart < Part.Base + Part.Size && Part.Base < OldEnd)) continue;
       Extendable = Extendable && Part.Arena && Part.Storage && !Part.FileBacked;
-      Movable = Movable && Extendable && !Part.Shared;
-      AnyShared = AnyShared || Part.Shared;
+      Movable = Movable && Extendable;
+      const auto [FirstPage, EndPage] = Overlap(Part, OldStart, OldSize);
+      const bool Shared = std::any_of(Part.Pages.begin() + FirstPage, Part.Pages.begin() + EndPage,
+                                      [](uint16_t Page) { return Page & SharedPage; });
+      Movable = Movable && !Shared;
+      AnyShared = AnyShared || Shared;
     }
     // MREMAP_DONTUNMAP of a shared mapping is EINVAL here (Linux 7.3 allows it): one object cannot be mapped twice.
     if (DontUnmap && AnyShared) return RemapStatus::Invalid;
@@ -429,7 +444,8 @@ public:
       const auto Extra = NewSize - OldSize;
       const auto Last = TopIndex(OldEnd - 1);
       auto& Region = Regions[Last];
-      if (Extendable && Extra <= Region.Size - (OldEnd - Region.Base)) {
+      if (Extendable && Extra <= Region.Size - (OldEnd - Region.Base) &&
+          CanReplace(OldEnd, Extra, Head & SharedPage)) {
         const auto FirstPage = (OldEnd - Region.Base) / PageSize;
         bool Free = true;
         for (auto Page = FirstPage; Page < FirstPage + Extra / PageSize; ++Page) Free = Free && (Region.Pages[Page] & Unmapped);
@@ -443,12 +459,11 @@ public:
         }
       }
       if (Extendable && Arena && Arena->ReserveAt(OldEnd, Extra)) {
-        const bool SharedTail = Region.Shared;
         if ((Head & ProtMask) && !Arena->Commit(OldEnd, Extra)) {
           Arena->Release(OldEnd, Extra);
           return RemapStatus::NoMemory;
         }
-        AddOwned(OldEnd, Extra, Head & ProtMask, SharedTail);
+        AddOwned(OldEnd, Extra, Head & ProtMask, Head & SharedPage);
         Regions.back().Pages.assign(Extra / PageSize, Inherited(Head) | (Head & ProtMask) | (Head & ProtMask ? Resident : 0));
         NewAddress = OldStart;
         return RemapStatus::Ok;
@@ -477,8 +492,9 @@ public:
       } else {
         // The target pages become fresh memory. Keep the reservation: only the
         // contents and the per-page attributes go.
+        if (!CanReplace(Target, NewSize, false)) return RemapStatus::NoMemory;
         Discard(Target, NewSize);
-        ChangeAttribute(Target, NewSize, DontFork | WipeOnFork | Locked, false);
+        ChangeAttribute(Target, NewSize, DontFork | WipeOnFork | Locked | SharedPage, false);
       }
     }
     if (!FixedStart) {
@@ -578,9 +594,9 @@ public:
   bool SavePrivatePages(bool (*Validate)(uint64_t, size_t) = nullptr) {
     std::vector<SavedRange> New;
     for (const auto& Region : Regions) {
-      if (Region.Shared) continue;
       const auto NeedsSave = [&](size_t Page) {
-        return !(Region.Pages[Page] & Unmapped) && Resident_(Region, Region.Pages[Page]);
+        const auto Flags = Region.Pages[Page];
+        return !(Flags & (Unmapped | SharedPage)) && Resident_(Region, Flags);
       };
       for (size_t Page = 0; Page < Region.Pages.size();) {
         if (!NeedsSave(Page)) {
@@ -613,7 +629,7 @@ public:
 private:
   static constexpr size_t NoRegion = SIZE_MAX;
   struct Region {
-    Region(uint64_t Base, size_t Size, uint8_t Flags)
+    Region(uint64_t Base, size_t Size, uint16_t Flags)
       : Base {Base}
       , Size {Size}
       , Pages(Size / PageSize, Flags) {}
@@ -626,7 +642,6 @@ private:
     size_t Size;
     std::vector<uint16_t> Pages;
     std::shared_ptr<void> Storage;
-    bool Shared {};
     bool FileBacked {};
     bool MayWrite {};
     bool Arena {}; // address space and commitment come from the GuestArena
@@ -640,16 +655,15 @@ private:
 
   static constexpr uint16_t Prot(uint16_t Byte) { return Byte & (ProtMask | Unmapped); }
   // Attributes a page keeps when its mapping grows or moves.
-  static constexpr uint16_t Inherited(uint16_t Byte) { return Byte & (DontFork | WipeOnFork | Locked); }
+  static constexpr uint16_t Inherited(uint16_t Byte) { return Byte & (DontFork | WipeOnFork | Locked | SharedPage); }
   // Pages outside the arena (images, external storage) are always resident.
   static bool Resident_(const Region& Region, uint16_t Byte) { return !Region.Arena || (Byte & Resident); }
 
   void AddOwned(uint64_t Address, size_t Size, uint8_t Flags, bool Shared) {
     auto* Owner = Arena;
-    Regions.emplace_back(Address, Size, Flags | (Flags ? Resident : 0));
+    Regions.emplace_back(Address, Size, Flags | (Flags ? Resident : 0) | (Shared ? SharedPage : 0));
     Regions.back().Storage = std::shared_ptr<void> {reinterpret_cast<void*>(Address),
                                                     [Owner, Address, Size](void*) { Owner->Release(Address, Size); }};
-    Regions.back().Shared = Shared;
     Regions.back().Arena = true;
   }
 
@@ -761,7 +775,7 @@ private:
           if (!Was) {
             if (!New.Fresh.empty() && New.Fresh.back().first + New.Fresh.back().second == Address) New.Fresh.back().second += PageSize;
             else New.Fresh.emplace_back(Address, PageSize);
-          } else if (!Region.Shared) {
+          } else if (!(Region.Pages[(Address - Region.Base) / PageSize] & SharedPage)) {
             std::memset(reinterpret_cast<void*>(Address), 0, PageSize);
           }
         }
@@ -797,7 +811,7 @@ private:
     const auto& Region = Regions[Top];
     const auto Byte = Region.Pages[(Address - Region.Base) / PageSize];
     if ((Byte & Unmapped) || (Byte & Need) != Need || !Resident_(Region, Byte)) return nullptr;
-    if (Live || Region.Shared) return reinterpret_cast<const uint8_t*>(Address);
+    if (Live || (Byte & SharedPage)) return reinterpret_cast<const uint8_t*>(Address);
     for (const auto& Range : Saved) {
       if (Address >= Range.Start && Address - Range.Start + Chunk <= Range.Size) {
         auto* Bytes = const_cast<SavedRange&>(Range).Bytes.get();

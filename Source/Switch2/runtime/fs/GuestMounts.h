@@ -342,6 +342,11 @@ inline std::variant<int64_t, FsOptions> ParseFsOptions(std::string_view Type, st
         if (Key == "uid") Out.Uid = static_cast<uint32_t>(*Id);
         if (Key == "gid") Out.Gid = static_cast<uint32_t>(*Id);
       } else return ErrInval;
+    } else if (Type == "cgroup2") {
+      // cgroup2_parse_param: the hierarchy-wide flags. They change nothing here (no controllers).
+      if (HasValue || (Key != "nsdelegate" && Key != "favordynmods" && Key != "memory_localevents" && Key != "memory_recursiveprot")) {
+        return ErrInval;
+      }
     } else {
       return ErrInval;  // sysfs and mqueue take no options
     }
@@ -352,7 +357,7 @@ inline std::variant<int64_t, FsOptions> ParseFsOptions(std::string_view Type, st
 // The filesystems mount(2) can create. Others are ENODEV (a kernel built without them, or one that needs a block
 // device).
 inline bool KnownFsType(std::string_view Type) {
-  return Type == "tmpfs" || Type == "ramfs" || Type == "proc" || Type == "sysfs" || Type == "devpts" || Type == "mqueue";
+  return Type == "tmpfs" || Type == "ramfs" || Type == "proc" || Type == "sysfs" || Type == "cgroup2" || Type == "devpts" || Type == "mqueue";
 }
 
 // ======================= mount flags =======================
@@ -472,7 +477,7 @@ inline std::shared_ptr<Superblock> MakeSuperblock(Ids& I, std::string_view Type,
   Sb->ReadOnly = Flags.SbReadOnly;
   Sb->Flags = Flags.SbFlags;
   Sb->Owner = std::move(Owner);
-  Sb->Pseudo = Type == "sysfs" || Type == "devpts" || Type == "mqueue";
+  Sb->Pseudo = Type == "sysfs" || Type == "cgroup2" || Type == "devpts" || Type == "mqueue";
   Sb->SizeBytes = Opts.SizeBytes;
   Sb->NrInodes = Opts.NrInodes;
   Sb->Mode = Opts.Mode.value_or(Type == "devpts" ? 0755 : 01777);

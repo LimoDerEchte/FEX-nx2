@@ -85,7 +85,7 @@ std::vector<SettingDef> BuildSchema() {
     S.push_back(D);
   }
 
-  // Logging: the launcher's log level is the one setting the runtime honors today.
+  // Logging: the launcher applies the log level to itself and the runtime.
   {
     SettingDef D = Enum("log_level", "Logging", "Log level", "How much the launcher and the guest runtime write to the SD log", Opts({{"standard", "Standard"}, {"detailed", "Detailed"}, {"trace", "Trace"}}), "standard");
     D.Honored = true;
@@ -94,6 +94,12 @@ std::vector<SettingDef> BuildSchema() {
 
   // Developer: the launcher's old diagnostic and test-bundle entries. Each runs in a program tab of the Shell screen.
   {
+    SettingDef Identity = Enum("gamepad_identity", "Developer", "Gamepad identity",
+                               "Controller reported to Linux games",
+                               Opts({{"xbox360", "Xbox 360 controller"}, {"switch_pro", "Switch Pro Controller"}}),
+                               "xbox360");
+    Identity.Honored = true;
+    S.push_back(Identity);
     auto Dev = [&](const char* Key, const char* Label, const char* Desc, const char* Text) {
       SettingDef D;
       D.Key = Key;

@@ -146,6 +146,7 @@ public:
   bool Readable() const { return !Events.empty(); }
   size_t Queued() const { return Events.size(); }
   bool HasWatches() const { return !Watches.empty(); }
+  const std::vector<Watch>& WatchList() const { return Watches; }
   // Counts queue changes, for edge-triggered epoll.
   uint64_t Changes() const { return ChangeCount; }
 

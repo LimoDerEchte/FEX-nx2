@@ -17,6 +17,8 @@ struct Segment {
   uint64_t Start;
   uint64_t Size;
   uint32_t Flags;
+  uint64_t Offset {};
+  uint64_t FileSize {};
 };
 
 struct ElfImage {
@@ -28,6 +30,9 @@ struct ElfImage {
   uint64_t ProgramHeaders {};
   uint16_t ProgramHeaderCount {};
   std::string Interpreter;
+  std::string Path;
+  uint64_t Inode {};
+  uint64_t Device {};
 
   std::span<const Segment> GetSegments() const {
     return {Segments.data(), SegmentCount};

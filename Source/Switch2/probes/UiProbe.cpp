@@ -87,6 +87,10 @@ void Handle(const ui::Event& E, State& S) {
       ui::Log("input: first stick event pad=%u stick=%u x=%.2f y=%.2f", E.Pad, E.StickIndex, E.X, E.Y);
     }
     break;
+  case T::PadCancel:
+    for (auto& Axes : S.Stick)
+      Axes[0] = Axes[1] = 0;
+    break;
   case T::Touch: {
     auto It = std::find_if(S.Touches.begin(), S.Touches.end(), [&](const Touch& T2) { return T2.Id == E.TouchId; });
     if (E.Phase == ui::TouchPhase::Up) {
@@ -115,6 +119,7 @@ void Handle(const ui::Event& E, State& S) {
       ui::Log("input: first mouse move x=%.0f y=%.0f dx=%.1f dy=%.1f (output px)", E.X, E.Y, E.DX, E.DY);
     }
     break;
+  case T::MouseCancel:
   case T::MouseButton:
     S.MouseSeen = true;
     if (E.Pressed)

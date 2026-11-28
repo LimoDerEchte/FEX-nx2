@@ -106,6 +106,7 @@ public:
   virtual void Write(std::string_view Input) = 0;      // keys, already encoded as the guest expects them
   virtual bool Running() = 0;                          // false once the shell exited
   virtual bool ChildRunning() = 0;                     // a foreground process other than the shell itself is running
+  virtual void SetForeground(bool Value) { (void)Value; }
   virtual void Resize(int Cols, int Rows) { (void)Cols; (void)Rows; }  // the terminal grid changed (TIOCGWINSZ)
   // The tab title until the program sets one with OSC 0/2 ("" = the screen's default, "Shell" or "Root shell").
   virtual std::string Title() { return {}; }
@@ -191,6 +192,7 @@ public:
   virtual size_t SessionRead(int Id, char* Out, size_t Max) { (void)Id; (void)Out; (void)Max; return 0; }
   virtual void SessionWrite(int Id, std::string_view Input) { (void)Id; (void)Input; }
   virtual void SessionResize(int Id, int Cols, int Rows) { (void)Id; (void)Cols; (void)Rows; }
+  virtual void SessionForeground(int Id, bool Value) { (void)Id; (void)Value; }
   virtual void SessionClose(int Id) { (void)Id; }
   virtual SessionInfo SessionState(int Id) { (void)Id; return SessionInfo {}; }
 
@@ -205,6 +207,7 @@ public:
   void Write(std::string_view Input) override { Be.SessionWrite(Id, Input); }
   bool Running() override { return Be.SessionState(Id).Running; }
   bool ChildRunning() override { return Be.SessionState(Id).ChildRunning; }
+  void SetForeground(bool Value) override { Be.SessionForeground(Id, Value); }
   void Resize(int Cols, int Rows) override { Be.SessionResize(Id, Cols, Rows); }
   std::string Title() override { return Be.SessionState(Id).Title; }
   std::string ExitNote() override { return Be.SessionState(Id).ExitNote; }

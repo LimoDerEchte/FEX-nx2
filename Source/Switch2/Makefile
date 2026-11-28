@@ -112,7 +112,7 @@ $(UI_GEN)/ui_%.h: $(UI_DIR)/render/shaders/ui.%
 	glslangValidator -V --quiet --vn ui_$* -o $@ $<
 
 # Console objects.
-UI_SW2_INC := $(UI_INC) -I$(PORTLIBS)/include/freetype2 -I$(PORTLIBS)/include/harfbuzz $(UI_DEFS)
+UI_SW2_INC := $(UI_INC) -Iruntime/process -I$(PORTLIBS)/include/freetype2 -I$(PORTLIBS)/include/harfbuzz $(UI_DEFS)
 $(UI_SW2)/%.o: $(UI_DIR)/%.cpp Makefile $(UI_SHADERS)
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(UI_SW2_INC) -MMD -MP -c $< -o $@
@@ -595,9 +595,9 @@ FILESYSTEM_TEST_DIR ?= $(BUILD)/guest/sd
 # Stages only test programs, sidecars and helper scripts into
 # $(FILESYSTEM_TEST_DIR)/fex/games: nothing that would overwrite the installed
 # Ubuntu RootFS. The folder is removed first so stale files disappear.
-filesystem-runtime: $(BUILD)/op-bench-debian.elf $(BUILD)/final-pass-suite-debian.elf $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf $(BUILD)/pty-suite-debian.elf $(BUILD)/thread-suite-debian.elf
+filesystem-runtime: $(BUILD)/op-bench-debian.elf $(BUILD)/final-pass-suite-debian.elf $(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf $(BUILD)/pty-suite-debian.elf $(BUILD)/thread-suite-debian.elf $(BUILD)/kernel-files-suite-debian.elf
 	rm -rf "$(FILESYSTEM_TEST_DIR)/fex"
-	python3 tools/StageDebian.py --games "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 3,5,$^) --filesystem-probe $(word 6,$^) --fs-suite $(word 7,$^) --name-limit-probe $(word 8,$^) --proc-suite $(word 9,$^) --process-acceptance $(word 10,$^) --comm-suite $(word 11,$^) --comm-acceptance $(word 12,$^) --container-suite $(word 13,$^) --container-acceptance $(word 14,$^) --pty-suite $(word 15,$^) --thread-suite $(word 16,$^) --op-bench $(word 1,$^) --final-pass-suite $(word 2,$^)
+	python3 tools/StageDebian.py --games "$(DEBIAN_ROOT)" "$(FILESYSTEM_TEST_DIR)" $(wordlist 3,5,$^) --filesystem-probe $(word 6,$^) --fs-suite $(word 7,$^) --name-limit-probe $(word 8,$^) --proc-suite $(word 9,$^) --process-acceptance $(word 10,$^) --comm-suite $(word 11,$^) --comm-acceptance $(word 12,$^) --container-suite $(word 13,$^) --container-acceptance $(word 14,$^) --pty-suite $(word 15,$^) --thread-suite $(word 16,$^) --op-bench $(word 1,$^) --final-pass-suite $(word 2,$^) --kernel-files-suite $(word 17,$^)
 
 # Filesystem compatibility suite: the Debian guest ELF and a native reference
 # run on the host kernel, as the current user and, where user namespaces
@@ -651,6 +651,32 @@ check-proc-suite-native: $(BUILD)/proc-suite-host
 	if [ -x "$(DEBIAN_LIBS)/ld-linux-x86-64.so.2" ]; then \
 		$(MAKE) $(BUILD)/proc-suite-debian.elf && \
 		cd $(BUILD)/proc-suite-native && { "$(DEBIAN_LIBS)/ld-linux-x86-64.so.2" --library-path "$(DEBIAN_LIBS)" ../proc-suite-debian.elf procfs/; test $$? -eq 42; }; \
+	else \
+		echo "Skipping the Debian glibc run: no debian-sysroot (make debian-sysroot)"; \
+	fi
+
+.PHONY: kernel-files-suite check-kernel-files-suite-native
+kernel-files-suite: $(BUILD)/kernel-files-suite-debian.elf
+
+# Use Debian's libc headers so scanf and strto* bind to symbols its runtime exports.
+$(BUILD)/kernel-files-suite.o: tests/guest/KernelFilesSuite.c Makefile $(DEBIAN_CRT)/Scrt1.o | $(BUILD)
+	$(HOST_X86_CC) -m64 -march=x86-64 -std=gnu11 -O2 -fPIE -pthread -Wall -Wextra -Werror \
+		-isystem "$(DEBIAN_ROOT)/usr/include/x86_64-linux-gnu" -isystem "$(DEBIAN_ROOT)/usr/include" -c $< -o $@
+
+$(BUILD)/kernel-files-suite-host: tests/guest/KernelFilesSuite.c | $(BUILD)
+	$(HOST_X86_CC) -std=gnu11 -O2 -pthread -Wall -Wextra -Werror $< -o $@
+
+check-kernel-files-suite-native: $(BUILD)/kernel-files-suite-host
+	mkdir -p $(BUILD)/kernel-files-suite-native
+	cd $(BUILD)/kernel-files-suite-native && { ../kernel-files-suite-host; test $$? -eq 42; }
+	if unshare --map-root-user true 2>/dev/null; then \
+		cd $(BUILD)/kernel-files-suite-native && { unshare --map-root-user ../kernel-files-suite-host; test $$? -eq 42; }; \
+	else \
+		echo "Skipping the namespace-root run: unshare --map-root-user is unavailable"; \
+	fi
+	if [ -x "$(DEBIAN_LIBS)/ld-linux-x86-64.so.2" ]; then \
+		$(MAKE) $(BUILD)/kernel-files-suite-debian.elf && \
+		cd $(BUILD)/kernel-files-suite-native && { "$(DEBIAN_LIBS)/ld-linux-x86-64.so.2" --library-path "$(DEBIAN_LIBS)" ../kernel-files-suite-debian.elf; test $$? -eq 42; }; \
 	else \
 		echo "Skipping the Debian glibc run: no debian-sysroot (make debian-sysroot)"; \
 	fi
@@ -762,7 +788,7 @@ filesystem-probe: $(BUILD)/filesystem-probe-debian.elf
 $(BUILD)/filesystem-probe.o: tests/guest/FilesystemProbe.c | $(BUILD)
 	$(HOST_X86_CC) -m64 -march=x86-64 -O2 -fPIE -Wall -Wextra -Werror -c $< -o $@
 
-$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf $(BUILD)/pty-suite-debian.elf $(BUILD)/thread-suite-debian.elf $(BUILD)/op-bench-debian.elf $(BUILD)/final-pass-suite-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
+$(BUILD)/thread-ipc-debian.elf $(BUILD)/glibc-probe-debian.elf $(BUILD)/process-probe-debian.elf $(BUILD)/filesystem-probe-debian.elf $(BUILD)/fs-suite-debian.elf $(BUILD)/name-limit-debian.elf $(BUILD)/proc-suite-debian.elf $(BUILD)/process-acceptance-debian.elf $(BUILD)/comm-suite-debian.elf $(BUILD)/comm-acceptance-debian.elf $(BUILD)/container-suite-debian.elf $(BUILD)/container-acceptance-debian.elf $(BUILD)/pty-suite-debian.elf $(BUILD)/thread-suite-debian.elf $(BUILD)/op-bench-debian.elf $(BUILD)/final-pass-suite-debian.elf $(BUILD)/kernel-files-suite-debian.elf: $(BUILD)/%-debian.elf: $(BUILD)/%.o $(DEBIAN_CRT)/Scrt1.o $(DEBIAN_CRT)/crti.o $(DEBIAN_CRT)/crtn.o $(DEBIAN_LIBS)/libc.so.6
 	$(HOST_X86_LD) -m elf_x86_64 -pie --dynamic-linker /lib64/ld-linux-x86-64.so.2 -rpath-link "$(DEBIAN_LIBS)" \
 		"$(DEBIAN_CRT)/Scrt1.o" "$(DEBIAN_CRT)/crti.o" $< "$(DEBIAN_LIBS)/libc.so.6" "$(DEBIAN_CRT)/crtn.o" -o $@
 
@@ -842,11 +868,60 @@ check-guest-credentials: $(BUILD)/guest-credentials-test
 $(BUILD)/guest-credentials-test: tests/unit/GuestCredentialsTest.cpp GuestCredentials.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $(INC) $< -o $@
 
+.PHONY: check-guest-vma-list
+check-guest-vma-list: $(BUILD)/guest-vma-list-test
+	$<
+
+$(BUILD)/guest-vma-list-test: tests/unit/GuestVmaListTest.cpp GuestVmaList.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $(INC) $< -o $@
+
 .PHONY: check-guest-procfs
 check-guest-procfs: $(BUILD)/guest-procfs-test
 	$<
 
 $(BUILD)/guest-procfs-test: tests/unit/GuestProcfsTest.cpp GuestProcfs.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $(INC) $< -o $@
+
+.PHONY: check-guest-sysctl
+check-guest-sysctl: $(BUILD)/guest-sysctl-test
+	$<
+
+$(BUILD)/guest-sysctl-test: tests/unit/GuestSysctlTest.cpp GuestSysctl.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $(INC) $< -o $@
+
+.PHONY: check-guest-sysfs
+check-guest-sysfs: $(BUILD)/guest-sysfs-test
+	$<
+
+$(BUILD)/guest-sysfs-test: tests/unit/GuestSysfsTest.cpp GuestSysfs.h GuestInputFeed.h GuestEvdev.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $(INC) $< -o $@
+
+.PHONY: check-guest-evdev
+check-guest-evdev: $(BUILD)/guest-evdev-test
+	$<
+
+$(BUILD)/guest-evdev-test: tests/unit/GuestEvdevTest.cpp GuestEvdev.h GuestPosixAcl.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $(INC) $< -o $@
+
+.PHONY: check-guest-input-feed
+check-guest-input-feed: $(BUILD)/guest-input-feed-test
+	$<
+
+$(BUILD)/guest-input-feed-test: tests/unit/GuestInputFeedTest.cpp GuestInputFeed.h GuestEvdev.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $(INC) $< -o $@
+
+.PHONY: check-guest-ioctl
+check-guest-ioctl: $(BUILD)/guest-ioctl-test
+	$<
+
+$(BUILD)/guest-ioctl-test: tests/unit/GuestIoctlTest.cpp GuestIoctl.h | $(BUILD)
+	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $(INC) $< -o $@
+
+.PHONY: check-guest-kernel-tree
+check-guest-kernel-tree: $(BUILD)/guest-kernel-tree-test
+	$<
+
+$(BUILD)/guest-kernel-tree-test: tests/unit/GuestKernelTreeTest.cpp GuestKernelTree.h | $(BUILD)
 	$(HOST_CXX) -std=c++20 -Wall -Wextra -Werror $(INC) $< -o $@
 
 .PHONY: check-guest-clocks

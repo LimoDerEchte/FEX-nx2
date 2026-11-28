@@ -12,9 +12,140 @@ User decision (2026-11-27): the whole SD card appears in the guest at `/mnt/sd`,
 with FEX's internal folders hidden (`/fex/rootfs`, `/fex/.inode`, `/fex/.tmp` and older tmpfs areas, `/fex/.download`,
 `/fex/config`). Card launches then run as `/mnt/sd/<card path>` (cwd and `/proc/self/exe` inside that mount).
 
+### Milestone 5 complete: 0.18.25 console acceptance (2026-11-28)
+
+- Final Pass Suite on 0.18.24 (`.superpowers/sdd/console-0.18.24-final.log`): 12/13 clean, 1200/1/11.
+  The only failure was `input/pad_identity_capabilities_and_idle` in the UID 1000 suite. Both `access` and
+  `open` returned EACCES, as expected in the root runner's tab. The suite's `CHECK` macro cleared `errno`
+  before the assertion. 0.18.25 saves the error before invoking `CHECK`.
+- The root-shell manual checks passed. The log confirms UID 0, the absence of the fex ACL entry, and EACCES
+  for a fresh UID 1000 open. The release chord remains unverified on hardware and is outside the targeted retest.
+- Host and staging: `cmake --build Source/Switch2/build/guest --target guest_nro` passed with zero warnings.
+  `make -C Source/Switch2 check-nro-assets` verified all 51 assets.
+  `make -C Source/Switch2 check-kernel-files-suite-native kernel-files-suite filesystem-runtime` passed.
+  Native Linux returned 26/0/8 in all three runs.
+- NRO: `build/guest/sd/switch/fex-switch2-guest.nro`, archived at `.superpowers/sdd/fex-switch2-guest-0.18.25.nro`.
+  Staged games: `build/guest/sd/fex/games/`.
+- Console 0.18.25 (`.superpowers/sdd/console-0.18.25.log`): Run ELF launched both kernel-files identities directly.
+  Each passed 33/0/1, including the pad capability test. These runs exercised foreground access. The 0.18.24
+  final-pass log already showed the correct EACCES from both calls in the root runner. The test now preserves
+  that errno. Acceptance combines the 0.18.24 milestone run and the 0.18.25 suite retest.
+- Next: [Milestone 6, non-PIE executables](docs/Milestone6Plan.md). Review the draft design with the user before
+  starting implementation.
+
+#### Milestone 5 on 0.18.24 (2026-11-28, uncommitted)
+- 0.18.24 includes fixes for the five suite failures and the manual findings from the 0.18.23 run below.
+  - The final-pass runner's `.elf.user` starts a root login tab. A UID 1000 child without pad access now verifies
+    EACCES and skips the capability checks. Its own foreground tab should exercise the full test.
+  - Fixed anonymous overlays can change the sharing mode of individual pages within an exclusive arena reservation.
+    Conflicting overlays on reservations held by a fork peer remain limited as described in
+    [CommunicationInventory.md](docs/CommunicationInventory.md).
+  - `/proc/<pid>/environ` reads the original environment bytes from the process's stack with offsets and fork state.
+  - Input discovery entries use root ownership and creation times. The event nodes keep their input group.
+  - Sine, triangle and square effects use the Linux ff-memless magnitude-to-rumble conversion and replay envelope.
+    The log records output at the launcher pty so a sudo relay does not log its nested pty a second time.
+- Host checks passed:
+  `make -C Source/Switch2 -j4 check-guest-evdev check-guest-procfs check-guest-sysfs check-guest-input-feed check-guest-kernel-tree check-guest-memory check-guest-vma-list`.
+  `cmake --build Source/Switch2/build/guest --target guest_nro` passed with zero warnings.
+  `make -C Source/Switch2 check-nro-assets` found all 51 assets. `git diff --check` passed.
+- Native Linux 7.3.6: `make -C Source/Switch2 check-kernel-files-suite-native` passed (26/0/8 in all three runs).
+  Outside the sandbox, `make -C Source/Switch2 -k check-proc-suite-native check-comm-suite-native check-thread-suite-native check-pty-suite-native check-container-suite-native check-fs-suite-native`
+  passed comm (122/0/3 twice), thread (36/0/0 and 35/0/1), pty (43/0/0 three times), container (50/0/4 twice), and
+  fs (81/0/2 twice). Proc UID 1000 passed 249/0/7. The first namespace-root run had 252/1/3 (`procfs/ps_scan`).
+  The unrestricted retry `make -C Source/Switch2 check-proc-suite-native` passed 249/0/7, 253/0/3 and 6/0/0.
+- Staged with `make -C Source/Switch2 kernel-files-suite filesystem-runtime`. Version 0.18.24 was verified in the
+  NRO, and the staged kernel-files ELFs match the guest build. The NRO copies match SHA-256
+  `3c8d8ee8c1fea081157fc59cf3bd60765b37fc7a8bce30a9148f5d7bee3f2266`.
+  Use `build/guest/sd/switch/fex-switch2-guest.nro` and `build/guest/sd/fex/games/`.
+  Archived NRO: `.superpowers/sdd/fex-switch2-guest-0.18.24.nro`.
+- Console `.superpowers/sdd/console-0.18.24.log`: kernel-files as user and root both 33/0/1. The user run passed
+  the pad test and skipped the cross-UID maps test because no other userspace UID was visible. Both runs passed
+  the fixed maps and environ cases. Proc 243/0/6, thread 36/0/0, pty 43/0/0. Comm has no result in this log.
+- The user reported that manual checks other than the combined ACL and chord check worked. The log confirms the
+  periodic sine upload, single sudo output and Switch Pro identity. It also shows the open pad FD delivered a
+  24-byte event after switching tabs. The second tab was another fex shell, so the root-to-fex ACL transition
+  and the physical chord result remain unverified.
+
+#### Milestone 5 history through 0.18.23 (2026-11-28, uncommitted)
+- Codex was dropped (user).
+- The agents' reports in `.superpowers/sdd/` (m5-task-2, m5-task-3-4, m5-task-5-7): host checks pass; `guest_nro`
+  builds with 0 warnings.
+- NRO `.superpowers/sdd/fex-switch2-guest-0.18.20.nro`.
+- Next: a console regression check, then Task 8 (Claude), then the whole-milestone review.
+- 0.18.20 on the console (`.superpowers/sdd/console-0.18.20.log`): final pass 10/11 clean, 1133/1/10, with comm
+  `tcp_nonblocking_connect_einprogress` failing (connect returned 0). `ps aux`, `top -bn1` and `lscpu` crashed the app
+  (HOS exception). The other shell checks passed, including the battery value.
+- Fixes in 0.18.21 (`.superpowers/sdd/fex-switch2-guest-0.18.21.nro`):
+  - **Crash.** The runtime passed FEX no `CPUMIDRs`, so `PerCPUData` was empty, and the brand leaves 0x80000002-4 read
+    for `/proc/cpuinfo` indexed past it. Fix: one A78C MIDR per core in `InitializeProcessContext`.
+  - **connect.** A nonblocking TCP connect now always returns EINPROGRESS, as on Linux: the console's stack completed
+    one loopback connect at once.
+- 0.18.21 on the console (`.superpowers/sdd/console-0.18.21.log`):
+  - comm-suite passed; `ps aux` and `top -bn1` work.
+  - `top` warned "libnuma: Warning: /sys not mounted or invalid".
+  - `lscpu` aborted: `print_cpuset: Assertion 'set' failed`.
+  - Cause of both: no `/sys/devices/system/node/node0/cpumap`.
+- 0.18.22 adds the node files Linux always has: `possible`, `has_*`, `node0/{cpumap,distance,cpuN}` and
+  `cpuN/node0`. NRO `.superpowers/sdd/fex-switch2-guest-0.18.22.nro`.
+- 0.18.22 on the console (`.superpowers/sdd/console-0.18.22.log`): `lscpu` and `top -bn1` work, with no libnuma
+  warning (user).
+- Tasks 2-7 regressions are closed.
+- Task 8 was done by Codex (user request; gpt-6.2-sol, medium effort) in three parts.
+  - The briefs and reports are `.superpowers/sdd/m5-task-8{a,b,c}-{brief,report}.md`.
+  - 8a: the feed, UI reader, rumble, Gamepad identity setting and ownership chord. 8b: `/dev/input/eventN`.
+    8c: sysfs, udev data, by-id/by-path links and inotify hot-plug.
+  - Host checks pass and `guest_nro` builds with 0 warnings. Not run on the console.
+- Whole-milestone review done (`.superpowers/sdd/m5-review.md`: 0 Critical, 2 Important, 9 Minor).
+  - I1 (input gid lookup on every launch) was fixed by the orchestrator in `PrepareRootfsFiles`.
+  - Codex fixed I2 (logind `uaccess` seat ACL for pads, `getfacl`), M2 (evdev ioctl errno), M3 (identity change
+    reconnects pads), M5 (dead code) and M9 (inventory note). Report: `.superpowers/sdd/m5-review-fixes-report.md`.
+  - M1, M4, M6, M7 and M8 are accepted as is (see the review file).
+- `tests/guest/KernelFilesSuite.c` (Codex, report `.superpowers/sdd/m5-suite-report.md`): 34 tests, staged as
+  `kernel-files-suite.elf` (uid 1000) and `kernel-files-suite-root.elf` (uid 0), both in `FINAL_PASS_SUITES`
+  (13 launches).
+  - Native Linux 7.3.6: 26/0/8 as uid 1000, as namespace root and as the Debian guest ELF. The skips are Switch 2-only
+    tests or features the host lacks.
+  - `make check-kernel-files-suite-native` ok; `guest_nro` 0 warnings; `check-nro-assets` ok.
+- 0.18.23 = M5 final acceptance build. NRO `.superpowers/sdd/fex-switch2-guest-0.18.23.nro` (also
+  `build/guest/sd/switch/`); games `build/guest/sd/fex/games/`. Pending: the user's console final pass.
+  - Expected: final pass 13/13 clean. Kernel files suite: 34/0/0 as user and 33/0/1 as root with a pad connected.
+  - Then input checks by hand: `/dev/input`, `getfacl`, `evtest`, the +/- chord, rumble and hot-plug.
+  - Next after acceptance: one M5 commit (no push).
+- 0.18.23 on the console (`.superpowers/sdd/console-0.18.23.log`): final pass 11/13 clean, 1196/5/11. All other
+  suites are clean.
+  - kernel-files-suite 31/3/0 as user: `input/pad_identity_capabilities_and_idle` (pad open EACCES; the uid is not
+    the seat user), `maps/ranges_and_offsets` (`MAP_FIXED|MAP_SHARED|MAP_ANONYMOUS` gives ENOMEM),
+    `process/initial_environment_and_auxv` (`/proc/self/environ` does not match `environ`).
+  - kernel-files-suite 31/2/1 as root: the same last two tests fail.
+  - Manual checks (user: most work, not all tested): `/dev/input` nodes, links, `getfacl`, `evtest`, the fftest
+    rumble upload and inotify all work.
+  - Found in the manual checks: by-id/by-path and the sysfs links are owned by `fex` with time 0, where Linux has
+    root and the creation time. The fftest periodic sine upload fails with EINVAL although the pad advertises it.
+    Output under sudo appears twice in the log.
+- Handed to Codex (user at the Claude weekly limit): `.superpowers/sdd/codex-handoff.md` has the bugs F1-F6, the
+  steps to M5 acceptance and the commit, and the user rules from Claude's memory.
+
+### Milestone 5 (/proc, /sys, /dev, input): Task 1 accepted on console 0.18.19 (2026-11-27, uncommitted)
+Console 0.18.19 (log `.superpowers/sdd/console-0.18.19.log`): final pass 11/11 clean, 1134/0/10; shell checks OK
+(user). Next: the user runs Codex on Task 2 (`docs/Milestone5Plan.md`). The milestone commits once, at the end.
+- Plan: `docs/Milestone5Plan.md`. It is self-contained for Codex; tasks 2-7 are Codex's (the user runs it), 1 and 8
+  are Claude's.
+- Task 1 done (uncommitted):
+  - `runtime/process/GuestKernelTree.h` (`check-guest-kernel-tree`), filled by `BuildKernelFiles`, serves `/sys`
+    and `/proc/sys`;
+  - sysfs at `/sys` and read-only cgroup2 at `/sys/fs/cgroup`, also through mount(2);
+  - generated files stat with size 0; `SEEK_END` on them is EINVAL;
+  - `/proc/<pid>/mem`;
+  - kernel-tree writers (`ProcWriter::KernelTree`);
+  - `docs/KernelFilesInventory.md`.
+- Host: kernel-tree, mounts, procfs and namespaces checks pass; `guest_nro` builds with 0 warnings.
+- Console: NRO `.superpowers/sdd/fex-switch2-guest-0.18.19.nro`. Run the final pass suite (expected 11/11 clean,
+  1134/0/10) and the shell checks from the handoff.
+- Next: after console acceptance, the user runs Codex on Task 2. Open user decisions are in plan section 5.
+
 ### Multithreading milestone complete: 0.18.18 accepted and committed (2026-11-27)
 Console 0.18.18 (log `.superpowers/sdd/console-0.18.18.log`): final-pass-suite 11/11 clean, 1134/0/10. Committed on
-nx2 (not pushed). Next milestone: per AGENTS.md / Milestone5Plan.md (32-bit), after discussing with the user.
+nx2 (not pushed). Next milestone: M5 /proc, /sys, /dev and input (docs/Milestone5Plan.md). Order set by the user 2026-11-27: M5 /proc+/sys+/dev+input, M6 non-PIE, M7 Wayland compositor, M8 graphics acceleration, M9 32-bit.
 
 ### Multithreading Tasks 2-4 accepted on console 0.18.17 (2026-11-27)
 Console (log `.superpowers/sdd/console-0.18.17.log`): final-pass-suite 11/11 clean, 1134/0/10 (thread 36/0/0,
@@ -82,7 +213,7 @@ proc-root 249/0/0, comm 124/0/1 (root same), fs 81/0/2, fs-root 83/0/0, pty 43/0
 (root same), thread 24/0/0. Two-tab busy loop OK (user). Block linking: xz -T1 40.4 -> 3.1 s, -T4 450 -> 1.26 s;
 apt update is now limited by the mirrors, not by speed (user). EXPERIMENT diagnostics kept, each labeled: runtime
 lock-hold / long-block logs (> 20 ms only), .profile, .no-tso, op-bench, xz-scaling scripts.
-Next: Multithreading Tasks 2-4 (docs/MultithreadingPlan.md); fork-group swap cost (Milestone 7 per-process delta).
+Next: Multithreading Tasks 2-4 (docs/MultithreadingPlan.md); fork-group swap cost (Milestone 6 per-process delta).
 
 ### Multithreading Task 1, 0.18.0 pending console (2026-11-27)
 Plan `docs/MultithreadingTask1.md`. 1A (preparation) and 1B (host thread per guest thread, runtime lock, wake words,
@@ -413,7 +544,7 @@ See `.superpowers/sdd/ui-task8b-report.md` for the full check list.
 - **0.17.9 (2026-11-26, console not run): RootFS `/` owner.** 0.17.7 console: `/etc` and `/etc/sudoers.d` are 0:0, but `/` stayed 1000:1000: extraction skipped the image's root entry (the folder exists), so it had no owner record (default 1000). Extraction now applies the image root's owner (re-owned, 1000 to 0) and mode to `/` through new `RootfsWriter::SetOwner` (console: `ChangeOwner`). Fixture root pinned to 0755 1000:1000 (`-root-mode/-root-uid/-root-gid`); install_full checks `/` is 0:0 0755 (failed before). Existing installs: `chown 0:0 /` from the Root shell, or reinstall. sudo now fails with "unable to allocate pty: No such file or directory": no ptys yet, UI Task 8a. Host: `make check-rootfs-install` ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.9.elf`.
 - **0.17.10 (2026-11-26, console not run): UI Task 8a, runtime ptys.** `/dev/ptmx`, `/dev/pts/N` with Linux semantics (tty object shared with the console terminal, `TtyMaster` interface for 8b); details and Partial items in `docs/TerminalInventory.md`, report `.superpowers/sdd/ui-task8a-report.md`. New `tests/guest/PtySuite.c`: 43/0/0 native (uid 1000 and unshare-root), staged as `/bin/pty-suite.elf` and `/bin/pty-suite-root.elf` (+ `.user 0 0`). Host: 29/29 check-guest-* (new check-guest-pty), check-ui, proc and container suites native ok; guest_nro 0 warnings. Runtime wiring console-only, unverified (agent's least sure spots: pty waits in `WaitKind::IO`, stat/readlink of pty nodes through the SD path code). ELF `.superpowers/sdd/fex-switch2-guest-0.17.10.elf`. Next: 8b.
 - **0.17.10 console (2026-11-26, log `.superpowers/sdd/console-0.17.10.log`):** both runs from `sdmc:/fex/games` failed before start with "Could not open the selected file.": `Inspect` (launcher/LauncherBackend.cpp) reads a games program's interpreter by raw SD path (`ResolvePath` + `ReadElf`), but Ubuntu's `/lib64/ld-linux-x86-64.so.2` is a symlink chain kept in the inode store. The old Debian bundle staged a real ld-linux there, which hid it. Fix (interpreter through the guest namespace, like `ReadRootfsElf`) handed to the running 8b agent, which owns those files. Pty suite, sudo, acceptance: not run yet.
-- **Multithreading plan 2026-11-26:** guest threads still run on one host thread (cooperative scheduler + 10 ms watchdog preemption). Full plan `docs/MultithreadingPlan.md` (one runtime lock with the JIT outside it, host thread per guest thread, retry-model waits on per-thread wake objects, stop-the-world for whole-process changes, TSO at the second thread; Task 0 console feasibility probe first). Not started; proposed after UI Task 8, before Milestone 5's 32-bit work.
+- **Multithreading plan 2026-11-26:** guest threads still run on one host thread (cooperative scheduler + 10 ms watchdog preemption). Full plan `docs/MultithreadingPlan.md` (one runtime lock with the JIT outside it, host thread per guest thread, retry-model waits on per-thread wake objects, stop-the-world for whole-process changes, TSO at the second thread; Task 0 console feasibility probe first). Not started; proposed after UI Task 8, before the 32-bit work (now Milestone 9).
 - **UI Task 8 (ptys + tabs) started 2026-11-26,** split into 8a runtime ptys + `tests/guest/PtySuite.c` (Sonnet, brief `.superpowers/sdd/ui-task8a-brief.md`), 8b concurrent runtime + one Bash per tab on host-owned masters, 8c terminal emulation; then the whole-UI review. **8a done (host side, console not run, launcher still 0.17.9):** per-terminal `GuestTty` + devpts ptys (`runtime/process/GuestPty.h`, wiring in `GuestRuntime.cpp`), `tests/guest/PtySuite.c` (43 cases pass natively as uid 1000 and `unshare -r` root; staged as `/bin/pty-suite.elf` and `-root.elf` by `make filesystem-runtime`), `docs/TerminalInventory.md`, host test `make check-guest-pty`. Report `.superpowers/sdd/ui-task8a-report.md`. Console checklist: run `/bin/pty-suite.elf` and `/bin/pty-suite-root.elf` (expect 43 passed, exit 42), then `sudo true` in Bash (no pty error).
 - **0.17.8 (2026-11-26, console not run): UI fixes.** (1) Settings sidebar: the rule above About spans the whole sidebar (x 0 to `SidebarW`, `ui/screens/settings.cpp`). (2) Wipe steps read "Counting the files" / "Removing the files". (3) After a wipe the app no longer exits (left over from the old Settings wipe): Done shows A Continue, which sends `Request::Kind::StartFirstRun`; `App::StartFirstRun` closes every screen and opens first-run RootFS setup (B there exits, as on a launch without a RootFS). Reinstall is unchanged (Continue goes Home). New `TestWipeFlow` in `ui/tests/AppTest.cpp`. (4) Debian 12 removed (user decision: not planned): built-in index entry, card, tests, docs (`docs/ui/rootfs-image-format.md`, `docs/LauncherUiPlan.md`); the `Available`/`Reason` index fields stay, tested with a synthetic entry. The Debian developer sysroot tools (`tools/FetchDebian.py`, `make debian-sysroot`) are a separate thing and stay. Host: `make check-ui` ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.8.elf`.
 - **0.17.7 (2026-11-26, console not run): root-owned RootFS, hosts, login start folder.** 0.17.5 shell: `sudo true` said "/etc/sudoers.d is owned by uid 1000, should be 0", "unable to resolve host fex-switch2", "a password is required". Cause: the FEX image owns all 39,528 entries as 1000/1000 (`unsquashfs -lln`) and the installer kept image owners, so sudo ignored `/etc/sudoers.d/fex` (NOPASSWD rule, already written by setup) and asked for a password. Fix: `ExtractHooks::BuilderToRoot` (installer sets it) maps uid/gid `ImageBuilderId` 1000 to 0 at extraction; other ids stay; `/home/fex` stays 1000. `/etc/hosts` gains `127.0.1.1\tfex-switch2` when no line names `GuestHostName` (`HostsNames`). Because the system tree is now root's, runs as the default user start in `/home/fex` with HOME=/home/fex, and root runs start in `/root` (`RunProgram` in `launcher/LauncherBackend.cpp`, env in `RunGuest`); the suites make their scratch folders in the working directory. Old installs keep uid 1000 until reinstalled. nano/wget printing nothing in the log: user says they work; the log only captures stderr of shell children (not a bug to fix now). Tests: fixture gains `etc/sudoers.d` + README owned 1000 (`tools/CheckRootfsInstall.py`); install_full checks they become 0/0, setuid-probe stays 12/34, /home/fex 1000, hosts line; failed before the fix. Host: `make check-rootfs-install` ok, `make check-ui` ok, 28/28 check-guest-* ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.7.elf`.
@@ -421,7 +552,7 @@ See `.superpowers/sdd/ui-task8b-report.md` for the full check list.
 - **0.17.5 (2026-11-25, console not run): object store layout and extras status.** (1) Inode objects move from one flat `/fex/.inode/objects/<inode>` folder to `objects/<inode>>16 hex>/<(inode>>8)&0xff hex>/<inode>` (`ObjectFolder`/`ObjectPath`/`EnsureObjectFolder` in `runtime/GuestRuntime.cpp`; leaf folders cached per session). Reason: the user saw single small files in `/usr/share` take seconds late in a RootFS install; exFAT creates/looks up names by scanning the whole folder (0.16.12 log: 28,047 promotion intents, objects all in one folder). Unconfirmed as the cause until a console install log shows the time drop. No migration (user decision): a store with files directly in `objects/` is detected at load (`FlatObjectLayout`), logged ("old flat layout ... reinstall the RootFS") and the inode store is unavailable, so old RootFS installs must be reinstalled. (2) 0.17.2 console: extras configure failed with dpkg "parsing file '/var/lib/dpkg/status' near line 18573 package 'sudo': mixed non-coinstallable and coinstallable package instances present": the image keeps a non-installed `sudo` entry and the installer appended a second one. `WithoutReplacedEntries` (`runtime/fs/GuestRootfsInstall.h`) drops the image's entry for each unpacked package (dpkg instance rules: one per name, or one per arch for Multi-Arch: same) before appending; fixture status gains a `deinstall ok config-files` sudo entry and the test checks one sudo entry remains (failed before the fix, passes after). Host: `make check-rootfs-install` ok, 28/28 check-guest-* ok, guest_nro 0 warnings; the object layout is console-only code (host checks do not cover it). ELF `.superpowers/sdd/fex-switch2-guest-0.17.5.elf`.
 - **0.17.4 (2026-11-25, console not run): reinstall fixes.** 0.17.2 console: Reinstall showed no progress screen; log stopped at "Removing the existing RootFS" (the recursive SD delete ran on the UI thread, no frames). `ConsoleEnv::WipeRootfs` (`launcher/RootfsInstallHost.cpp`) now deletes on a worker thread and pumps the UI every 16 ms; the step shows "Removing the existing RootFS". The wipe now runs before the free-space check (user request), so the old RootFS's space counts. Host: `make check-rootfs-install` ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.4.elf`. Open: Settings > Wipe RootFS still deletes on the UI thread (frozen until done).
 - **0.17.3 (2026-11-25, console not run): UI fixes from the user's 0.17.1 notes.** Shell footer is the standard footer (`chrome::FooterY/FooterH`, terminal ends at 656); path chip as tall as Browse; focus ring clipped to the list (`Widget::RingClip`, file picker and Settings rows); file picker rows bound to slot `Index % PoolSize` (focus no longer falls to the sidebar when the list scrolls to the last entry; `TestPickerDownToLast`); Settings rows 74 du with the text centred 4 du above the middle, a rule above each section's first row, rules from the sidebar rule to the screen edge (also the About rule). Host: `make check-ui` ok, check-nro-assets ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.3.elf`.
-- **Non-PIE executables (python3) deferred to a potential Milestone 7** (user, 2026-11-25): draft plan `docs/Milestone7Plan.md`, nothing implemented. Tracked gap: Ubuntu's python3.12 and other ET_EXEC binaries return ENOEXEC; python3-* maintainer scripts fail in `apt upgrade`.
+- **Non-PIE executables (python3) deferred to Milestone 6** (user, 2026-11-25; renumbered 2026-11-27): draft plan `docs/Milestone6Plan.md`, nothing implemented. Tracked gap: Ubuntu's python3.12 and other ET_EXEC binaries return ENOEXEC; python3-* maintainer scripts fail in `apt upgrade`.
 - **0.17.2 (2026-11-25, console not run): 0.17.1 + signed archive index (item d).** ELF `.superpowers/sdd/fex-switch2-guest-0.17.2.elf`.
 - **0.17.1 (2026-11-25, superseded by 0.17.2 before a console run): fixes from the 0.17.0 console run.** 0.17.0 console: UI works; log `.superpowers/sdd/ui-task7-console-0.17.0.log`. Fixed: Home FTP pill 24 du higher; Settings/About row focus ring wider and inside the row rules (`RingOutsetY`); file picker stale rows after a folder change (rows unbound in `Open`, `Loaded` flag instead of "was not done this frame", which also fixes the missing scroll range and auto-scroll); picker B = parent folder (closes at a root), X = cancel; one header/footer component (`ui/components/Chrome.{h,cpp}`: `DrawScreenHeader`, `DrawFullRule`, `chrome::` layout) used by Settings, FTP, RootFS setup, picker, license view, gallery; header and footer rules edge to edge; Home B exits without a dialog; footer segments 8 du apart; wheel scroll 12 -> 2.4 du per unit. Removed: Debian developer setup (`launcher/RootfsSetupHost.cpp`, manifest/URL code of `GuestRootfsSetup.h`, `tests/unit/GuestRootfsSetupTest.cpp`, `tools/CheckRootfsSetup.py`, `tools/RootfsManifest.py`, `check-rootfs-setup`, `/fex/setup` staging) and the embedded-guest and JIT-probe developer rows. RootFS install: extras + sudo, nano, wget, whiptail (git is in the image); `/etc/sudoers.d/fex` (NOPASSWD, fex has no password); apt archive URI -> `mirror+http://mirrors.ubuntu.com/mirrors.txt` (security pocket unchanged). Host: `make check-ui` ok, `make check-rootfs-install` ok, 28/28 `check-guest-*` ok, `check-nro-assets` ok, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.1.elf`. **Open from the 0.17.0 log:** (a) python3 does not run: Ubuntu's `/usr/bin/python3.12` is non-PIE (ET_EXEC at 0x400000), `LoadElf` returns ENOEXEC, dash then runs py3clean/py3compile as sh scripts -> python3-* maintainer scripts fail during `apt upgrade`. Needs fixed low guest addresses (docs/Milestone3Sdk.md: not mappable on the console) -> guest/host address translation; milestone-sized, not planned yet. (b) apt "posix_openpt (2: ENOENT)": no /dev/ptmx until UI Task 8. (c) apt lock EACCES as user fex is correct (use sudo). (d) Fixed in 0.17.2: the extras' `InRelease` is now verified (`runtime/fs/OpenPgp.h`: SHA-512, RSA e=65537, cleartext framework, v4 signature packets) against the embedded Ubuntu Archive Automatic Signing Key (2018), fingerprint F6ECB3762474EDA9D21B7022871920D1991BC93C (`runtime/fs/UbuntuArchiveKey.h`); only the signed text is parsed. Checked by hand against the live noble and noble-updates InRelease (valid, ~8 ms each; one flipped byte rejected). Fixture archive is signed with a throwaway RSA-2048 key (`tools/CheckRootfsInstall.py`); `install_extras` passes, tampered / other-key / wrong-key InRelease are refused. Remaining: no Valid-Until in Ubuntu's InRelease, so an attacker can replay an older genuine index (old but genuine packages). Still open: the RootFS image itself is checked only by XXH3-64 (not cryptographic) over HTTP, as FEX's RootFS_links.json provides it. The machine-id RNG finding does not apply on the console (`RootfsInstallHost.cpp` uses libnx `randomGet`). Next: user's 0.17.2 console run (same checklist as 0.17.1), then RESUME below.
 - **0.17.0 (2026-11-25, console run, see 0.17.1): UI Tasks 6 and 7 in.** New Vulkan launcher UI replaces the text menu (reports `.superpowers/sdd/ui-task6-report.md`, `ui-task7-report.md`; console checklist draft in the Task 7 report). Host: `make check-ui` ok (70 PNGs), `make check-nro-assets` ok (51 embedded files), all `check-guest-*` and `check-rootfs-install` pass, guest_nro 0 warnings. ELF `.superpowers/sdd/fex-switch2-guest-0.17.0.elf`. **PAUSED (user, token limit).** RESUME: (1) collect the user's 0.17.0 console result; (2) UI Task 8 (ptys + shell tabs, LauncherUiPlan.md) via one Sonnet agent; (3) one Sonnet review of the whole UI diff (minor list in progress.md); (4) orchestrator fixes, console acceptance, one commit.
@@ -484,9 +615,9 @@ See `.superpowers/sdd/ui-task8b-report.md` for the full check list.
 - **Next.** Milestone 4, containers and scheduling
   ([Milestone4Plan.md](docs/Milestone4Plan.md)): namespaces, mounts,
   `pivot_root`/`chroot`, seccomp, `sched_*`, and Linux errors for the
-  machine-wide calls. Then milestone 5, a host thread per guest thread (Task 0) and 32-bit guests
-  ([Milestone5Plan.md](docs/Milestone5Plan.md)), and milestone 6, `/proc`,
-  `/sys`, `/dev` and input ([Milestone6Plan.md](docs/Milestone6Plan.md)). The
+  machine-wide calls. Then (numbers as of 2026-11-27) milestone 9, 32-bit guests
+  ([Milestone9Plan.md](docs/Milestone9Plan.md)), and milestone 5, `/proc`,
+  `/sys`, `/dev` and input ([Milestone5Plan.md](docs/Milestone5Plan.md)). The
   90 uninventoried syscalls and the open rows of milestones 1–3 are in
   [RemainingSyscalls.md](docs/RemainingSyscalls.md). Process for each
   milestone (AGENTS.md): sequential Sonnet task agents, one Sonnet review
@@ -2097,6 +2228,9 @@ native Vulkan layer. Steam Big Picture remains the long-term goal.
   registers cannot be read safely from EL0), then use the result for both builds: the compiler flags of the NRO itself
   (`-march`/`-mcpu` for the launcher, runtime and FEXCore host code) and the `HostFeatures` FEXCore generates guest code
   for (today the runtime passes none). Known so far: LSE, RCPC, LRCPC2 present (mtprobe 3).
+- **CPU overclocking (user, 2026-11-28).** The console's CPU cores can run at up to 1.3 GHz (user). Add a launcher
+  setting for the CPU clock while guests run, and restore the default clock on exit. `/sys` cpufreq should then report
+  the real clock: today `scaling_cur_freq` and `cpuinfo_max_freq` are the fixed `CpuFreqKHz`.
 - **Launcher review leftovers (0.17.16).** InRelease freshness (no Valid-Until / signature time check: replay of an older
   signed index is possible). The live RootFS index is plain HTTP (no TLS on the console): newer entries are limited to the
   built-in entry's host and marked not authenticated; a signed index would close it. The 0.16.3 perf counters

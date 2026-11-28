@@ -76,6 +76,12 @@ public:
 
   size_t Size() const { return Items.size(); }
 
+  // Every interest with its event mask and data (/proc/<pid>/fdinfo of an epoll descriptor).
+  template<typename Visit>
+  void ForEachItem(Visit Function) const {
+    for (const auto& Item : Items) Function(Item.K, Item.Events, Item.Data);
+  }
+
   template<typename Visit>
   void ForEachKey(Visit Function) const {
     for (const auto& Item : Items) Function(Item.K);

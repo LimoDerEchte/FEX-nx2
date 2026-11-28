@@ -3,6 +3,7 @@
 #include "GuestRuntime.h"
 #include "GuestService.h"
 #include "GuestAddressSpace.h"
+#include "GuestVmaList.h"
 #include "GuestClocks.h"
 #include "GuestCredentials.h"
 #include "GuestDirectoryRecovery.h"
@@ -15,6 +16,7 @@
 #include "GuestInodeStore.h"
 #include "GuestInotify.h"
 #include "GuestJobControl.h"
+#include "GuestKernelTree.h"
 #include "GuestMemoryFile.h"
 #include "GuestMounts.h"
 #include "GuestMqueue.h"
@@ -25,6 +27,10 @@
 #include "GuestSignals.h"
 #include "GuestPosixAcl.h"
 #include "GuestProcfs.h"
+#include "GuestSysctl.h"
+#include "GuestSysfs.h"
+#include "GuestIoctl.h"
+#include "GuestInputFeed.h"
 #include "GuestRootFS.h"
 #include "GuestSched.h"
 #include "GuestSocket.h"
@@ -83,7 +89,7 @@ void EmitTerminal(const char* Data, size_t Size) {
 }
 // Capability numbers (linux/capability.h) beyond those in GuestCredentials.h.
 constexpr uint32_t CapDacReadSearch = 2, CapFowner = 3, CapFsetid = 4, CapNetBindService = 10, CapNetAdmin = 12, CapNetRaw = 13, CapIpcLock = 14, CapIpcOwner = 15, CapSysPtrace = 19, CapSysAdmin = 21,
-                   CapSysResource = 24, CapCheckpointRestore = 40;
+                   CapSysResource = 24, CapSyslog = 34, CapCheckpointRestore = 40;
 namespace SockOpt = Switch2Guest::SockOpt;
 constexpr size_t GuestPageSize = PageSize;
 
@@ -347,6 +353,7 @@ struct ClosedFile {
   uint64_t Inode;
   std::string Path;
   bool Write, Directory;
+  bool UnlinkedInput {};
 };
 std::vector<ClosedFile> ClosedFiles;
 
@@ -429,7 +436,8 @@ void TraceGuest(const char* Stage, uint64_t RIP, uint64_t Detail) {
 
 uint64_t BuildInitialStack(uint64_t StackBase, std::string_view Program, std::span<const std::string> Arguments,
                            std::span<const std::string> Environment, const ElfImage* ProgramImage, uint64_t InterpreterBase,
-                           std::array<uint32_t, 4> IDs = {1000, 1000, 1000, 1000}) {
+                           std::array<uint32_t, 4> IDs, std::vector<uint64_t>& SavedAuxv,
+                           uint64_t& EnvironStart, uint64_t& EnvironEnd) {
   char* Strings = reinterpret_cast<char*>(StackBase + MainStackSize);
   auto PushString = [&](std::string_view Text) {
     Strings -= Text.size() + 1;
@@ -441,7 +449,11 @@ uint64_t BuildInitialStack(uint64_t StackBase, std::string_view Program, std::sp
   std::vector<uint64_t> InitialStack {Arguments.size()};
   for (const auto& Argument : Arguments) InitialStack.push_back(PushString(Argument));
   InitialStack.push_back(0);
-  for (const auto& Variable : Environment) InitialStack.push_back(PushString(Variable));
+  // Linux places the original environment strings in one range in envp order.
+  EnvironEnd = reinterpret_cast<uint64_t>(Strings);
+  for (auto It = Environment.rbegin(); It != Environment.rend(); ++It) InitialStack.push_back(PushString(*It));
+  std::reverse(InitialStack.end() - Environment.size(), InitialStack.end());
+  EnvironStart = reinterpret_cast<uint64_t>(Strings);
   InitialStack.push_back(0);
   if (ProgramImage) {
     Strings -= 16;
@@ -453,6 +465,9 @@ uint64_t BuildInitialStack(uint64_t StackBase, std::string_view Program, std::sp
       AT_SECURE, IDs[0] != IDs[1] || IDs[2] != IDs[3]});
   }
   InitialStack.insert(InitialStack.end(), {AT_NULL, 0});
+  // /proc/<pid>/auxv shows the vector as the loader placed it (mm->saved_auxv): the words after the environment's NUL.
+  SavedAuxv.assign(InitialStack.begin() + static_cast<std::ptrdiff_t>(3 + Arguments.size() + Environment.size()),
+                   InitialStack.end());
   const size_t StackBytes = InitialStack.size() * sizeof(uint64_t);
   const auto Stack = (reinterpret_cast<uint64_t>(Strings) - StackBytes) & ~15ULL;
   std::memcpy(reinterpret_cast<void*>(Stack), InitialStack.data(), StackBytes);
@@ -463,6 +478,9 @@ class GuestFileService;
 
 class GuestSyscalls final : public FEXCore::HLE::SyscallHandler {
   friend class GuestFileService;
+
+  // The count outlives every descriptor table, including queued SCM_RIGHTS.
+  size_t EvdevOpenCount {};
 
 public:
   GuestSyscalls(std::span<const Switch2Guest::Segment> Segments, std::string Folder, std::string RootPath, std::string WorkingDirectory,
@@ -527,17 +545,32 @@ public:
       return "Could not resolve the guest ELF file.";
     }
     if (const char* Error = ReadElf(FileBackingPath(Path).c_str(), Image, Info.Size, FileExtents(Info.Inode))) return Error;
+    Image.Path = Path;
+    Image.Inode = Info.Inode;
+    Image.Device = Info.Device;
     if (Resolved) *Resolved = std::move(Path);
     if (Inode) *Inode = Info.Inode;
     return nullptr;
   }
 
-  void TrackInitialExecutable(std::string_view Program) {
+  void TrackInitialExecutable(std::string_view Program, const ElfImage& ProgramImage, std::span<const Segment> Segments) {
     LinuxStat Info {};
     std::string Resolved;
     if (!Program.empty() && !PathStat(CurrentDirectory, Program, Info, &Resolved) && (Info.Mode & 0170000) == 0100000) {
       Task->ExecutableInode = Info.Inode;
-      Task->ExecutablePath = std::move(Resolved);
+      Task->ExecutablePath = Resolved;
+    } else if (Program.starts_with('/')) {
+      Resolved = Program;
+      Info.Inode = SdInode(Resolved);
+      Info.Device = CardDevice;
+    }
+    const auto MainCount = ProgramImage.GetSegments().size();
+    TrackElfSegments(*Task, Segments.first(MainCount), Resolved, Program, Info.Device, Info.Inode, true);
+    if (MainCount < Segments.size()) {
+      Info = {};
+      Resolved.clear();
+      PathStat(CurrentDirectory, ProgramImage.Interpreter, Info, &Resolved);
+      TrackElfSegments(*Task, Segments.subspan(MainCount), Resolved, ProgramImage.Interpreter, Info.Device, Info.Inode, false);
     }
   }
 
@@ -613,7 +646,12 @@ public:
     }
   }
 
-  uint64_t CreateStack(size_t Size) { return Task->Memory.Allocate(Size, PF_R | PF_W); }
+  uint64_t CreateStack(size_t Size) {
+    const auto Start = Task->Memory.Allocate(Size, PF_R | PF_W);
+    if (Start) Task->Vmas.Map({.Start = Start, .End = Start + GuestAddressSpace::RoundUp(Size), .Prot = 3,
+                              .Special = Switch2Guest::Vma::Stack, .GrowsDown = true, .Accounted = true});
+    return Start;
+  }
   bool InitMain(FEXCore::Core::CPUState& State) {
     InitializeExecCPU(*Task, State);
     Task->TraceFirstDispatch = true;
@@ -622,8 +660,17 @@ public:
   bool AddMainThread(FEXCore::Core::CPUState& State) {
     return AddThread(*Task->Context, State, ProcessID, 0, ProcessID);
   }
+  uint64_t InitialStack(uint64_t Stack, std::string_view Program, std::span<const std::string> Arguments,
+                        std::span<const std::string> Environment, const ElfImage* Image, uint64_t InterpreterBase) {
+    return BuildInitialStack(Stack, Program, Arguments, Environment, Image, InterpreterBase,
+                             Switch2Guest::AuxvIds(Task->Creds), Task->Auxv, Task->EnvironStart, Task->EnvironEnd);
+  }
 
   // The launcher stops the run (the user left the tab, the app is closing): polled by the scheduler on the guest thread.
+  void SetInputGroup(int64_t Gid) {
+    if (Gid >= 0) InputGid = static_cast<uint32_t>(Gid);
+  }
+
   bool HostStop {};
   uint64_t LastHostPoll {};
   uint32_t LastCols {}, LastRows {};
@@ -705,6 +752,7 @@ public:
   std::optional<uint64_t> RunThreads() {
     LockRuntime();
     Serving = true;
+    PumpEvdev(true);
     for (auto& Slot : Threads) {
       // Host threads of slots made before the runtime served (the main thread) wait to be started until here.
       if (Slot.Core && Slot.HostCreated && Slot.HostState == GuestThread::HostRun::None && !StartHostThread(Slot)) {
@@ -721,6 +769,8 @@ public:
       // terminal, so a busy loop with no reader (a shell's own `while :; do :; done`) must still have its keyboard
       // polled: this thread does that, however long the guest threads run.
       if (Interactive) PollTerminalInput();
+      PumpEvdev(true);
+      UpdateEvdevOwnership();
       FireTimers();
       if (!ClosedFiles.empty() || !ClosedPtys.empty()) DrainClosedFiles();
       // Host sockets raise events on their own: poll them once per pass while a thread waits on one.
@@ -734,10 +784,12 @@ public:
       const auto TimerDue = NextTimerDeadline();
       // Every guest thread waits and nothing can end the waits: no thread will ever run again. (CPU-clock timers do
       // not count: nothing runs to use CPU time.)
-      if (!Service && !NextTimerDeadline(false) && std::all_of(Threads.begin(), Threads.end(), [&](auto& Thread) {
-            return !Thread.Core || (!Thread.Exited && Thread.HostState == GuestThread::HostRun::Blocked && !Thread.Deadline &&
-                                    !Thread.CpuDeadline && Thread.Waiting != WaitKind::Terminal && Thread.Waiting != WaitKind::Net &&
-                                    !Ready(Thread));
+      if (!Service && !EvdevOpenCount && !NextTimerDeadline(false) &&
+          std::all_of(Threads.begin(), Threads.end(), [&](auto& Thread) {
+            return !Thread.Core ||
+                   (!Thread.Exited && Thread.HostState == GuestThread::HostRun::Blocked && !Thread.Deadline &&
+                    !Thread.CpuDeadline && Thread.Waiting != WaitKind::Terminal && Thread.Waiting != WaitKind::Net &&
+                    !Ready(Thread));
           })) {
         PrintStage("Guest threads are blocked with no remaining producer.");
         break;
@@ -826,6 +878,7 @@ public:
     std::shared_ptr<Switch2Guest::HostSession> Host;
     std::shared_ptr<GuestTty> Tty;
     uint32_t PID {};
+    uint32_t LoginUid {};
     uint64_t Activity {};
     uint16_t Cols {}, Rows {};
     bool HungUp {};
@@ -843,6 +896,9 @@ public:
     if (Launch.OnCard) {
       Image.ResolvedPath = Launch.Program;
       if (const char* Error = ReadElf(Launch.Program.c_str(), Image.Program)) return Error;
+      Image.Inode = Image.Program.Inode = SdInode(Launch.Program);
+      Image.Program.Path = Launch.Program;
+      Image.Program.Device = CardDevice;
     } else {
       if (const char* Error = ReadRootfsElfFile(Launch.Program, Image.Program, &Image.ResolvedPath, &Image.Inode)) return Error;
     }
@@ -929,12 +985,7 @@ public:
       const auto Base = Image.Path.substr(Image.Path.find_last_of('/') == std::string::npos ? 0 : Image.Path.find_last_of('/') + 1);
       std::memcpy(Child.Name.data(), Base.data(), std::min<size_t>(Base.size(), Child.Name.size() - 1));
     }
-    for (const auto* ELF : {&Image.Program, &Image.Interpreter}) {
-      for (const auto& Segment : ELF->GetSegments()) {
-        Child.Memory.Register(Segment.Start, Segment.Size, Segment.Flags);
-        RecordMapping(Segment.Start, Segment.Size, Segment.Start - ELF->Base, ELF == &Image.Program ? Image.ProgramPath : Image.Program.Interpreter);
-      }
-    }
+    RegisterExecImage(Child, Image);
     FEXCore::Core::CPUState State {};
     InitializeExecCPU(Child, State);
     State.rip = Image.Interpreter.Entry ? Image.Interpreter.Entry : Image.Program.Entry;
@@ -943,8 +994,8 @@ public:
     Argv.insert(Argv.end(), Launch.Arguments.begin(), Launch.Arguments.end());
     bool Ok = Stack != 0;
     if (Ok) {
-      State.gregs[FEXCore::X86State::REG_RSP] = BuildInitialStack(Stack, Image.Path, Argv, Launch.Environment, &Image.Program,
-                                                                  Image.Interpreter.Base, Switch2Guest::AuxvIds(Child.Creds));
+      State.gregs[FEXCore::X86State::REG_RSP] =
+        InitialStack(Stack, Image.Path, Argv, Launch.Environment, &Image.Program, Image.Interpreter.Base);
       Ok = InitializeProcessContext(Child) && AddThread(*Child.Context, State, PID, 0, PID);
     }
     Task = SavedTask;
@@ -958,6 +1009,7 @@ public:
       return Fail("Could not create the guest process.");
     }
     Child.Host = Host;
+    Child.InputSession = Host->Id;
     Child.TraceFirstDispatch = true;
     Child.HasDispatched = false;
     Child.SerialGuest = Launch.SingleThread;
@@ -967,7 +1019,7 @@ public:
     if (Launch.SingleThread) WriteLog(("Guest session " + std::to_string(Host->Id) + ": single-thread mode").c_str());
     WriteLog(("Guest session " + std::to_string(Host->Id) + ": " + Image.Path + " as process " + std::to_string(PID) + " on /dev/pts/" +
               std::to_string(Tty->Index)).c_str());
-    Sessions.push_back({Host, Tty, PID, Activity, Cols, Rows});
+    Sessions.push_back({Host, Tty, PID, Child.Creds.Uid[0], Activity, Cols, Rows});
     Host->State.store(Switch2Guest::HostSession::Running);
     return nullptr;
   }
@@ -1237,7 +1289,7 @@ public:
     case 219: Result = -4; break; // restart_syscall: no restart block without stopped sleeps (Task 6).
     case 234: Result = TkillGuest(A, B, C); break;
     case 297: Result = QueueSignalInfo(A, B, C, Registers[REG_R10], true); break;
-    case 16: Result = GetFile(A) && GetFile(A)->NsObject ? NsIoctl(*GetFile(A), B, C) : TerminalIoctl(A, B, C); break;
+    case 16: Result = GetFile(A) && GetFile(A)->NsObject ? NsIoctl(*GetFile(A), B, C) : Ioctl(A, B, C); break;
     case 17: Result = ReadGuest(A, B, C, Registers[REG_R10]); break;
     case 18: Result = WriteGuest(A, B, C, Registers[REG_R10]); break;
     case 19: Result = VectorIO(static_cast<uint32_t>(A), B, static_cast<uint32_t>(C), false); break;
@@ -1533,8 +1585,12 @@ public:
     if (!ClosedFiles.empty() || !ClosedPtys.empty()) DrainClosedFiles();
     ++PerfCounters.SyscallCount[PerfNumber];
     PerfCounters.SyscallTicks[PerfNumber] += armGetSystemTick() - PerfStart;
+    if (!Denied && Result != RetrySyscall) CountIo(Registers[REG_RAX], Result);
     if (Result == RetrySyscall || Task->PendingExec) {
-      if (Result == RetrySyscall) Current->SeccompRetryRip = Frame->State.rip;
+      if (Result == RetrySyscall) {
+        Current->SeccompRetryRip = Frame->State.rip;
+        ++Current->VoluntarySwitches; // the thread went to sleep (a rerun that sleeps again counts again, as schedule() does)
+      }
       ReturnToHostLoop();
     }
     if (Current->SuspendMask && MaskedWait(Registers[REG_RAX]) && Result != -4) {
@@ -1680,6 +1736,8 @@ private:
     uint64_t Changes {}; // counts changes to Ticks, for edge-triggered epoll
     bool CancelOnSet {}; // TFD_TIMER_CANCEL_ON_SET on an absolute realtime timer
     bool Canceled {};    // the realtime clock was set since; read reports ECANCELED once
+    int32_t ClockId {};  // the clockid timerfd_create was given, and the flags of the last timerfd_settime (fdinfo)
+    uint32_t SetFlags {};
   };
 
   // timer_create. Notify is sigev_notify (SIGEV_SIGNAL 0, SIGEV_NONE 1,
@@ -1785,6 +1843,12 @@ private:
     uint64_t CpuMask {~uint64_t {0}};
     uint16_t IoPriority {};
     uint64_t IoContext {};
+    // /proc/<pid>/status ctxt switches and sched: waits entered, and preemptions of this thread.
+    uint64_t VoluntarySwitches {}, InvoluntarySwitches {};
+    // /proc/<pid>/io, per thread (the process keeps the sum): characters and calls of the read and write family.
+    Switch2Guest::Procfs::IoCounters Io;
+    // timer_slack_ns: prctl(PR_SET_TIMERSLACK) and /proc/<pid>/timerslack_ns (default 50 us). Inherited by fork and clone.
+    uint64_t TimerSlack {50000};
     // One host thread per guest thread (Task 1B). Host is the libnx thread, HostCreated says it was made
     // and must be joined, HostState is where it is in its life, and WakeWord is the address its host thread
     // sleeps on while the guest thread waits.
@@ -2316,6 +2380,7 @@ private:
     if (Current) {
       Slot->Sched = Current->Sched;
       Slot->CpuMask = Current->CpuMask;
+      Slot->TimerSlack = Current->TimerSlack;
       Slot->IoPriority = Current->IoPriority;
       Slot->IoContext = Current->IoContext;
       Slot->Seccomp = Current->Seccomp; // fork and clone inherit the filters
@@ -2376,6 +2441,27 @@ private:
     HostReturn = Previous;
   }
 
+  // /proc/<pid>/io (do_io_accounting): the read and write family add the bytes moved (rchar, wchar) and count the call
+  // (syscr, syscw), per thread and for the process. sendfile and copy_file_range count as both. Sockets and
+  // recv/send do not count, as on Linux.
+  void CountIo(uint64_t Number, int64_t Result) {
+    const bool Read = Number == 0 || Number == 17 || Number == 19 || Number == 295 || Number == 327;
+    const bool Write = Number == 1 || Number == 18 || Number == 20 || Number == 296 || Number == 328;
+    const bool Both = Number == 40 || Number == 326;
+    if (!Read && !Write && !Both) return;
+    const uint64_t Bytes = Result > 0 ? static_cast<uint64_t>(Result) : 0;
+    for (auto* Io : {&Current->Io, &Task->Io}) {
+      if (Read || Both) {
+        Io->Rchar += Bytes;
+        ++Io->Syscr;
+      }
+      if (Write || Both) {
+        Io->Wchar += Bytes;
+        ++Io->Syscw;
+      }
+    }
+  }
+
   // ExecuteThread returned through a preemption poll: the stop handler has
   // spilled the guest registers, and the poll stored the host address of the
   // entry point or backward-branch target it stopped at. BeginGuest/LeftGuest
@@ -2391,6 +2477,7 @@ private:
     }
     Thread->CurrentFrame->State.rip = RIP;
     ++Preempt.Switches;
+    ++Current->InvoluntarySwitches;
     if (Task->Profile) ++Task->ProfileSamples[RIP];
     if (Logging == LogLevel::Trace) {
       char Message[96];
@@ -3410,8 +3497,27 @@ private:
     }
   };
 
+  struct EvdevNode {
+    Switch2Guest::Evdev::EvdevDevice Device;
+    Switch2Guest::InputClass Class;
+    Switch2Guest::PadConnection Connection;
+    uint32_t Number, Pad, Gid;
+    uint64_t InputNumber;
+    uint64_t Inode;
+    FileTimestamp Created;
+    std::vector<Switch2Guest::Evdev::EvdevClient*> Clients;
+    bool Connected = true;
+  };
+
   struct OpenFile {
     ~OpenFile() {
+      if (InputClient) {
+        StopInputEffects();
+        std::erase(InputNode->Clients, &*InputClient);
+        if (--*InputOpenCount == 0) Switch2Guest::InputFeed().StopTaking();
+      }
+      if (InputNode && !InputNode->Connected)
+        ClosedFiles.push_back({Inode, {}, false, false, true});
       if (NotifyClose) ClosedFiles.push_back({Inode, Path, WriteAccess(StatusFlags), Directory.has_value()});
       if (Tty && Tty->Pty) {
         if (TtyMaster) --Tty->MasterFiles;
@@ -3423,6 +3529,23 @@ private:
         if (WriteAccess(StatusFlags) && --Fifo->Writers == 0) Fifo->Writer->ShutWrite = true;
       }
     }
+    void StopInputEffects() {
+      auto& Node = *InputNode;
+      if (Node.Connected) {
+        for (size_t Id = 0; Id < Node.Device.Effects.size(); ++Id) {
+          const auto& Effect = Node.Device.Effects[Id];
+          if (Effect && Effect->Owner == &*InputClient)
+            Switch2Guest::InputFeed().PushRumble(Node.Pad, {.EffectId = static_cast<int>(Id), .Stop = true},
+                                                Node.Connection.Generation);
+        }
+      }
+      InputClient->Close(Node.Device);
+    }
+
+    std::shared_ptr<EvdevNode> InputNode; // Also retained by O_PATH for fstat after unplug.
+    std::optional<Switch2Guest::Evdev::EvdevClient> InputClient;
+    size_t* InputOpenCount {};
+    uint64_t InputOpenGeneration {};
     ConsoleStream Console {};
     // A pseudo-terminal descriptor: the tty (the slave side) and whether this is the /dev/ptmx master. The
     // descriptor also has Console == Terminal so the stream-only checks (no seeking, pollable) apply.
@@ -3465,16 +3588,25 @@ private:
     std::shared_ptr<InotifyState> Inotify;
     std::shared_ptr<MqueueState> Mqueue; // mq_open descriptor
     bool NotifyClose {}; // an open regular file or directory: closing it is an inotify event
+    bool UdevRecord {}; // An open udev database entry keeps its contents after unplug.
+    FileTimestamp UdevCreated {};
     // An nsfs file (/proc/<pid>/ns/<name> or an NS_GET_* result): the namespace it names.
     std::shared_ptr<Switch2Guest::Ns::Namespace> NsObject;
     // An open /proc/<pid>/uid_map (0), gid_map (1) or setgroups (2) for writing: the process it belongs to and the
     // credentials the file was opened with (file_ns_capable uses those, not the writer's).
     struct ProcWriter {
+      static constexpr int KernelTree = 3; // a file of the kernel tree (its node's Write)
+      static constexpr int Comm = 4, OomScoreAdj = 5, OomAdj = 6, TimerSlack = 7; // per-process attribute files
       uint32_t PID;
-      int Kind;
+      int Kind; // 0 uid_map, 1 gid_map, 2 setgroups, KernelTree, or one of the attribute kinds above
       Switch2Guest::Ns::Subject Opener;
+      uint32_t Tid {}; // TimerSlack under task/<tid>/: the thread
     };
     std::optional<ProcWriter> ProcWrite;
+    int64_t ReadError {};   // a generated file whose read always fails with this errno
+    uint32_t ProcMemPid {}; // /proc/<pid>/mem: the global pid whose memory the file reads and writes
+    uint32_t ProcEnvironPid {};
+    uint64_t ProcEnvironExec {};
   };
   // ================= System V IPC (shm, sem, msg) =================
 
@@ -3592,6 +3724,12 @@ private:
     const size_t Rounded = PagesOf(Segment->Size) * GuestPageSize;
     const uint8_t Access = PF_R | (Flags & ReadOnly ? 0 : PF_W) | (Flags & Execute ? PF_X : 0);
     if (!Task->Memory.RegisterSharedFile(Base, Rounded, Access, Segment->Storage, !(Flags & ReadOnly))) return -12;
+    char Name[14];
+    std::snprintf(Name, sizeof(Name), "/SYSV%08x", static_cast<uint32_t>(Segment->Perm.Key));
+    using Switch2Guest::Vma;
+    Task->Vmas.Map({.Start = Base, .End = Base + Rounded, .Prot = LinuxProtection(Access), .Shared = true,
+                   .DevMinor = ShmDevice, .Inode = static_cast<uint32_t>(IdArgument), .Name = Name,
+                   .Backing = Vma::Sysv, .Object = Base, .Deleted = true, .MayWrite = !(Flags & ReadOnly)});
     EnableTso(*Task, "System V shared memory");
     std::erase_if(Task->ShmAttached, [&](const ShmAttach& Old) { return !Task->Memory.AnyMapped(Old.Address, Old.Size); });
     Task->ShmAttached.push_back({Segment->Storage, Base, Rounded});
@@ -4112,7 +4250,7 @@ private:
 
   // mq_open. glibc has already removed the leading '/' from the name.
   int64_t MqueueOpen(uint64_t NameAddress, uint64_t OpenFlags, uint64_t Mode, uint64_t AttributeAddress) {
-    constexpr uint64_t Create = 0100, Exclusive = 0200;
+    constexpr uint64_t Create = 0100;
     const auto Name = GuestString(NameAddress, Switch2Guest::MqNameMax + 1, -36);
     if (!Name) return Name.Error;
     if ((OpenFlags & 3) == 3) return Invalid;
@@ -4126,10 +4264,16 @@ private:
       Attr = {Raw[0], Raw[1], Raw[2], Raw[3]};
       HasAttr = true;
     }
+    return OpenMqueueNamed(*Name, OpenFlags, Mode, Attr, HasAttr);
+  }
+
+  // mq_open and an open of /dev/mqueue/<name> (the mqueue file system) end here: the name has no slash.
+  int64_t OpenMqueueNamed(std::string_view Name, uint64_t OpenFlags, uint64_t Mode, const MqAttr& Attr, bool HasAttr) {
+    constexpr uint64_t Create = 0100, Exclusive = 0200;
     const auto FD = FreeDescriptor();
     if (FD == NoDescriptor) return -24;
     std::shared_ptr<MqueueState> State;
-    if (const auto Existing = Ipc().MqueueNames.find(*Name); Existing != Ipc().MqueueNames.end()) {
+    if (const auto Existing = Ipc().MqueueNames.find(Name); Existing != Ipc().MqueueNames.end()) {
       if ((OpenFlags & Create) && (OpenFlags & Exclusive)) return -17;
       State = Existing->second;
       const auto Access = OpenFlags & 3;
@@ -4152,7 +4296,7 @@ private:
       State->Uid = Task->Creds.Uid[1];
       State->Gid = Task->Creds.Gid[1];
       State->Mode = static_cast<uint16_t>(Mode & 0777 & ~Task->Fs->CreationMask);
-      State->Name = std::string(*Name);
+      State->Name = std::string(Name);
       State->Inode = NextAnonymousInode++;
       ++Ipc().MqueueAccounts->Queues;
       Ipc().MqueueAccounts->Bytes[Owner] += Charged;
@@ -4179,7 +4323,12 @@ private:
     if (!Name) return Name.Error;
     if (Name->empty()) return Invalid;
     if (Name->find('/') != std::string_view::npos || *Name == "." || *Name == "..") return -13;
-    const auto Found = Ipc().MqueueNames.find(*Name);
+    return UnlinkMqueueNamed(*Name);
+  }
+
+  // mq_unlink and an unlink of /dev/mqueue/<name>.
+  int64_t UnlinkMqueueNamed(std::string_view Name) {
+    const auto Found = Ipc().MqueueNames.find(Name);
     if (Found == Ipc().MqueueNames.end()) return -2;
     // The queue directory is sticky (01777): only the owner of the queue or of
     // the directory (root) may remove an entry.
@@ -4348,6 +4497,17 @@ private:
     return Path;
   }
 
+  // The queue name of a resolved SD path like <root>/dev/mqueue/name (the mqueue file system, Milestone 5 Task 6).
+  std::optional<std::string_view> MqueueEntryName(std::string_view Path) const {
+    if (!Path.starts_with(RootPath)) return std::nullopt;
+    Path.remove_prefix(RootPath.size());
+    if (!Path.starts_with("/dev/mqueue/")) return std::nullopt;
+    Path.remove_prefix(12);
+    if (Path.empty() || Path.find('/') != Path.npos) return std::nullopt;
+    return Path;
+  }
+  static constexpr std::string_view MqueueDirectory = "/dev/mqueue";
+
   uint64_t ShmLinkCount(uint64_t Inode) const {
     return std::count_if(ShmFiles.begin(), ShmFiles.end(), [Inode](const auto& Entry) { return Entry.second.Inode == Inode; });
   }
@@ -4441,6 +4601,23 @@ private:
     }
     if (!CanRemoveShmEntry(Source->second.Inode)) return -1;
     if (Target != ShmFiles.end() && !CanRemoveShmEntry(Target->second.Inode)) return -1;
+    const auto OldPath = std::string(ShmDirectory) + "/" + std::string(*Old);
+    const auto NewPath = std::string(ShmDirectory) + "/" + std::string(*New);
+    const auto SourceInode = Source->second.Inode;
+    const auto TargetInode = Target == ShmFiles.end() ? 0 : Target->second.Inode;
+    const auto Rename = [&](uint64_t Inode, std::string& Path) {
+      if (Inode == SourceInode && Path == OldPath) Path = NewPath;
+      else if (Inode == TargetInode && Path == NewPath && (Flags & Exchange)) Path = OldPath;
+    };
+    ForEachOpenFile([&](OpenFile& File) { if (File.Memory) Rename(File.Inode, File.Path); });
+    for (auto& [PID, Process] : Processes) {
+      Process.Vmas.UpdateNames([&](Switch2Guest::Vma& Range) {
+        if (Range.Backing != Switch2Guest::Vma::Shmem || Range.Deleted) return;
+        if (!(Flags & Exchange) && Range.Inode == TargetInode && Range.BackingPath == NewPath) Range.Deleted = true;
+        Rename(Range.Inode, Range.BackingPath);
+        if (!Range.BackingPath.empty()) Range.Name = Range.BackingPath;
+      });
+    }
     if (Flags & Exchange) {
       std::swap(Source->second, Target->second);
     } else {
@@ -4506,6 +4683,7 @@ private:
 
   struct GuestProcess {
     GuestAddressSpace Memory;
+    Switch2Guest::VmaList Vmas;
     std::vector<std::weak_ptr<StreamSocket::PinnedPage>> PrivatePipePages;
     std::array<FEXCore::Core::CPUState::gdt_segment, 32> GDT {};
     // Only fork descendants can share a private host address view. Exec
@@ -4567,12 +4745,22 @@ private:
     std::shared_ptr<Switch2Guest::GuestTty> Ctty;
     // The launcher session this process leads (a terminal tab's first process); null for every other process.
     std::shared_ptr<Switch2Guest::HostSession> Host;
+    uint64_t InputSession {};
     uint32_t ExitSignal {17}; // Sent to the parent on exit (clone's CSIGNAL).
     uint32_t ParentDeathSignal {};
     bool ChildSubreaper {};
     bool Dumpable {true};
     int32_t Nice {};
     uint32_t Personality {};
+    // oom_score_adj is shared by the thread group and inherited by fork; OomScoreAdjMin is the lowest value a process without
+    // CAP_SYS_RESOURCE may set (Linux signal->oom_score_adj_min).
+    int32_t OomScoreAdj {}, OomScoreAdjMin {};
+    // The auxiliary vector placed on the stack at exec (mm->saved_auxv) and the process's /proc/<pid>/io totals. RssPeak is
+    // VmHWM in bytes: the highest resident size seen since exec (see ProcRssPeak).
+    std::vector<uint64_t> Auxv;
+    uint64_t EnvironStart {}, EnvironEnd {}, ExecGeneration {};
+    Switch2Guest::Procfs::IoCounters Io;
+    mutable uint64_t RssPeak {};
     std::array<char, 16> Name {};
     uint64_t ChildTicks {}; // CPU ticks of reaped descendants.
     // ITIMER_REAL (monotonic ns), ITIMER_VIRTUAL and ITIMER_PROF (process
@@ -4780,10 +4968,24 @@ private:
     auto ProcSb = Make("proc", "proc", ProcDevice, RootPath + "/proc");
     ProcSb->Pid = NsRegistry.Initial.Pid;
     Mn::MakeMount(*Table, MountIds, Slash, RootPath + "/proc", RootPath + "/proc", ProcSb, Hardened);
+    // sysfs at /sys and the cgroup2 hierarchy at /sys/fs/cgroup, as a systemd machine mounts them. The runtime has
+    // no cgroup controllers, so the cgroup2 root is read-only (writes fail with EROFS).
+    auto SysSb = Make("sysfs", "sysfs", SysDevice, RootPath + "/sys");
+    SysSb->Pseudo = true;
+    const auto Sys = Mn::MakeMount(*Table, MountIds, Slash, RootPath + "/sys", RootPath + "/sys", SysSb, Hardened);
+    auto CgroupSb = Make("cgroup2", "cgroup2", CgroupDevice, RootPath + "/sys/fs/cgroup");
+    CgroupSb->Pseudo = true;
+    CgroupSb->ReadOnly = true;
+    Mn::MakeMount(*Table, MountIds, Sys, RootPath + "/sys/fs/cgroup", RootPath + "/sys/fs/cgroup", CgroupSb, Hardened | Mn::MntReadonly);
     const auto Dev = Mn::MakeMount(*Table, MountIds, Slash, RootPath + "/dev", RootPath + "/dev", Make("devtmpfs", "devtmpfs", DevDevice, RootPath + "/dev"),
                                    Mn::MntNosuid | Mn::MntRelatime);
     Mn::MakeMount(*Table, MountIds, Dev, RootPath + "/dev/shm", RootPath + "/dev/shm", Make("tmpfs", "tmpfs", ShmDevice, RootPath + "/dev/shm"),
                   Mn::MntNosuid | Mn::MntNodev | Mn::MntRelatime);
+    // /run remains on the RootFS. Publish the volatile database in a read-only subtree without a udev control socket.
+    const auto UdevPath = RootPath + UdevDirectory.data();
+    auto UdevSb = Make("tmpfs", "tmpfs", UdevDevice, UdevPath);
+    UdevSb->Pseudo = UdevSb->ReadOnly = true;
+    Mn::MakeMount(*Table, MountIds, Slash, UdevPath, UdevPath, UdevSb, Hardened | Mn::MntReadonly);
     // The SD card, read-only at /mnt/sd, without FEX's own folders (user decision 2026-11-27: the guest must not change
     // homebrew). Programs started from the card run inside it, so getcwd and /proc/self/exe name paths the guest can open.
     CardSb = Make("msdos", "sdmc", CardDevice, "/");
@@ -5133,10 +5335,16 @@ private:
     }
     if (!Lookup.Directory) return -20;
     FlushTmpfsDeletes();
-    std::string FsRoot = Type.Value == "proc" ? RootPath + "/proc" : std::string(TmpfsArea) + "/" + std::to_string(MountIds.NextDev);
+    // proc, sysfs and cgroup2 show the generated trees (a new superblock of the same kernel objects); the others get
+    // their own tmpfs folder.
+    const bool Generated = Type.Value == "proc" || Type.Value == "sysfs" || Type.Value == "cgroup2";
+    std::string FsRoot = Type.Value == "proc"    ? RootPath + "/proc" :
+                         Type.Value == "sysfs"   ? RootPath + "/sys" :
+                         Type.Value == "cgroup2" ? RootPath + "/sys/fs/cgroup" :
+                                                   std::string(TmpfsArea) + "/" + std::to_string(MountIds.NextDev);
     auto Sb = Mn::MakeSuperblock(MountIds, Type.Value, Source.Value, Options, Sd, Owner, FsRoot, Task->Creds.Uid[3], Task->Creds.Gid[3]);
     if (Type.Value == "proc") Sb->Pid = Task->Ns.Pid; // proc_init_fs_context: the mounter's active PID namespace
-    if (Type.Value != "proc") {
+    if (!Generated) {
       TmpfsFolders.insert(FsRoot);
       if (const auto Error = CreateTmpfsFolder(*Sb)) {
         char Message[160];
@@ -5323,6 +5531,11 @@ private:
     Features.SupportsAtomics = true;
     Features.SupportsRCPC = true;
     Features.SupportsTSOImm9 = true;
+    // One MIDR per core the guest sees. FEX sizes its per-CPU table from this list; empty, the brand-string leaves
+    // (0x80000002-4, read for /proc/cpuinfo) index past an empty table and crash. MIDR_EL1 is not readable from EL0
+    // on the console, so the value is the A78C's implementer (0x41, Arm) and part (0xd4b) with variant and revision
+    // 0: FEX matches only implementer and part.
+    Features.CPUMIDRs.assign(HostCpuCount(), 0x410f'd4b0u);
     // FEX reads its configuration when it creates the context.
     FEXCore::Config::Set(FEXCore::Config::CONFIG_TSOENABLED, Process.NoTso ? "0" : "1");
     Process.Context = ContextType::CreateNewContext(Features);
@@ -5462,6 +5675,7 @@ private:
     SuspendPipePages(Process, 0, UINT64_MAX, true);
     FlushViewsMappedBy(Process.Memory);
     Process.Memory = {};
+    Process.Vmas = {};
     if (!SharedFileViews.empty()) PruneSharedFileViews();
     Process.ForkView.reset();
     Process.InheritedImages.clear();
@@ -5713,11 +5927,17 @@ private:
     Child.ParentPID = Flags & CloneParent ? Task->ParentPID : Task->PID;
     Child.Group = Task->Group;
     Child.Session = Task->Session;
+    Child.InputSession = Task->InputSession;
     Child.Ctty = Task->Ctty;
     Child.ExitSignal = Flags & CloneParent ? Task->ExitSignal : Request.ExitSignal;
     Child.Dumpable = Task->Dumpable;
     Child.Nice = Task->Nice;
     Child.Personality = Task->Personality;
+    Child.OomScoreAdj = Task->OomScoreAdj;
+    Child.OomScoreAdjMin = Task->OomScoreAdjMin;
+    Child.Auxv = Task->Auxv;
+    Child.EnvironStart = Task->EnvironStart;
+    Child.EnvironEnd = Task->EnvironEnd;
     Child.Name = Task->Name;
     if (Flags & CloneFs) Child.Fs = Task->Fs;
     else *Child.Fs = *Task->Fs;
@@ -5728,6 +5948,9 @@ private:
     Child.SupplementaryGroups = Task->SupplementaryGroups;
     if (NewUser) Ns::EnterUserNs(Child.Creds, NewUser);
     Child.Memory = Task->Memory.ForkChild();
+    Child.Vmas = Task->Vmas;
+    for (const auto& Range : Task->Vmas.Ranges()) DropUnmappedVmas(Child, Range.Start, Range.End - Range.Start);
+    Child.Vmas.ResetPeak();
     Child.MembarrierRegistered = Task->MembarrierRegistered;
     // Segments stay attached in the child. The undo list is shared only under CLONE_SYSVSEM.
     Child.ShmAttached = Task->ShmAttached;
@@ -6407,6 +6630,9 @@ private:
       if ((Info.Mode & 02010) == 02010) Request.EffectiveGID = Info.Gid;
     }
     if (ReadElf(FileBackingPath(Path).c_str(), Request.Program, Info.Size, FileExtents(Info.Inode))) return -8;
+    Request.Program.Path = Path;
+    Request.Program.Inode = Info.Inode;
+    Request.Program.Device = Info.Device;
     if (!Request.Program.Interpreter.empty()) {
       LinuxStat InterpreterInfo {};
       std::string Interpreter;
@@ -6417,6 +6643,9 @@ private:
       if (StatMount && (StatMount->Flags & Switch2Guest::Mounts::MntNoexec)) return -13;
       if (ReadElf(FileBackingPath(Interpreter).c_str(), Request.Interpreter, InterpreterInfo.Size, FileExtents(InterpreterInfo.Inode)) ||
           !Request.Interpreter.Interpreter.empty()) return -80; // ELIBBAD
+      Request.Interpreter.Path = std::move(Interpreter);
+      Request.Interpreter.Inode = InterpreterInfo.Inode;
+      Request.Interpreter.Device = InterpreterInfo.Device;
     }
     Task->PendingExec = std::move(Request);
     Task->ExecBy = Current;
@@ -6490,6 +6719,8 @@ private:
     InitializeExecCPU(*Task, State);
     FlushViewsMappedBy(Task->Memory);
     Task->Memory = {};
+    Task->Vmas = {};
+    Task->RssPeak = 0;
     Task->LockFuture = false;
     Task->MembarrierRegistered = 0;
     Task->ShmAttached.clear(); // exec detaches every segment; SEM_UNDO adjustments survive it
@@ -6524,22 +6755,16 @@ private:
     Switch2Guest::ApplyExecCaps(Task->Creds, Image.EffectiveUID, Task->NoNewPrivileges, false, Image.EffectiveGID);
     Task->Creds.Uid[2] = Task->Creds.Uid[3] = Task->Creds.Uid[1];
     Task->Creds.Gid[2] = Task->Creds.Gid[3] = Task->Creds.Gid[1];
-    for (const auto* ELF : {&Image.Program, &Image.Interpreter}) {
-      for (const auto& Segment : ELF->GetSegments()) {
-        Task->Memory.Register(Segment.Start, Segment.Size, Segment.Flags);
-        RecordMapping(Segment.Start, Segment.Size, Segment.Start - ELF->Base,
-                      ELF == &Image.Program ? Image.ProgramPath : Image.Program.Interpreter);
-      }
-    }
+    RegisterExecImage(*Task, Image);
     State.rip = Image.Interpreter.Entry ? Image.Interpreter.Entry : Image.Program.Entry;
     const auto Base = CreateStack(MainStackSize);
     if (!Base) {
       Self->Exited = true;
       return false;
     }
+    ++Task->ExecGeneration;
     State.gregs[FEXCore::X86State::REG_RSP] =
-      BuildInitialStack(Base, Image.Path, Image.Arguments, Image.Environment, &Image.Program, Image.Interpreter.Base,
-                        Switch2Guest::AuxvIds(Task->Creds));
+      InitialStack(Base, Image.Path, Image.Arguments, Image.Environment, &Image.Program, Image.Interpreter.Base);
     if (!AddThread(*Task->Context, State, PID, 0, PID, Self)) {
       Self->Exited = true;
       return false;
@@ -6558,6 +6783,62 @@ private:
     Task->StartupSyscallCheckpoints = Logging == LogLevel::Trace ? 12 : 0;
     WriteLog(("Guest exec " + Image.Path).c_str());
     return true;
+  }
+
+  static void DropUnmappedVmas(GuestProcess& Process, uint64_t Start, uint64_t Size) {
+    if (Size > UINT64_MAX - Start || Process.Memory.IsMapped(Start, Size)) return;
+    auto Address = Start;
+    for (const auto& [Base, Length] : Process.Memory.MappedRuns(Start, Size)) {
+      Process.Vmas.Unmap(Address, Base - Address);
+      Address = Base + Length;
+    }
+    Process.Vmas.Unmap(Address, Start + Size - Address);
+  }
+
+  static void TrackElfSegments(GuestProcess& Process, std::span<const Segment> Segments, std::string_view Path,
+                               std::string_view Name, uint64_t Device, uint64_t Inode, bool Main) {
+    using Switch2Guest::Vma;
+    for (const auto& Segment : Segments) {
+      const auto Start = Segment.Start & ~(GuestPageSize - 1);
+      const auto End = GuestAddressSpace::RoundUp(Segment.Start + Segment.Size);
+      const auto FileEnd = Segment.FileSize ? GuestAddressSpace::RoundUp(Segment.Start + Segment.FileSize) : Start;
+      Vma Range {.Start = Start, .End = FileEnd, .Prot = LinuxProtection(Segment.Flags),
+                 .Offset = Segment.Offset & ~(GuestPageSize - 1), .DevMinor = static_cast<uint32_t>(Device),
+                 .Inode = Inode, .Name = std::string(Name), .Backing = Vma::File,
+                 .MainText = Main && (Segment.Flags & PF_X), .Accounted = bool(Segment.Flags & PF_W),
+                 .BackingPath = std::string(Path)};
+      Process.Vmas.Map(Range);
+      if (FileEnd < End) {
+        Process.Vmas.Map({.Start = FileEnd, .End = End, .Prot = Range.Prot,
+                          .MainText = Range.MainText, .Accounted = Range.Accounted});
+      }
+    }
+  }
+
+  void RegisterExecImage(GuestProcess& Process, const ExecImage& Image) {
+    for (const auto* ELF : {&Image.Program, &Image.Interpreter}) {
+      const bool Main = ELF == &Image.Program;
+      const std::string_view Name = Main ? Image.ProgramPath : Image.Program.Interpreter;
+      for (const auto& Segment : ELF->GetSegments()) {
+        Process.Memory.Register(Segment.Start, Segment.Size, Segment.Flags);
+        RecordMapping(Segment.Start, Segment.Size, Segment.Start - ELF->Base, Name);
+      }
+      TrackElfSegments(Process, ELF->GetSegments(), ELF->Path, MappingName(ELF->Path, Name), ELF->Device, ELF->Inode, Main);
+    }
+  }
+
+  std::string MappingName(std::string_view Path, std::string_view Fallback, const MountRef& Mount = {}) const {
+    namespace Mn = Switch2Guest::Mounts;
+    if (Mount && Mn::PathContains(Mount->Root, Path)) {
+      if (const auto Visible = Mn::VisiblePath(RootOf(*Task), Mount.get(), Path)) return *Visible;
+    }
+    if (Path.empty()) return std::string(Fallback);
+    if (PathContains(RootPath, Path)) return std::string(Path.substr(RootPath.size()));
+    if (Path.starts_with(ShmDirectory)) return std::string(Path);
+    if (const auto Card = CardMountOf(*Task)) {
+      if (const auto Visible = Mn::VisiblePath(RootOf(*Task), Card.get(), Path)) return *Visible;
+    }
+    return std::string(Fallback);
   }
 
   bool IsUnlinked(uint64_t Inode) const {
@@ -6684,6 +6965,8 @@ private:
   };
   static_assert(sizeof(LinuxStat) == 144);
   static constexpr uint64_t ProcDevice = 2, DevDevice = 3, ShmDevice = 4, AnonDevice = 13; // anon_inodefs is 0:13 on Linux
+  static constexpr uint64_t SysDevice = 21, CgroupDevice = 26; // sysfs and cgroup2, as 0:21 and 0:26 on the checking host
+  static constexpr uint64_t UdevDevice = 27;
   static constexpr uint64_t CardDevice = 1;                        // /mnt/sd is the same SD card file system as /
   static constexpr std::string_view CardMountPoint = "/mnt/sd";    // guest path of the SD card mount
   std::shared_ptr<Switch2Guest::Mounts::Superblock> CardSb;
@@ -7130,6 +7413,7 @@ private:
     auto File = std::make_shared<OpenFile>();
     File->TimerFd = std::make_shared<TimerFdState>();
     File->TimerFd->Clock = TimerClockFor(Clock);
+    File->TimerFd->ClockId = static_cast<int32_t>(ClockId);
     const auto State = File->TimerFd;
     const auto FD = OpenAnonymous("[timerfd]", Flags, 2, std::move(File));
     if (FD >= 0) TimerFds.push_back(State);
@@ -7156,6 +7440,7 @@ private:
     const auto Old = TimerValue(State->Clock, State->Timer);
     // timerfd_setup_cancel: only absolute realtime timers may cancel; other flags are ignored.
     State->CancelOnSet = State->Clock.Domain == TimerDomain::Realtime && (Flags & TimerAbsolute) && (Flags & CancelOnSet);
+    State->SetFlags = static_cast<uint32_t>(Flags);
     State->Canceled = false;
     State->Ticks = 0;
     ++State->Changes;
@@ -7337,7 +7622,8 @@ private:
 
   // file_can_poll: the descriptor kinds with a poll operation.
   static bool CanPoll(const OpenFile& File) {
-    return File.Socket || File.Inet || File.Console != ConsoleStream::None || File.AnonName || File.PidfdTarget;
+    return File.Socket || File.Inet || File.Console != ConsoleStream::None || File.AnonName || File.PidfdTarget ||
+           File.InputClient;
   }
 
   static void ForgetClosed(EpollState& State) {
@@ -7378,6 +7664,7 @@ private:
   }
 
   int64_t EpollCtl(uint64_t EpFd, uint64_t OpArgument, uint64_t FD, uint64_t EventAddress) {
+    PumpEvdev();
     using namespace Switch2Guest;
     const auto Op = static_cast<uint32_t>(OpArgument);
     EpollEvent Event {};
@@ -7435,6 +7722,7 @@ private:
 
   // do_epoll_wait and ep_poll. Never restarted after a handler.
   int64_t EpollWaitCore(uint64_t EpFd, uint64_t Events, uint64_t MaxArgument, std::optional<uint64_t> Duration) {
+    PumpEvdev();
     using Switch2Guest::EpollEvent;
     const auto Max = static_cast<int32_t>(MaxArgument);
     if (Max <= 0 || Max > static_cast<int32_t>(INT32_MAX / sizeof(EpollEvent))) return Invalid;
@@ -7545,7 +7833,11 @@ private:
   // A watched directory's child event, named.
   void NotifyChild(const std::string& Path, uint32_t Mask, uint32_t Cookie, bool Directory, bool Unlinked = false) {
     if (Path.empty() || Path == RootPath) return;
-    InotifyEmit(KnownInode(ParentPath(Path)), Mask, Cookie, BaseName(Path), Directory, Unlinked);
+    const auto Parent = ParentPath(Path);
+    const bool Input = PathContains(RootPath, Parent) &&
+                       std::string_view(Parent).substr(RootPath.size()) == InputDirectory;
+    const auto Inode = Input ? VirtualInode(InputDirectory) : KnownInode(Parent);
+    InotifyEmit(Inode, Mask, Cookie, BaseName(Path), Directory, Unlinked);
   }
 
   // An event on a file: its directory's watches with the name, then its own
@@ -7562,7 +7854,7 @@ private:
 
   bool InodeOpen(uint64_t Inode) {
     bool Open {};
-    ForEachOpenFile([&](const OpenFile& File) { Open |= File.Inode == Inode && File.NotifyClose; });
+    ForEachOpenFile([&](const OpenFile& File) { Open |= File.Inode == Inode && (File.NotifyClose || File.InputNode); });
     return Open;
   }
 
@@ -7588,9 +7880,11 @@ private:
     ClosedFiles.clear();
     if (!InotifyWatching()) return;
     for (const auto& File : Closed) {
-      const bool Unlinked = IsUnlinked(File.Inode);
-      NotifyPath(File.Path, File.Inode, File.Write ? Switch2Guest::InCloseWrite : Switch2Guest::InCloseNowrite,
-                 File.Directory, Unlinked);
+      const bool Unlinked = File.UnlinkedInput || IsUnlinked(File.Inode);
+      if (!File.UnlinkedInput) {
+        NotifyPath(File.Path, File.Inode, File.Write ? Switch2Guest::InCloseWrite : Switch2Guest::InCloseNowrite,
+                   File.Directory, Unlinked);
+      }
       if (Unlinked && !InodeOpen(File.Inode)) {
         InodeDeleted(File.Inode, File.Directory);
         EndInodeWatches(File.Inode);
@@ -8081,6 +8375,8 @@ private:
     return 0;
   }
 
+  static constexpr uint64_t DefaultTimerSlack = 50000;
+
   int64_t GuestPrivilegeControl(uint64_t Operation, uint64_t Value, uint64_t Arg3, uint64_t Arg4, uint64_t Arg5) {
     switch (Operation) {
     case 1: // PR_SET_PDEATHSIG
@@ -8103,6 +8399,10 @@ private:
       return 0;
     }
     case 16: return CopyOut(Value, Task->Name) ? Fault : 0;
+    // PR_SET_TIMERSLACK (0 restores the default) and PR_GET_TIMERSLACK: the calling thread's timer_slack_ns, which
+    // /proc/<pid>/timerslack_ns shows. The runtime's timers do not use the slack, so it only stores the value.
+    case 29: Current->TimerSlack = Value ? Value : DefaultTimerSlack; return 0;
+    case 30: return static_cast<int64_t>(Current->TimerSlack);
     // cap_task_prctl ignores the unused arguments of the keep-caps options;
     // glibc's variadic prctl leaves whatever was in those registers.
     case 7: // PR_GET_KEEPCAPS
@@ -8234,11 +8534,16 @@ private:
   // True when the credential holds Cap; access(2) and friends use the real
   // ids, where Linux's override_creds keeps capabilities only for real root.
   bool HasCap(uint32_t Cap, bool Real, uint64_t Inode) const {
+    const auto [Uid, Gid] = InodeOwner(Inode);
+    return HasCapForOwner(Cap, Real, Uid, Gid);
+  }
+
+  bool HasCapForOwner(uint32_t Cap, bool Real, uint32_t Uid, uint32_t Gid) const {
     const auto& Creds = Task->Creds;
     bool Has;
     if (!Real || (Creds.Uid[0] == Creds.Uid[1] && Creds.Gid[0] == Creds.Gid[1])) Has = Creds.OwnCapable(Cap);
     else Has = Creds.Uid[0] == Switch2Guest::Ns::RootKuid(*Task->Ns.User) && (Creds.CapPermitted >> Cap & 1);
-    return Has && InodeMapped(Inode, true);
+    return Has && Task->Ns.User->Uid.FromKernel(Uid) && Task->Ns.User->Gid.FromKernel(Gid);
   }
 
   // privileged_wrt_inode_uidgid: the inode's owner (and group) have ids in the caller's user namespace.
@@ -8593,7 +8898,11 @@ private:
       return 0;
     }
     if (auto* File = GetFile(FD)) {
-      s64 Size = File->Memory ? File->Memory->Size : File->Contents.size();
+      if (File->InputNode) {
+        Info = EvdevStat(*File->InputNode);
+        return 0;
+      }
+      s64 Size = File->Memory ? File->Memory->Size : 0; // generated files report size 0, as proc and sysfs do
       s64 Allocated {};
       if (File->RealFile) {
         if (const auto Error = DiskAllocation(*File, Allocated); Error) return Error;
@@ -8605,18 +8914,26 @@ private:
                            Metadata != Inodes.end() && Metadata->second.Symlink ? &*Metadata->second.Symlink : nullptr;
       if (Target) Size = Target->size();
       const auto Special = Metadata == Inodes.end() ? 0 : Metadata->second.SpecialType;
+      if (File->UdevRecord) {
+        Info = MakeStat(0100444, File->Contents.size(), File->Inode);
+        Info.Device = UdevDevice;
+        SetInputMetadata(Info, File->UdevCreated);
+        const auto* Node = KernelNode(File->Path);
+        Info.Links = Node && Node->Data.Inode == File->Inode ? 1 : 0;
+        return 0;
+      }
       const auto Mode = Special ? Special : Target ? 0120777 : File->Directory ? 0040755 : File->Pipe ? 0010600 : File->Socket || File->Inet ? 0140777 :
-                        File->Console != ConsoleStream::None ? 0020600 : File->Memory ? 0100777 : CharDevAt(File->Path) != CharDev::None ? 0020666 : ProcFile(File->Path) ? ProcFileMode(File->Path) : RegularMode(File->Path);
+                        File->Console != ConsoleStream::None ? 0020600 : File->Memory ? 0100777 : CharDevAt(File->Path) != CharDev::None ? CharDevMode(CharDevAt(File->Path)) : ProcFile(File->Path) ? ProcFileMode(File->Path) : RegularMode(File->Path);
       Info = MakeStat(ModeForInode(File->Inode, Mode), Size, File->Inode);
       const auto VirtualDir = File->Directory ? VirtualDirectory(File->Path) : std::string_view {};
       if (VirtualDir == ShmDirectory) {
         ShmDirectoryStat(Info);
       } else if (!VirtualDir.empty()) {
-        Info.Device = VirtualDir.starts_with("/dev") ? DevDevice : ProcDevice;
-        Info.Mode = VirtualDir == PtsDirectory ? 0040755 : 0040555;
+        Info.Device = VirtualDir.starts_with("/dev") ? DevDevice : KernelFileDevice(VirtualDir);
+        Info.Mode = VirtualDirectoryMode(VirtualDir);
       }
       if (File->Memory && File->Path.starts_with("/dev/shm/")) Info.Device = ShmDevice;
-      if (ProcFile(File->Path) || !ProcTarget.empty()) Info.Device = ProcDevice;
+      if (ProcFile(File->Path) || !ProcTarget.empty()) Info.Device = KernelFileDevice(File->Path);
       if (CharDevAt(File->Path) != CharDev::None) Info.Device = DevDevice;
       if (File->RealFile) Info.Blocks = Allocated / 512 + (Allocated % 512 != 0);
       if (File->Memory) Info.Blocks = File->Memory->AllocatedBytes() / 512;
@@ -8637,9 +8954,13 @@ private:
         Info.Links = Links + OverflowSubdirectories(File->Path);
       }
       if (CharDevAt(File->Path) != CharDev::None) Info.Rdev = CharDevRdev(CharDevAt(File->Path));
-      if (File->Console == ConsoleStream::Terminal) Info.Rdev = 0x500;
+      if (File->Console == ConsoleStream::Terminal) Info.Rdev = CharDevAt(File->Path) == CharDev::Console ? 0x501 : 0x500;
+      if (CharDevAt(File->Path) == CharDev::Console) Info.Gid = 5; // root:tty
       if (File->Tty && File->Tty->Pty && File->Path != "/dev/tty") PtyNodeStat(Info, File->Tty.get(), File->TtyMaster);
       else if (CharDevAt(File->Path) == CharDev::Pts) PtyNodeStat(Info, PtsSlaveAt(File->Path).get(), false); // O_PATH
+      auto GuestPath = std::string_view(File->Path);
+      if (PathContains(RootPath, GuestPath)) GuestPath.remove_prefix(RootPath.size());
+      ApplyInputMetadata(Info, GuestPath);
     } else {
       return BadFile;
     }
@@ -8680,6 +9001,10 @@ private:
     const auto Type = Info.Mode & 0170000;
     if ((Mode & 2) && (Type == 0100000 || Type == 0040000 || Type == 0120000)) {
       if (const auto Denied = MountDenies(StatMount, false)) return Denied;
+    }
+    if (IsEvdevStat(Info)) {
+      const auto* Node = EvdevAt(Info);
+      return EvdevAllows(Info.Gid, EvdevAclUser(Node), Mode & 7, !(Flags & EffectiveAccess)) ? 0 : -13;
     }
     // A pty slave belongs to the opener of its master, not to the inode store's default owner.
     if (const auto Tty = PtsOfStat(Info)) return PtsAllows(*Tty, Mode & 7, !(Flags & EffectiveAccess)) ? 0 : -13;
@@ -8727,15 +9052,381 @@ private:
       if (Found == Processes.end() || Found->second.Reaped) return std::nullopt;
       Process = &Found->second;
     }
-    return ProcEntry {Process, Slash == Name.npos ? std::string_view {} : Name.substr(Slash + 1)};
+    auto Rest = Slash == Name.npos ? std::string_view {} : Name.substr(Slash + 1);
+    // task/<tid>/{fd,fdinfo,ns,attr}: the descriptor table, namespaces and attributes belong to the process, so the
+    // thread directory names the same objects as the process directory.
+    if (Rest.starts_with("task/")) {
+      const auto After = Rest.substr(5);
+      const auto Cut = After.find('/');
+      if (Cut != After.npos) {
+        const auto Tail = After.substr(Cut + 1);
+        const auto Head = Tail.substr(0, Tail.find('/'));
+        if (const auto Tid = ProcPID(After.substr(0, Cut)); Tid && (Head == "fd" || Head == "fdinfo" || Head == "ns" || Head == "attr")) {
+          for (const auto& Thread : Threads) {
+            if (Thread.Core && !Thread.Exited && Thread.PID == Process->PID && ViewOut(Thread.TID) == Tid) {
+              Rest = Tail;
+              break;
+            }
+          }
+        }
+      }
+    }
+    return ProcEntry {Process, Rest};
+  }
+
+  static constexpr std::string_view InputDirectory = "/dev/input";
+  static constexpr std::string_view EventPrefix = "/dev/input/event";
+  static constexpr std::string_view UdevDirectory = "/run/udev";
+  static constexpr uint32_t EvdevMode = 0020660;
+
+  std::optional<uint32_t> InputGid;
+  uint64_t NextInputNumber {};
+  std::map<uint32_t, std::shared_ptr<EvdevNode>> EvdevDevices;
+  std::array<std::shared_ptr<EvdevNode>, Switch2Guest::InputPadCount> EvdevPads;
+  std::shared_ptr<EvdevNode> EvdevKeyboard, EvdevMouse;
+  Switch2Guest::InputSnapshot EvdevState;
+
+  std::shared_ptr<EvdevNode> ConnectEvdev(Switch2Guest::Evdev::EvdevDevice Device, Switch2Guest::InputClass Class,
+                                         uint32_t Pad = 0, Switch2Guest::PadConnection Connection = {}) {
+    // evdev_connect takes the lowest free minor in the evdev range.
+    uint32_t Number = 0;
+    while (EvdevDevices.contains(Number)) ++Number;
+    const auto Path = std::string(EventPrefix) + std::to_string(Number);
+    auto Node = std::make_shared<EvdevNode>(EvdevNode {
+      .Device = std::move(Device), .Class = Class, .Connection = Connection,
+      .Number = Number, .Pad = Pad, .Gid = *InputGid, .InputNumber = NextInputNumber++,
+      .Inode = VirtualInode(Path + "/" + std::to_string(Connection.Generation)), .Created = WallClock(), .Clients = {},
+    });
+    EvdevDevices.emplace(Number, Node);
+    SetEvdevDiscovery(*Node, true);
+    NotifyChild(RootPath + Path, Switch2Guest::InCreate, 0, false);
+    return Node;
+  }
+
+  void DisconnectEvdev(const std::shared_ptr<EvdevNode>& Node) {
+    // evdev_disconnect removes the name, but existing descriptions retain the old device.
+    const auto Path = RootPath + std::string(EventPrefix) + std::to_string(Node->Number);
+    // devtmpfs handle_remove resets permissions before vfs_unlink, which first notifies the parent of IN_ATTRIB.
+    Node->Connected = false;
+    NotifyPath(Path, Node->Inode, Switch2Guest::InAttrib, false);
+    EvdevDevices.erase(Node->Number);
+    SetEvdevDiscovery(*Node, false);
+    NotifyRemoved({Path, Node->Inode, 1, true, false});
+    Node->Device.Grab = nullptr;
+    for (auto* Client : Node->Clients) Client->Disconnect();
+    ++IOEpoch;
+  }
+
+  void SetEvdevDiscovery(const EvdevNode& Node, bool Present) {
+    namespace Sf = Switch2Guest::Sysfs;
+    using Switch2Guest::KernelTree::Kind;
+    auto& Tree = KernelFiles();
+    const auto Input = "input" + std::to_string(Node.InputNumber);
+    const auto Event = "event" + std::to_string(Node.Number);
+    const auto Dev = "13:" + std::to_string(64 + Node.Number);
+    const auto Relative = "devices/virtual/input/" + Input;
+    const auto DevicePath = "/sys/" + Relative;
+    const auto EventPath = DevicePath + '/' + Event;
+    auto Udev = Sf::InputUdev(Node.Device, Node.Class, Present ? MonotonicNs() / 1000 : 0);
+    const auto ById = "/dev/" + Udev.ById;
+    const auto ByPath = "/dev/" + Udev.ByPath;
+    const auto Record = std::string(UdevDirectory) + "/data/c" + Dev;
+    const auto ClassInput = "/sys/class/input/" + Input;
+    const auto ClassEvent = "/sys/class/input/" + Event;
+    const auto ByDev = "/sys/dev/char/" + Dev;
+    if (!Present) {
+      for (const auto* Path : {&DevicePath, &ClassInput, &ClassEvent, &ByDev, &ById, &ByPath, &Record}) Tree.Remove(*Path);
+      return;
+    }
+
+    const auto File = [&](std::string_view Path, std::string Text, uint32_t Mode = 0444, uint64_t Inode = 0) {
+      Tree.Add(Path, Kind::File, Mode, {[Text = std::move(Text)] { return Text; }, {}, {}, Inode, Node.Created});
+    };
+    const auto Link = [&](std::string_view Path, std::string Target) {
+      Tree.Add(Path, Kind::Link, 0777, {{}, {}, std::move(Target), 0, Node.Created});
+    };
+    for (const auto& Path : {DevicePath, EventPath, DevicePath + "/id", DevicePath + "/capabilities"}) {
+      Tree.Add(Path, Kind::Directory, 0555, {{}, {}, {}, 0, Node.Created});
+    }
+    for (auto& Attr : Sf::InputFiles(Node.Device, Node.Class)) {
+      File(DevicePath + '/' + std::string(Attr.Name), std::move(Attr.Text), Attr.Name == "uevent" ? 0644 : 0444);
+    }
+    File(EventPath + "/dev", Dev + '\n');
+    File(EventPath + "/uevent", Sf::EventUevent(Node.Number), 0644);
+    File(Record, std::move(Udev.Database), 0444, VirtualInode(Record + '/' + Input));
+    // device_add_class_symlinks and sysfs_dev_char_kobj provide both libudev lookup paths.
+    Link(ClassInput, "../../" + Relative);
+    Link(ClassEvent, "../../" + Relative + '/' + Event);
+    Link(ByDev, "../../" + Relative + '/' + Event);
+    Link(DevicePath + "/subsystem", "../../../../class/input");
+    Link(EventPath + "/subsystem", "../../../../../class/input");
+    Link(EventPath + "/device", "../../" + Input);
+    Link(ById, "../" + Event);
+    Link(ByPath, "../" + Event);
+  }
+
+  const std::shared_ptr<EvdevNode>* EvdevAt(std::string_view Path) const {
+    if (!Path.starts_with(EventPrefix)) return nullptr;
+    Path.remove_prefix(EventPrefix.size());
+    uint32_t Number {};
+    if (!Switch2Guest::PtyTable::ParseName(Path, Number)) return nullptr;
+    const auto It = EvdevDevices.find(Number);
+    return It == EvdevDevices.end() ? nullptr : &It->second;
+  }
+
+  Switch2Guest::Evdev::ClockTimes EvdevTime(uint64_t Time) const {
+    const auto Monotonic = static_cast<int64_t>(Time);
+    return {std::max<int64_t>(0, Realtime.Now(Time)), Monotonic, Monotonic};
+  }
+
+  void DeliverEvdev(EvdevNode& Node, const std::vector<Switch2Guest::Evdev::InputEvent>& Packet,
+                    const Switch2Guest::Evdev::ClockTimes* Time) {
+    if (Packet.empty()) return;
+    if (!Time) {
+      // A state snapshot updates EVIOCGKEY and EVIOCGABS without fabricating queued transitions.
+      for (const auto& Event : Packet) Node.Device.Apply(Event);
+      return;
+    }
+    Switch2Guest::Evdev::Deliver(Node.Device, Node.Clients, Packet, *Time);
+    if (!Node.Clients.empty()) ++IOEpoch;
+  }
+
+  void ApplyPad(uint32_t Index, const Switch2Guest::PadReport& Report, Switch2Guest::PadConnection Connection,
+                const Switch2Guest::Evdev::ClockTimes* Time) {
+    using namespace Switch2Guest;
+    auto& Node = EvdevPads[Index];
+    auto& Before = EvdevState.Pads[Index];
+    if (Node && (!Report.Connected || Node->Connection.Generation != Connection.Generation)) {
+      DisconnectEvdev(Node);
+      Node.reset();
+      Before = {};
+    }
+    if (Report.Connected) {
+      if (!Node)
+        Node = ConnectEvdev(Evdev::MakeGamepad(Index, Connection.Identity), InputClass::Pad, Index, Connection);
+      if (Before != Report) {
+        DeliverEvdev(*Node, ToEvdevPacket(PadChange {Index, Before, Report}, Node->Connection.Identity), Time);
+        Before = Report;
+      }
+    }
+  }
+
+  void ApplyEvdevSnapshot(const Switch2Guest::InputSnapshot& Snapshot) {
+    using namespace Switch2Guest;
+    // While idle, reconcile removals first so new devices can use the freed minors.
+    for (uint32_t Index = 0; Index < EvdevPads.size(); ++Index) {
+      const auto& Node = EvdevPads[Index];
+      if (Node && (!Snapshot.Pads[Index].Connected ||
+                   Node->Connection.Generation != Snapshot.Connections[Index].Generation))
+        ApplyPad(Index, {}, {}, nullptr);
+    }
+    // Connections that came in while idle get their minors in connect order.
+    std::array<uint32_t, InputPadCount> Order {};
+    for (uint32_t Index = 0; Index < Order.size(); ++Index) Order[Index] = Index;
+    std::sort(Order.begin(), Order.end(), [&](uint32_t A, uint32_t B) {
+      return Snapshot.Connections[A].Generation < Snapshot.Connections[B].Generation;
+    });
+    for (const auto Index : Order)
+      ApplyPad(Index, Snapshot.Pads[Index], Snapshot.Connections[Index], nullptr);
+    if (EvdevState.Keyboard != Snapshot.Keyboard)
+      DeliverEvdev(*EvdevKeyboard, ToEvdevPacket(KeyboardChange {EvdevState.Keyboard, Snapshot.Keyboard}), nullptr);
+    if (EvdevState.MouseButtons != Snapshot.MouseButtons) {
+      const MouseChange Change {EvdevState.MouseButtons, {.Buttons = Snapshot.MouseButtons}};
+      DeliverEvdev(*EvdevMouse, ToEvdevPacket(Change), nullptr);
+    }
+    EvdevState = Snapshot;
+  }
+
+  void PumpEvdev(bool RefreshIdle = false) {
+    using namespace Switch2Guest;
+    if (!InputGid) return;
+    if (!EvdevOpenCount && !RefreshIdle) return;
+    if (!EvdevKeyboard) {
+      EvdevKeyboard = ConnectEvdev(Evdev::MakeKeyboard(), InputClass::Keyboard);
+      EvdevMouse = ConnectEvdev(Evdev::MakeMouse(), InputClass::Mouse);
+    }
+    if (!EvdevOpenCount) {
+      ApplyEvdevSnapshot(InputFeed().Snapshot());
+      return;
+    }
+    const auto Batch = InputFeed().Take();
+    if (Batch.Dropped) {
+      const auto Time = EvdevTime(Batch.Changes.front().TimeNs);
+      for (const auto& [Number, Node] : EvdevDevices)
+        for (auto* Client : Node->Clients)
+          if (!Client->Revoked) Client->Drop(Time);
+      ++IOEpoch;
+    }
+    if (Batch.Snapshot) ApplyEvdevSnapshot(*Batch.Snapshot);
+    for (const auto& Item : Batch.Changes) {
+      const auto Time = EvdevTime(Item.TimeNs);
+      if (const auto* Pad = std::get_if<PadChange>(&Item.Change)) {
+        ApplyPad(Pad->Index, Pad->After, Pad->Connection, &Time);
+      } else if (const auto* Keyboard = std::get_if<KeyboardChange>(&Item.Change)) {
+        DeliverEvdev(*EvdevKeyboard, ToEvdevPacket(KeyboardChange {EvdevState.Keyboard, Keyboard->After}), &Time);
+        EvdevState.Keyboard = Keyboard->After;
+      } else {
+        const auto& Mouse = std::get<MouseChange>(Item.Change);
+        DeliverEvdev(*EvdevMouse, ToEvdevPacket(MouseChange {EvdevState.MouseButtons, Mouse.After}), &Time);
+        EvdevState.MouseButtons = Mouse.After.Buttons;
+      }
+    }
+  }
+
+  void UpdateEvdevOwnership() {
+    using namespace Switch2Guest;
+    if (!EvdevOpenCount) return;
+    std::array<std::optional<uint64_t>, 3> Generations {};
+    const auto Foreground = Service ? Service->ForegroundId() : 0;
+    if (Foreground || (!Service && Interactive)) {
+      for (const auto& Thread : Threads) {
+        if (!Thread.Core || Thread.Exited || !Thread.Descriptors) continue;
+        const auto* Process = FindProcess(Thread.PID);
+        if (!Process || Process->Exited || Process->InputSession != Foreground) continue;
+        for (const auto& File : Thread.Descriptors->Files) {
+          if (!File || !File->InputClient || File->InputClient->Revoked) continue;
+          auto& Generation = Generations[static_cast<size_t>(File->InputNode->Class)];
+          if (!Generation || *Generation < File->InputOpenGeneration) Generation = File->InputOpenGeneration;
+        }
+      }
+    }
+    for (size_t Index = 0; Index < Generations.size(); ++Index) {
+      const auto Generation = Generations[Index];
+      InputFeed().SetOwned(static_cast<InputClass>(Index), Generation.has_value(), Generation.value_or(0));
+    }
+  }
+
+  LinuxStat EvdevStat(const EvdevNode& Node) {
+    auto Info = MakeStat(Node.Connected ? EvdevMode : 0020000, 0, Node.Inode);
+    Info.Device = DevDevice;
+    Info.Rdev = (13 << 8) | (64 + Node.Number);
+    SetInputMetadata(Info, Node.Created);
+    Info.Gid = Node.Connected ? Node.Gid : 0;
+    Info.Links = Node.Connected ? 1 : 0;
+    return Info;
+  }
+
+  static bool IsEvdevStat(const LinuxStat& Info) {
+    return Info.Device == DevDevice && (Info.Mode & 0170000) == 0020000 && (Info.Rdev >> 8) == 13;
+  }
+
+  const EvdevNode* EvdevAt(const LinuxStat& Info) const {
+    const auto Minor = Info.Rdev & 0xff;
+    if (Minor < 64) return nullptr;
+    const auto It = EvdevDevices.find(Minor - 64);
+    return It != EvdevDevices.end() && It->second->Inode == Info.Inode ? It->second.get() : nullptr;
+  }
+
+  std::optional<uint32_t> EvdevAclUser(const EvdevNode* Node) const {
+    if (!Node || Node->Class != Switch2Guest::InputClass::Pad || !Service) return std::nullopt;
+    // logind's uaccess grant belongs to the login user, even if a child changes its credentials.
+    const auto Foreground = Service->ForegroundId();
+    for (const auto& Record : Sessions) {
+      if (Record.Host->Id == Foreground && Record.Host->State.load() == Switch2Guest::HostSession::Running)
+        return Record.LoginUid;
+    }
+    return std::nullopt;
+  }
+
+  bool EvdevAllows(uint32_t Gid, std::optional<uint32_t> AclUser, unsigned Requested, bool Real = false) const {
+    const auto User = Task->Creds.Uid[Real ? 0 : 3];
+    if (HasCapForOwner(Switch2Guest::CapDacOverride, Real, 0, Gid) && !(Requested & 1)) return true;
+    if (HasCapForOwner(CapDacReadSearch, Real, 0, Gid) && Requested == 4) return true;
+    return !(Requested & ~(User == 0 || User == AclUser || InGuestGroup(Gid, Real) ? 6u : 0u));
+  }
+
+  int64_t ReadEvdev(OpenFile& File, void* Buffer, uint64_t Count) {
+    const auto Result = File.InputClient->Read(static_cast<uint8_t*>(Buffer), Count, File.Nonblocking());
+    return Result == Switch2Guest::Evdev::ReadWait ? WaitForIO() : Result;
+  }
+
+  int64_t WriteEvdev(OpenFile& File, const void* Buffer, uint64_t Count) {
+    auto& Node = *File.InputNode;
+    const auto SendRumble = [&](const auto& Request) {
+      Switch2Guest::InputFeed().PushRumble(Node.Pad, Request, Node.Connection.Generation);
+    };
+    return Switch2Guest::Evdev::Write(Node.Device, *File.InputClient, static_cast<const uint8_t*>(Buffer), Count,
+                                     SendRumble);
+  }
+
+  int64_t InputIoctl(OpenFile& File, uint32_t Command, uint64_t Argument) {
+    using namespace Switch2Guest::Evdev;
+    auto& Node = *File.InputNode;
+    auto& Client = *File.InputClient;
+    if (Client.Revoked) return Enodev;
+    if (IocType(Command) != 'E') return Enotty;
+    // evdev_do_ioctl tests dev->absinfo before copying the new axis parameters from the caller.
+    if (IsSetAbsIoctl(Command) && !TestBit(Node.Device.Ev, EV_ABS)) return Einval;
+
+    std::vector<uint8_t> Arg(IocSize(Command));
+    // These three commands receive scalar values despite their _IOW encodings (evdev_do_ioctl).
+    if (Command == EVIOCGRAB || Command == EVIOCREVOKE || Command == EVIOCRMFF) {
+      const auto Value = Command == EVIOCRMFF ? static_cast<int32_t>(Argument) : int32_t {Argument != 0};
+      std::memcpy(Arg.data(), &Value, sizeof(Value));
+    } else if ((IocDir(Command) & IocWrite) || Command == EVIOCGMASK) {
+      if (AccessiblePrefix(Argument, Arg.size(), PF_R) < Arg.size()) return Fault;
+      if (!Arg.empty()) std::memcpy(Arg.data(), reinterpret_cast<const void*>(Argument), Arg.size());
+    }
+
+    InputMask Mask {};
+    std::vector<uint8_t> Codes;
+    uint32_t CodesSize {};
+    if (Command == EVIOCGMASK || Command == EVIOCSMASK) {
+      std::memcpy(&Mask, Arg.data(), sizeof(Mask));
+      const auto MaxCode = Switch2Guest::Evdev::Detail::MaskCount(Mask.Type);
+      const bool Get = Command == EVIOCGMASK;
+      if (Mask.CodesSize && (Get || MaxCode)) {
+        CodesSize = Mask.CodesSize;
+        if (!Get && CodesSize % sizeof(uint64_t)) return Invalid;
+        Mask.CodesSize = std::min<uint32_t>(CodesSize, ((MaxCode + 63) / 64) * 8);
+        const auto Size = Get ? CodesSize : Mask.CodesSize;
+        if (AccessiblePrefix(Mask.CodesPtr, Size, Get ? PF_W : PF_R) < Size) return Fault;
+        Codes.resize(Mask.CodesSize);
+        if (!Get) std::memcpy(Codes.data(), reinterpret_cast<const void*>(Mask.CodesPtr), Codes.size());
+        std::memcpy(Arg.data(), &Mask, sizeof(Mask));
+      }
+    }
+
+    // EVIOCSFF writes back only the assigned id. Check that field before uploading the effect.
+    constexpr size_t EffectId = offsetof(FfEffect, Id);
+    if (Command == EVIOCSFF && AccessiblePrefix(Argument + EffectId, sizeof(FfEffect::Id), PF_W) < sizeof(FfEffect::Id))
+      return Fault;
+    if (Command == EVIOCSCLOCKID) Client.LastTime = EvdevTime(MonotonicNs());
+
+    size_t Copy {};
+    const auto Before = Client.Generation();
+    const auto Result = EvdevIoctl(Node.Device, Client, Command, Arg, &Copy, Codes);
+    if (Result < 0) return Result;
+    if (Client.Generation() != Before) ++IOEpoch;
+    if (Command == EVIOCREVOKE) File.StopInputEffects();
+    if (Command == EVIOCRMFF) {
+      Switch2Guest::InputFeed().PushRumble(Node.Pad, {.EffectId = static_cast<int32_t>(Argument), .Stop = true},
+                                          Node.Connection.Generation);
+    }
+    if (Command == EVIOCSFF) {
+      int16_t Id {};
+      std::memcpy(&Id, Arg.data() + EffectId, sizeof(Id));
+      return CopyOut(Argument + EffectId, Id);
+    }
+    if (Copy) {
+      if (AccessiblePrefix(Argument, Copy, PF_W) < Copy) return Fault;
+      std::memcpy(reinterpret_cast<void*>(Argument), Arg.data(), Copy);
+    }
+    if (Command == EVIOCGMASK && CodesSize) {
+      auto* Out = reinterpret_cast<uint8_t*>(Mask.CodesPtr);
+      if (!Codes.empty()) std::memcpy(Out, Codes.data(), Codes.size());
+      std::memset(Out + Codes.size(), 0, CodesSize - Codes.size());
+    }
+    return Result;
   }
 
   // The character devices of /dev. They are real device nodes: st_rdev, mode 0666 and the read/write rules of
   // drivers/char/mem.c. /dev/tty exists always (it can be bind-mounted) but opens only for a process with a
   // controlling terminal, which here means an interactive run.
   // Ptmx is the pty master (/dev/ptmx, /dev/pts/ptmx); Pts a slave /dev/pts/<n> while its master is open.
-  enum class CharDev { None, Null, Zero, Full, Random, Urandom, Tty, Ptmx, Pts };
-  static CharDev CharDevAt(std::string_view GuestPath) {
+  enum class CharDev { None, Null, Zero, Full, Random, Urandom, Tty, Ptmx, Pts, Console, Kmsg, Input };
+  CharDev CharDevAt(std::string_view GuestPath) const {
+    if (EvdevAt(GuestPath)) return CharDev::Input;
     if (GuestPath == "/dev/ptmx" || GuestPath == "/dev/pts/ptmx") return CharDev::Ptmx;
     if (GuestPath.starts_with("/dev/pts/")) {
       uint32_t Index {};
@@ -8748,12 +9439,15 @@ private:
     if (GuestPath == "/dev/random") return CharDev::Random;
     if (GuestPath == "/dev/urandom") return CharDev::Urandom;
     if (GuestPath == "/dev/tty") return CharDev::Tty;
+    if (GuestPath == "/dev/console") return CharDev::Console;
+    if (GuestPath == "/dev/kmsg") return CharDev::Kmsg;
     return CharDev::None;
   }
-  // The data devices (everything but the terminal).
-  static bool IsDataDev(std::string_view GuestPath) {
+  // The data devices served by ReadCharDev and WriteCharDev.
+  bool IsDataDev(std::string_view GuestPath) const {
     const auto Kind = CharDevAt(GuestPath);
-    return Kind != CharDev::None && Kind != CharDev::Tty && Kind != CharDev::Ptmx && Kind != CharDev::Pts;
+    return Kind != CharDev::None && Kind != CharDev::Tty && Kind != CharDev::Ptmx && Kind != CharDev::Pts &&
+           Kind != CharDev::Console && Kind != CharDev::Input;
   }
   // The pty a /dev/pts/<n> path names, while its master is open.
   static std::shared_ptr<GuestTty> PtsSlaveAt(std::string_view GuestPath) {
@@ -8769,13 +9463,21 @@ private:
     case CharDev::Random: return 0x108;  // 1:8
     case CharDev::Urandom: return 0x109; // 1:9
     case CharDev::Tty: return 0x500;     // 5:0
+    case CharDev::Console: return 0x501; // 5:1
+    case CharDev::Kmsg: return 0x10b;    // 1:11
     case CharDev::Ptmx: return Switch2Guest::PtmxRdev; // 5:2
     default: return 0;
     }
   }
-  // read_null, read_zero (also /dev/full) and the random devices' read.
+  // The mode of a /dev node: console is 0600 (root:tty) and kmsg 0644, the rest 0666.
+  static uint32_t CharDevMode(CharDev Kind) {
+    return Kind == CharDev::Console ? 0020600 : Kind == CharDev::Kmsg ? 0020644 : 0020666;
+  }
+  // read_null, read_zero (also /dev/full) and the random devices' read. /dev/kmsg has no ring here: it never has a
+  // record to read (devkmsg_read on an empty log), and a blocking reader would wait forever.
   static int64_t ReadCharDev(CharDev Kind, void* Buffer, uint64_t Count) {
     auto* Bytes = static_cast<char*>(Buffer);
+    if (Kind == CharDev::Kmsg) return -11;
     if (Kind == CharDev::Null) return 0;
     if (Kind == CharDev::Random || Kind == CharDev::Urandom) {
       for (uint64_t Done = 0; Done < Count;) {
@@ -8801,43 +9503,95 @@ private:
     return Out;
   }
 
-  // /proc/<pid>/status as the caller reads it: ids and numbers in the caller's namespaces.
-  std::string ProcStatus(const GuestProcess& P) const {
-    char Line[160];
-    std::string Out;
-    const auto Add = [&](const char* Format, auto... Values) {
-      std::snprintf(Line, sizeof(Line), Format, Values...);
-      Out += Line;
-    };
-    const char* Comm = P.Name[0] ? P.Name.data() : "fex-guest";
-    Add("Name:\t%s\nUmask:\t%04o\n", Comm, P.Fs->CreationMask);
-    Add("State:\t%s\n", P.Exited ? "Z (zombie)" : P.Stopped ? "T (stopped)" : "R (running)");
-    size_t Count {};
-    for (const auto& Thread : Threads) Count += Thread.Core && !Thread.Exited && Thread.PID == P.PID;
-    Add("Tgid:\t%u\nNgid:\t0\nPid:\t%u\nPPid:\t%u\nTracerPid:\t0\n", ViewOut(P.PID), ViewOut(P.PID), ViewOut(P.ParentPID));
-    Add("Uid:\t%u\t%u\t%u\t%u\n", UidOut(P.Creds.Uid[0]), UidOut(P.Creds.Uid[1]), UidOut(P.Creds.Uid[2]), UidOut(P.Creds.Uid[3]));
-    Add("Gid:\t%u\t%u\t%u\t%u\n", GidOut(P.Creds.Gid[0]), GidOut(P.Creds.Gid[1]), GidOut(P.Creds.Gid[2]), GidOut(P.Creds.Gid[3]));
-    Out += "Groups:\t";
-    for (const auto Group : P.SupplementaryGroups) Out += std::to_string(GidOut(Group)) + " ";
-    Out += "\n";
-    Out += "NStgid:\t" + PidChain(P.PID, P) + "\nNSpid:\t" + PidChain(P.PID, P) + "\nNSpgid:\t" + PidChain(P.Group, P) +
-           "\nNSsid:\t" + PidChain(P.Session, P) + "\n";
-    Add("Threads:\t%zu\n", Count);
-    Add("VmPeak:\t%8zu kB\nVmSize:\t%8zu kB\nVmRSS:\t%8zu kB\n", P.Memory.MappedBytes() >> 10, P.Memory.MappedBytes() >> 10,
-        P.Memory.ResidentBytes() >> 10);
-    Add("CapInh:\t%016llx\nCapPrm:\t%016llx\nCapEff:\t%016llx\nCapBnd:\t%016llx\nCapAmb:\t%016llx\n",
-        static_cast<unsigned long long>(P.Creds.CapInheritable), static_cast<unsigned long long>(P.Creds.CapPermitted),
-        static_cast<unsigned long long>(P.Creds.CapEffective), static_cast<unsigned long long>(P.Creds.CapBounding),
-        static_cast<unsigned long long>(P.Creds.CapAmbient));
-    // Seccomp state of the thread group leader (the main thread), or of any live thread.
-    const GuestThread* Leader {};
-    for (const auto& Thread : Threads) {
-      if (!Thread.Core || Thread.Exited || Thread.PID != P.PID) continue;
-      if (!Leader || Thread.TID == P.PID) Leader = &Thread;
+  // The descriptor table size Linux shows as FDSize: 64 doubled until it covers the highest open descriptor.
+  uint32_t FdTableSize(const GuestProcess& P) const {
+    uint32_t Size = 64;
+    if (const auto* Table = DescriptorsOf(P)) {
+      for (size_t Index = Table->Files.size(); Index-- > 0;) {
+        if (Table->Files[Index]) {
+          while (Size <= Index) Size *= 2;
+          break;
+        }
+      }
     }
-    Add("NoNewPrivs:\t%d\nSeccomp:\t%u\nSeccomp_filters:\t%zu\n", P.NoNewPrivileges ? 1 : 0, Leader ? Leader->Seccomp.Mode : 0,
-        Leader ? Switch2Guest::Seccomp::FilterCount(Leader->Seccomp.Filters) : size_t {});
-    return Out;
+    return Size;
+  }
+
+  // VmHWM: the highest resident size seen since exec. The runtime has no page-fault hook, so the peak is sampled when a
+  // /proc file is read and when an unmap of 1 MiB or more is about to drop pages.
+  uint64_t ProcRssPeak(const GuestProcess& P, uint64_t Current) const {
+    P.RssPeak = std::max(P.RssPeak, Current);
+    return P.RssPeak;
+  }
+
+  // /proc/<pid>/status (proc_pid_status) as the caller reads it: ids and numbers in the caller's namespaces. Thread null
+  // reads the process (its leader's signal and scheduling state); else that task's.
+  std::string ProcStatus(const GuestProcess& P, const GuestThread* Thread = nullptr) const {
+    namespace Pf = Switch2Guest::Procfs;
+    Pf::Status S;
+    const auto* Leader = Thread ? Thread : LeaderOf(P);
+    const uint32_t Tid = Thread ? Thread->TID : P.PID;
+    S.Name = P.Name[0] ? P.Name.data() : "fex-guest";
+    S.Umask = P.Fs->CreationMask;
+    S.State = ProcState(P, Thread);
+    S.Tgid = ViewOut(P.PID);
+    S.Pid = ViewOut(Tid);
+    S.PPid = ViewOut(P.ParentPID);
+    for (int I = 0; I < 4; ++I) {
+      S.Uid[I] = UidOut(P.Creds.Uid[I]);
+      S.Gid[I] = GidOut(P.Creds.Gid[I]);
+    }
+    S.FdSize = FdTableSize(P);
+    for (const auto Group : P.SupplementaryGroups) S.Groups.push_back(GidOut(Group));
+    S.NStgid = PidChain(P.PID, P);
+    S.NSpid = PidChain(Tid, P);
+    S.NSpgid = PidChain(P.Group, P);
+    S.NSsid = PidChain(P.Session, P);
+    const auto Memory = ProcMemoryTotals(P);
+    S.VmPeak = P.Vmas.PeakSize() >> 10;
+    S.VmSize = Memory.Size >> 10;
+    S.VmHwm = ProcRssPeak(P, Memory.Rss) >> 10;
+    S.VmRss = Memory.Rss >> 10;
+    S.RssAnon = Memory.RssAnon >> 10;
+    S.RssFile = Memory.RssFile >> 10;
+    S.RssShmem = Memory.RssShmem >> 10;
+    S.VmData = Memory.Data >> 10;
+    S.VmStk = Memory.Stack >> 10;
+    S.VmExe = Memory.Executable >> 10;
+    S.VmLib = Memory.Library >> 10;
+    uint32_t Live {};
+    for (const auto& Each : Threads) Live += Each.Core && !Each.Exited && Each.PID == P.PID;
+    S.Threads = Live ? Live : 1;
+    S.SigLimit = P.Limits[ResourceSigpending][0];
+    S.SigQueued = P.SharedPending.QueuedCount();
+    for (const auto& Each : Threads) {
+      if (Each.Core && !Each.Exited && Each.PID == P.PID) S.SigQueued += Each.Pending.QueuedCount();
+    }
+    if (Leader) {
+      S.SigPnd = Leader->Pending.Set();
+      S.SigBlk = Leader->SignalMask;
+    }
+    S.ShdPnd = P.SharedPending.Set();
+    for (size_t Signal = 0; Signal < P.SignalActions.size(); ++Signal) {
+      const auto Handler = P.SignalActions[Signal][0];
+      if (Handler == SigIgnore) S.SigIgn |= uint64_t {1} << Signal;
+      else if (Handler != SigDefault) S.SigCgt |= uint64_t {1} << Signal;
+    }
+    S.CapInh = P.Creds.CapInheritable;
+    S.CapPrm = P.Creds.CapPermitted;
+    S.CapEff = P.Creds.CapEffective;
+    S.CapBnd = P.Creds.CapBounding;
+    S.CapAmb = P.Creds.CapAmbient;
+    S.NoNewPrivs = P.NoNewPrivileges ? 1 : 0;
+    S.Seccomp = Leader ? Leader->Seccomp.Mode : 0;
+    S.SeccompFilters = Leader ? static_cast<uint32_t>(Switch2Guest::Seccomp::FilterCount(Leader->Seccomp.Filters)) : 0;
+    S.Cpus = HostCpuCount();
+    S.CpusAllowed = (Leader ? Leader->CpuMask : ~uint64_t {0}) & Switch2Guest::Sched::AllCpus(S.Cpus);
+    if (Leader) {
+      S.VoluntarySwitches = Leader->VoluntarySwitches;
+      S.InvoluntarySwitches = Leader->InvoluntarySwitches;
+    }
+    return Pf::FormatStatus(S);
   }
 
   // ---- /proc/<pid>/stat and the files ps and top read (the formats are in GuestProcfs.h) ----
@@ -8912,9 +9666,55 @@ private:
     return S;
   }
 
+  static uint64_t VmaResidentPages(const GuestProcess& P, const Switch2Guest::Vma& Range) {
+    uint64_t Pages = 0;
+    for (auto Address = Range.Start; Address < Range.End; Address += GuestPageSize) {
+      Pages += P.Memory.PageCommitted(Address);
+    }
+    return Pages;
+  }
+
+  static Switch2Guest::VmaTotals ProcMemoryTotals(const GuestProcess& P) {
+    return Switch2Guest::CountVmas(P.Vmas, [&](const auto& Range) { return VmaResidentPages(P, Range); });
+  }
+
   std::string ProcStatm(const GuestProcess& P) const {
     namespace Pf = Switch2Guest::Procfs;
-    return Pf::FormatStatm(P.Memory.MappedBytes() / Pf::PageBytes, P.Memory.ResidentBytes() / Pf::PageBytes, 0, 0, 0);
+    const auto Memory = ProcMemoryTotals(P);
+    return Pf::FormatStatm(Memory.Size / Pf::PageBytes, Memory.Rss / Pf::PageBytes,
+                         (Memory.RssFile + Memory.RssShmem) / Pf::PageBytes, Memory.Text / Pf::PageBytes,
+                         (Memory.Data + Memory.Stack) / Pf::PageBytes);
+  }
+
+  static bool IsProcMapFile(std::string_view File) {
+    return File == "maps" || File == "smaps" || File == "smaps_rollup";
+  }
+
+  std::string ProcMaps(const GuestProcess& P, std::string_view File) const {
+    using Switch2Guest::Vma;
+    if (P.Exited) return {};
+    auto Snapshot = P.Vmas;
+    Snapshot.UpdateNames([&](Vma& Range) {
+      if (Range.Deleted || Range.BackingPath.empty()) return;
+      if (Range.Backing == Vma::Shmem) {
+        const auto Entry = ShmFiles.find(BaseName(Range.BackingPath));
+        Range.Deleted = Entry == ShmFiles.end() || Entry->second.Inode != Range.Inode;
+      } else {
+        Range.Deleted = IsUnlinked(Range.Inode) || KnownInode(Range.BackingPath) != Range.Inode;
+      }
+    });
+    if (File == "maps") return Switch2Guest::FormatMaps(Snapshot);
+    const auto Resident = [&](const Vma& Range) { return VmaResidentPages(P, Range); };
+    const auto Sharing = [&](const Vma& Range) {
+      return 1 + std::count_if(Processes.begin(), Processes.end(), [&](const auto& Item) {
+        const auto& Other = Item.second;
+        return &Other != &P && !Other.Exited && std::ranges::any_of(Other.Vmas.Ranges(), [&](const Vma& Entry) {
+          return Range.SameSharedObject(Entry);
+        });
+      });
+    };
+    if (File == "smaps") return Switch2Guest::FormatSmaps(Snapshot, Resident, Sharing);
+    return Switch2Guest::FormatSmapsRollup(Snapshot, Resident, Sharing);
   }
 
   std::string ProcCmdline(const GuestProcess& P) const {
@@ -8946,18 +9746,212 @@ private:
     return std::nullopt;
   }
 
+  // wchan (get_wchan / proc_pid_wchan): the kernel function a blocked task sleeps in. A blocked system call is told by its
+  // number (the rerun keeps it in RAX), else the kind of wait names it. Sleeping outside a wait is "0".
+  static const char* WchanOfKind(WaitKind Kind) {
+    switch (Kind) {
+    case WaitKind::Futex: return "futex_wait_queue_me";
+    case WaitKind::IO: return "pipe_read";
+    case WaitKind::Terminal: return "n_tty_read";
+    case WaitKind::Lock: return "locks_lock_inode_wait";
+    case WaitKind::Sleep: return "hrtimer_nanosleep";
+    case WaitKind::Signal: return "do_sigtimedwait";
+    case WaitKind::Vfork: return "wait_for_vfork_done";
+    case WaitKind::Net: return "sk_wait_data";
+    case WaitKind::None: break;
+    }
+    return "0";
+  }
+  static const char* WchanOfSyscall(uint64_t Number, WaitKind Kind) {
+    switch (Number) {
+    case 61: case 247: return "do_wait";                       // wait4, waitid
+    case 7: case 271: return "do_sys_poll";                    // poll, ppoll
+    case 23: case 270: return "core_sys_select";               // select, pselect6
+    case 232: case 281: case 441: return "ep_poll";            // epoll_wait, epoll_pwait, epoll_pwait2
+    case 35: case 230: return "hrtimer_nanosleep";             // nanosleep, clock_nanosleep
+    case 202: return "futex_wait_queue_me";                    // futex
+    case 43: case 288: return "inet_csk_accept";               // accept, accept4
+    default: return WchanOfKind(Kind);
+    }
+  }
+  const char* WchanName(const GuestThread& Thread) const {
+    if (Thread.Waiting == WaitKind::None) return "0";
+    return WchanOfSyscall(Thread.Core->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX], Thread.Waiting);
+  }
+
+  // /proc/<pid>/syscall (proc_pid_syscall): the blocked call's number, six arguments, stack pointer and counter. A task that
+  // is not blocked reads "running" (including the reader itself: the runtime cannot show its own open and read).
+  std::string ProcSyscall(const GuestThread* Thread) const {
+    namespace Pf = Switch2Guest::Procfs;
+    const uint64_t None[6] {};
+    if (!Thread || Thread->Waiting == WaitKind::None || !Thread->Core) return Pf::FormatSyscall(true, 0, None, 0, 0);
+    const auto& State = Thread->Core->CurrentFrame->State;
+    namespace X = FEXCore::X86State;
+    const uint64_t Args[6] = {State.gregs[X::REG_RDI], State.gregs[X::REG_RSI], State.gregs[X::REG_RDX],
+                              State.gregs[X::REG_R10], State.gregs[X::REG_R8],  State.gregs[X::REG_R9]};
+    return Pf::FormatSyscall(false, static_cast<int64_t>(State.gregs[X::REG_RAX]), Args, State.gregs[X::REG_RSP], State.rip);
+  }
+
+  // /proc/<pid>/sched (proc_sched_show_task): the thread's CPU time, switch counts, weight, policy and priority.
+  std::string ProcSched(const GuestProcess& P, const GuestThread* Thread) const {
+    namespace Pf = Switch2Guest::Procfs;
+    const auto* Subject = Thread ? Thread : LeaderOf(P);
+    Pf::Sched S;
+    S.Comm = P.Name[0] ? P.Name.data() : "fex-guest";
+    S.Pid = ViewOut(Thread ? Thread->TID : P.PID);
+    uint32_t Live {};
+    for (const auto& Each : Threads) Live += Each.Core && !Each.Exited && Each.PID == P.PID;
+    S.Threads = Live ? Live : 1;
+    const uint64_t Now = MonotonicNs();
+    S.ExecStartNs = Subject && Subject->EnteredNs ? Subject->EnteredNs : Now;
+    if (Subject) {
+      S.SumExecRuntimeNs = ThreadCpuNs(*Subject);
+      S.VoluntarySwitches = Subject->VoluntarySwitches;
+      S.InvoluntarySwitches = Subject->InvoluntarySwitches;
+      S.Switches = S.VoluntarySwitches + S.InvoluntarySwitches;
+      S.Policy = Subject->Sched.Policy;
+      if (Switch2Guest::Sched::IsRt(S.Policy)) S.Prio = 99 - static_cast<int32_t>(Subject->Sched.Priority);
+      else if (S.Policy == Switch2Guest::Sched::Deadline) S.Prio = -1;
+    }
+    if (!Subject || Switch2Guest::Sched::IsFair(S.Policy)) {
+      S.Prio = 120 + P.Nice;
+      S.Weight = Pf::NiceWeight(P.Nice);
+    }
+    S.ClockDeltaNs = static_cast<int64_t>(MonotonicNs() - Now); // two reads of the same clock, as proc_sched_show_task does
+    return Pf::FormatSched(S);
+  }
+
+  // /proc/<pid>/fdinfo/<fd> (seq_show): the generic lines, then what each file kind adds. Null when the fd is not open.
+  std::optional<std::string> ProcFdinfo(const GuestProcess& P, std::string_view Digits) const {
+    namespace Pf = Switch2Guest::Procfs;
+    if (Digits.empty() || (Digits.size() > 1 && Digits.front() == '0')) return std::nullopt;
+    uint64_t Number {};
+    const auto [Next, Error] = std::from_chars(Digits.data(), Digits.data() + Digits.size(), Number);
+    if (Error != std::errc {} || Next != Digits.data() + Digits.size()) return std::nullopt;
+    const auto* Table = DescriptorsOf(P);
+    if (!Table || Number >= Table->Files.size() || !Table->Files[Number]) return std::nullopt;
+    const auto& File = *Table->Files[Number];
+    const auto Device = [](const OpenFile& Of) { return Of.Mount && Of.Mount->Sb ? static_cast<uint32_t>(Of.Mount->Sb->Dev) : 0u; };
+    uint32_t Flags = File.StatusFlags;
+    if (Table->Flags[Number]) Flags |= 02000000; // O_CLOEXEC
+    if (!File.Path.empty() && !File.Pipe && !File.Socket && !File.Inet) Flags |= 0100000; // O_LARGEFILE, forced on 64 bits
+    std::string Out = Pf::FormatFdinfo(File.Offset, Flags, File.Mount ? static_cast<int>(File.Mount->Id) : 0, File.Inode);
+    if (File.Event) Out += Pf::FormatEventfdInfo(File.Event->Value);
+    if (File.SignalFdMask) Out += Pf::FormatSignalfdInfo(*File.SignalFdMask);
+    if (File.Epoll) {
+      File.Epoll->Set.ForEachItem([&](const EpollKey& Key, uint32_t Events, uint64_t Data) {
+        const auto Target = Key.File.lock();
+        Out += Pf::FormatEpollInfo(Key.Fd, Events, Data, Target ? Target->Offset : 0, Target ? Target->Inode : 0, Target ? Device(*Target) : 0);
+      });
+    }
+    if (File.Inotify) {
+      for (const auto& Watch : File.Inotify->Instance.WatchList()) {
+        Out += Pf::FormatInotifyInfo(Watch.Wd, Watch.Inode, Device(File), Watch.Mask);
+      }
+    }
+    if (File.TimerFd) {
+      const auto& State = *File.TimerFd;
+      const auto Value = const_cast<GuestSyscalls*>(this)->TimerValue(State.Clock, State.Timer);
+      Out += Pf::FormatTimerfdInfo(State.ClockId, State.Ticks, State.SetFlags, static_cast<uint64_t>(Value.Value.Seconds),
+                                   static_cast<uint64_t>(Value.Value.Nanoseconds), static_cast<uint64_t>(Value.Interval.Seconds),
+                                   static_cast<uint64_t>(Value.Interval.Nanoseconds));
+    }
+    return Out;
+  }
+
+  // Names of the per-process files that need ptrace_may_access (read) to open.
+  static bool ProcFileNeedsPtrace(std::string_view Name) {
+    return IsProcMapFile(Name) || Name == "mem" || Name == "mountinfo" || Name == "mounts" || Name == "mountstats" ||
+           Name == "environ" || Name == "auxv" || Name == "io" || Name == "wchan" || Name == "syscall" || Name == "stack" ||
+           Name == "personality" || Name.starts_with("fdinfo/");
+  }
+
+  // The mode Linux gives a per-process file (proc_pid_* tables in fs/proc/base.c).
+  static uint32_t ProcessFileMode(std::string_view Name) {
+    if (Name == "mem") return 0100600;
+    if (Name == "comm" || Name == "sched" || Name == "timerslack_ns" || Name == "oom_adj" || Name == "oom_score_adj" ||
+        Name == "loginuid") return 0100644;
+    if (Name == "environ" || Name == "auxv" || Name == "io" || Name == "syscall" || Name == "stack" || Name == "personality" ||
+        Name == "mountstats" || Name.starts_with("fdinfo/")) return 0100400;
+    if (Name == "attr/current") return 0100666;
+    return 0100444;
+  }
+
+  // The files of /proc/<pid> and /proc/<pid>/task/<tid> that are generated text. Names a process lists besides these are
+  // directories and links.
+  static constexpr std::array<std::string_view, 27> ProcessFileNames {
+      "status", "stat", "statm", "cmdline", "comm", "cgroup", "environ", "auxv", "limits", "io", "wchan", "sched", "timerslack_ns",
+      "oom_score", "oom_adj", "oom_score_adj", "loginuid", "sessionid", "personality", "stack", "syscall", "mountstats",
+      "children", "mem", "maps", "smaps", "smaps_rollup"};
+
+  // The child pids a /proc/<pid>/children file lists (this process's children, numbered as the caller sees them).
+  std::string ProcChildren(const GuestProcess& P, const GuestThread* Thread) const {
+    std::vector<uint32_t> Pids;
+    // The runtime does not record which thread created a child: the leader lists them all, other threads none.
+    if (!Thread || Thread->TID == P.PID) {
+      for (const auto& [PID, Child] : Processes) {
+        if (Child.ParentPID == P.PID && !Child.Reaped && PID != P.PID) {
+          if (const auto Number = ViewOut(PID)) Pids.push_back(Number);
+        }
+      }
+    }
+    return Switch2Guest::Procfs::FormatChildren(Pids);
+  }
+
+  // /proc/<pid>/mountstats (mountstats_open): one line per mount of the process's namespace, as it sees them from its root.
+  std::string ProcMountstats(const GuestProcess& P) const {
+    std::string Out;
+    const auto Root = RootOf(P);
+    for (const auto& Mount : TableOf(*P.Ns.Mnt).List) {
+      if (const auto Where = Switch2Guest::Mounts::WhereMounted(Root, Mount)) {
+        Out += Switch2Guest::Procfs::FormatMountstat(Mount->Sb->Source, *Where, Mount->Sb->Type);
+      }
+    }
+    return Out;
+  }
+
+  // maps, smaps and smaps_rollup are generated at open (ProcMaps), after the ptrace check; they are empty here.
   std::string ProcessFile(const GuestProcess& P, const GuestThread* Thread, std::string_view File) const {
     namespace Pf = Switch2Guest::Procfs;
+    const auto* Subject = Thread ? Thread : LeaderOf(P);
     if (File == "stat") return Pf::FormatStat(ProcStat(P, Thread));
     if (File == "statm") return ProcStatm(P);
-    if (File == "status") return ProcStatus(P);
+    if (File == "status") return ProcStatus(P, Thread);
     if (File == "cmdline") return ProcCmdline(P);
     if (File == "comm") return std::string(P.Name[0] ? P.Name.data() : "fex-guest") + "\n";
     if (File == "cgroup") return "0::/\n";
+    if (File == "environ") return std::string {}; // environ_read copies the original stack range at read time.
+    if (File == "auxv") return P.Exited ? std::string {} : std::string(reinterpret_cast<const char*>(P.Auxv.data()), P.Auxv.size() * 8);
+    if (File == "limits") {
+      uint64_t Limits[16][2];
+      for (size_t I = 0; I < 16; ++I) {
+        Limits[I][0] = P.Limits[I][0];
+        Limits[I][1] = P.Limits[I][1];
+      }
+      return Pf::FormatLimits(Limits);
+    }
+    if (File == "io") return Pf::FormatIo(Thread ? Thread->Io : P.Io);
+    if (File == "wchan") return Subject && !P.Exited ? WchanName(*Subject) : "0";
+    if (File == "syscall") return ProcSyscall(P.Exited ? nullptr : Subject);
+    if (File == "sched") return ProcSched(P, Thread);
+    if (File == "timerslack_ns") return std::to_string(Subject ? Subject->TimerSlack : DefaultTimerSlack) + "\n";
+    if (File == "oom_score") return "0\n"; // the console has no OOM killer
+    if (File == "oom_score_adj") return std::to_string(P.OomScoreAdj) + "\n";
+    if (File == "oom_adj") return std::to_string(Pf::OomAdjOf(P.OomScoreAdj)) + "\n";
+    if (File == "loginuid" || File == "sessionid") return "4294967295\n"; // AUDIT_UID_UNSET: no audit subsystem
+    if (File == "personality") return Pf::FormatPersonality(P.Personality);
+    if (File == "mountstats") return ProcMountstats(P);
+    if (File == "children") return ProcChildren(P, Thread);
     return {};
   }
   static bool IsProcessFile(std::string_view File) {
-    return File == "stat" || File == "statm" || File == "status" || File == "cmdline" || File == "comm" || File == "cgroup";
+    return std::find(ProcessFileNames.begin(), ProcessFileNames.end(), File) != ProcessFileNames.end();
+  }
+  // /proc/<pid>/mem and /proc/<pid>/task/<tid>/mem (read and written through ProcMemTransfer, not generated).
+  bool IsProcMemFile(const GuestProcess& P, std::string_view Rest) const {
+    if (Rest == "mem") return true;
+    const auto Thread = TaskOf(P, Rest);
+    return Thread && Thread->File == "mem";
   }
 
   mutable Switch2Guest::Procfs::LoadAverage LoadAvg;
@@ -9015,63 +10009,328 @@ private:
         const uint64_t Used = Arena->Committed() >> 10;
         M.FreeKb = M.TotalKb > Used ? M.TotalKb - Used : 0;
         M.AvailableKb = M.FreeKb;
+        M.CommitLimitKb = M.TotalKb;
+        M.CommittedKb = M.TotalKb - M.FreeKb;
       }
+      // AnonPages: the anonymous pages of every live process (RssAnon, VMA accounting). Shmem and Cached: the pages of the
+      // memory-backed tmpfs files (/dev/shm); tmpfs mounts on the SD card hold no page cache here.
+      for (const auto& [PID, Process] : Processes) {
+        if (!Process.Exited && !Process.Reaped) M.AnonPagesKb += ProcMemoryTotals(Process).RssAnon >> 10;
+      }
+      for (const auto& [FileName, Shm] : ShmFiles) M.ShmemKb += Shm.Memory->AllocatedBytes() >> 10;
+      M.CachedKb = M.ShmemKb;
       return Pf::FormatMeminfo(M);
     }
-    if (Name == "/proc/cpuinfo") return Pf::FormatCpuinfo(Cpus);
+    if (Name == "/proc/cpuinfo") return Pf::FormatCpuinfo(ProcCpuid(), Cpus);
+    // /proc/version: the release and version uname reports.
+    if (Name == "/proc/version") return Pf::FormatVersion(UnameRelease, UnameVersion);
+    // The types mount(2) creates (KnownFsType), the devtmpfs of /dev, and the FAT card.
+    if (Name == "/proc/filesystems") {
+      return Pf::FormatFilesystems({{"sysfs", true}, {"tmpfs", true}, {"proc", true}, {"cgroup2", true}, {"devtmpfs", true},
+                                    {"devpts", true}, {"ramfs", true}, {"mqueue", true}, {"vfat", false}});
+    }
+    if (Name == "/proc/swaps") return Pf::FormatSwaps();
+    if (Name == "/proc/partitions") return Pf::FormatPartitions();
+    if (Name == "/proc/cmdline") return std::string {"BOOT_IMAGE=/fex root=sdmc\n"}; // fixed: the console has no boot command line
+    // The character majors of the /dev nodes the runtime serves (CharDevAt).
+    if (Name == "/proc/devices") return Pf::FormatDevices({{1, "mem"}, {4, "tty"}, {5, "/dev/tty"}, {5, "/dev/console"}, {5, "/dev/ptmx"}, {13, "input"}, {136, "pts"}});
+    if (Name == "/proc/misc") return std::string {};
     return std::nullopt;
   }
 
-  // The part of /proc/sys the runtime serves (Milestone 6 does the rest): the ids the kernel shows for an unmapped
+  // The CPUID leaves FEX shows the guest, for /proc/cpuinfo (the caller's context; zeros when it has none).
+  Switch2Guest::Procfs::CpuidInfo ProcCpuid() const {
+    Switch2Guest::Procfs::CpuidInfo Info;
+    if (!Task->Context) return Info;
+    const auto Read = [&](uint32_t Function, uint32_t Subleaf) {
+      const auto R = Task->Context->RunCPUIDFunction(Function, Subleaf);
+      return Switch2Guest::Procfs::CpuidRegs {R.eax, R.ebx, R.ecx, R.edx};
+    };
+    Info.Leaf0 = Read(0, 0);
+    Info.Leaf1 = Read(1, 0);
+    Info.Leaf7 = Read(7, 0);
+    Info.LeafD1 = Read(0xd, 1);
+    Info.Ext1 = Read(0x80000001, 0);
+    Info.Ext8 = Read(0x80000008, 0);
+    for (uint32_t I = 0; I < 3; ++I) Info.Brand[I] = Read(0x80000002 + I, 0);
+    return Info;
+  }
+
+  // The part of /proc/sys the runtime serves (Milestone 5 does the rest): the ids the kernel shows for an unmapped
   // id, the namespace limits, and the identity strings of the caller's UTS namespace.
   static constexpr std::string_view UnameRelease = "5.15.0";
+  // uname -v and the tail of /proc/version; a fixed build date, as the console has no build of its own.
+  static constexpr std::string_view UnameVersion = "#1 SMP PREEMPT FEX Switch 2 Mon Jan 5 00:00:00 UTC 2026";
   static constexpr uint32_t MaxNamespaces = 126662; // the default of the checking host (it follows the memory size)
   static constexpr std::array<std::string_view, 7> NamespaceLimits {"cgroup", "ipc", "mnt", "net", "pid", "user", "uts"};
 
-  static bool ProcSysDirectory(std::string_view Name) { return Name == "/proc/sys" || Name == "/proc/sys/kernel" || Name == "/proc/sys/user"; }
+  // ---- The kernel file tree: sysfs and /proc/sys (GuestKernelTree.h) ----------
+  // Every directory, file and symlink of /sys and /proc/sys is a node of one table. A file node reads with Read (the
+  // contents at open time) and, when writable, writes with Write (the whole text of one write call; the open already
+  // checked the mode). A link node names its target. Adding a file means adding one node in BuildKernelFiles.
+  struct KernelFileData {
+    std::function<std::string()> Read;
+    std::function<int64_t(std::string_view)> Write;
+    std::string Target;
+    uint64_t Inode {}; // Overrides the path hash for a database file whose name can be reused after unplug.
+    std::optional<FileTimestamp> Created {};
+  };
+  using KernelTreeType = Switch2Guest::KernelTree::Tree<KernelFileData>;
+  mutable std::unique_ptr<KernelTreeType> KernelFilesTree;
 
-  static std::vector<DirectoryEntry> ProcSysEntries(std::string_view Directory) {
-    std::vector<DirectoryEntry> Entries;
-    if (Directory == "/proc/sys") {
-      Entries.insert(Entries.end(), {{"kernel", true}, {"user", true}});
-    } else if (Directory == "/proc/sys/kernel") {
-      for (const auto* Name : {"domainname", "hostname", "osrelease", "ostype", "overflowgid", "overflowuid", "pid_max"}) Entries.push_back({Name, false});
+  KernelTreeType& KernelFiles() const {
+    if (!KernelFilesTree) {
+      KernelFilesTree = std::make_unique<KernelTreeType>();
+      const_cast<GuestSyscalls*>(this)->BuildKernelFiles(*KernelFilesTree);
+    }
+    return *KernelFilesTree;
+  }
+
+  void BuildKernelFiles(KernelTreeType& T) {
+    using Switch2Guest::KernelTree::Kind;
+    const auto File = [&](std::string_view Path, uint32_t Mode, std::function<std::string()> Read) {
+      T.Add(Path, Kind::File, Mode, KernelFileData {std::move(Read), {}, {}});
+    };
+    const auto Text = [](std::string Value) { return [Value = std::move(Value)] { return Value; }; };
+
+    // /proc/sys (proc_sys_root): the ids the kernel shows for an unmapped id, the namespace limits, and the identity
+    // strings of the caller's UTS namespace. Writes are not supported yet (EACCES at open; Milestone 5 Task 4).
+    T.AddRoot("/proc/sys");
+    File("/proc/sys/kernel/overflowuid", 0644, Text(std::to_string(Switch2Guest::Ns::OverflowId) + "\n"));
+    File("/proc/sys/kernel/overflowgid", 0644, Text(std::to_string(Switch2Guest::Ns::OverflowId) + "\n"));
+    // hostname and domainname write the caller's UTS namespace, as sethostname and setdomainname do (CAP_SYS_ADMIN over the
+    // namespace's owner); the text ends at a newline and at most 64 bytes are kept.
+    const auto UtsFile = [&](const char* Path, bool Domain) {
+      T.Add(Path, Kind::File, 0644,
+            KernelFileData {[this, Domain] { return (Domain ? Task->Ns.Uts->Domainname : Task->Ns.Uts->Hostname) + "\n"; },
+                            [this, Domain](std::string_view Text) -> int64_t {
+                              auto& Uts = *Task->Ns.Uts;
+                              const auto Name = Switch2Guest::Sysctl::ParseString(Text, Switch2Guest::Ns::NameMax);
+                              if (const auto Error = Switch2Guest::Ns::CheckSetName(SubjectOf(*Task), Uts, Name.size()); Error < 0) return Error;
+                              (Domain ? Uts.Domainname : Uts.Hostname) = Name;
+                              return static_cast<int64_t>(Text.size());
+                            },
+                            {}});
+    };
+    UtsFile("/proc/sys/kernel/hostname", false);
+    UtsFile("/proc/sys/kernel/domainname", true);
+    File("/proc/sys/kernel/ostype", 0444, Text("Linux\n"));
+    File("/proc/sys/kernel/osrelease", 0444, Text(std::string(UnameRelease) + "\n"));
+    // Values the runtime never changes: the table of GuestSysctl.h. They have no writer (the runtime has nothing to
+    // change), so a write fails at open with EACCES.
+    for (const auto& Fixed : Switch2Guest::Sysctl::FixedFiles) File(Fixed.Path, Fixed.Mode, Text(std::string(Fixed.Text)));
+    namespace Sy = Switch2Guest::Sysctl;
+    const auto Number = [&](std::string_view Path, uint32_t Mode, uint64_t Value) { File(Path, Mode, Text(Sy::FormatUnsigned(Value))); };
+    // Limits that come from the runtime's own tables.
+    Number("/proc/sys/kernel/threads-max", 0644, GuestThreadCount);
+    Number("/proc/sys/kernel/cap_last_cap", 0444, Switch2Guest::CapLast);
+    Number("/proc/sys/kernel/shmmax", 0644, Switch2Guest::ShmMax);
+    Number("/proc/sys/kernel/shmall", 0644, Switch2Guest::ShmMax);
+    Number("/proc/sys/kernel/shmmni", 0644, Switch2Guest::ShmMni);
+    Number("/proc/sys/kernel/msgmax", 0644, static_cast<uint64_t>(Switch2Guest::MsgMax));
+    Number("/proc/sys/kernel/msgmnb", 0644, static_cast<uint64_t>(Switch2Guest::MsgMnb));
+    Number("/proc/sys/kernel/msgmni", 0644, static_cast<uint64_t>(Switch2Guest::MsgMni));
+    File("/proc/sys/kernel/sem", 0644, Text(Sy::FormatVector({Switch2Guest::SemMsl, Switch2Guest::SemMns, Switch2Guest::SemOpm, Switch2Guest::SemMni})));
+    Number("/proc/sys/fs/pipe-max-size", 0644, PipeMaxSize);
+    Number("/proc/sys/fs/inotify/max_user_watches", 0644, Switch2Guest::InotifyMaxWatches);
+    Number("/proc/sys/fs/inotify/max_user_instances", 0644, Switch2Guest::InotifyMaxInstances);
+    Number("/proc/sys/fs/inotify/max_queued_events", 0644, Switch2Guest::InotifyMaxQueued);
+    Number("/proc/sys/fs/mqueue/msg_max", 0644, static_cast<uint64_t>(Switch2Guest::MqDefaultMaxMsg));
+    Number("/proc/sys/fs/mqueue/msgsize_max", 0644, static_cast<uint64_t>(Switch2Guest::MqDefaultMsgSize));
+    Number("/proc/sys/fs/mqueue/queues_max", 0644, Switch2Guest::MqQueuesMax);
+    // random: boot_id is one UUID per launcher start (the console RNG), uuid a new one per read.
+    static const std::string BootId = [] {
+      uint8_t Bytes[16];
+      randomGet(Bytes, sizeof(Bytes));
+      return Switch2Guest::Sysctl::FormatUuid(Bytes);
+    }();
+    File("/proc/sys/kernel/random/boot_id", 0444, Text(BootId));
+    File("/proc/sys/kernel/random/uuid", 0444, [] {
+      uint8_t Bytes[16];
+      randomGet(Bytes, sizeof(Bytes));
+      return Switch2Guest::Sysctl::FormatUuid(Bytes);
+    });
+    for (const auto Name : NamespaceLimits) {
+      File("/proc/sys/user/max_" + std::string(Name) + "_namespaces", 0644, Text(std::to_string(MaxNamespaces) + "\n"));
+    }
+
+    BuildSysfs(T);
+    T.AddRoot("/dev/input/by-id", 0755);
+    T.AddRoot("/dev/input/by-path", 0755);
+    T.AddRoot(UdevDirectory, 0755);
+    T.Add("/run/udev/data", Kind::Directory, 0755);
+  }
+
+  // The battery and charger as plain values. The console-only part: psm is initialized once, on the first use of the
+  // tree. When it cannot be initialized there are no power supplies (no fake battery).
+  static bool PowerSupplyAvailable() {
+    static const bool Available = R_SUCCEEDED(psmInitialize());
+    return Available;
+  }
+  static std::optional<Switch2Guest::Sysfs::PowerState> ReadPowerState() {
+    if (!PowerSupplyAvailable()) return std::nullopt;
+    Switch2Guest::Sysfs::PowerState State;
+    u32 Percent {};
+    PsmChargerType Charger {};
+    if (R_FAILED(psmGetBatteryChargePercentage(&Percent)) || R_FAILED(psmGetChargerType(&Charger))) return std::nullopt;
+    State.Percent = Percent;
+    State.ChargerPresent = Charger != PsmChargerType_Unconnected;
+    State.ChargerEnough = Charger == PsmChargerType_EnoughPower;
+    return State;
+  }
+
+  // /sys (sysfs, Milestone 5 Task 5). Formatting is in GuestSysfs.h.
+  void BuildSysfs(KernelTreeType& T) {
+    using Switch2Guest::KernelTree::Kind;
+    namespace Sf = Switch2Guest::Sysfs;
+    const auto File = [&](std::string_view Path, uint32_t Mode, std::function<std::string()> Read) {
+      T.Add(Path, Kind::File, Mode, KernelFileData {std::move(Read), {}, {}});
+    };
+    const auto Text = [](std::string Value) { return [Value = std::move(Value)] { return Value; }; };
+    T.AddRoot("/sys");
+    for (const auto* Name : {"block", "bus", "class", "dev", "devices", "firmware", "fs", "kernel", "module", "power"}) {
+      T.Add(std::string("/sys/") + Name, Kind::Directory, 0555);
+    }
+    for (const auto* Name : {"/sys/class/input", "/sys/class/power_supply", "/sys/devices/system/cpu",
+                             "/sys/devices/system/node/node0", "/sys/devices/virtual/input", "/sys/dev/char"}) {
+      T.Add(Name, Kind::Directory, 0555);
+    }
+
+    // The CPUs (cpu_subsys): online, possible and present are 0..N-1; cpu0 has no online file, as on x86.
+    const uint32_t Cpus = HostCpuCount();
+    for (const auto* Name : {"online", "possible", "present"}) File(std::string("/sys/devices/system/cpu/") + Name, 0444, Text(Sf::CpuMaskAll(Cpus)));
+    File("/sys/devices/system/cpu/kernel_max", 0444, Text(Sf::KernelMax(Cpus)));
+    File("/sys/devices/system/cpu/offline", 0444, Text("\n"));
+    for (uint32_t Cpu = 0; Cpu < Cpus; ++Cpu) {
+      const std::string Base = "/sys/devices/system/cpu/cpu" + std::to_string(Cpu);
+      if (Cpu) File(Base + "/online", 0644, Text("1\n"));
+      for (const auto& Topology : Sf::TopologyFiles(Cpu, Cpus)) File(Base + "/topology/" + std::string(Topology.Name), 0444, Text(Topology.Text));
+      File(Base + "/cpufreq/scaling_cur_freq", 0444, Text(Switch2Guest::Sysctl::FormatUnsigned(Sf::CpuFreqKHz)));
+      File(Base + "/cpufreq/cpuinfo_max_freq", 0444, Text(Switch2Guest::Sysctl::FormatUnsigned(Sf::CpuFreqKHz)));
+      File(Base + "/cpufreq/cpuinfo_min_freq", 0444, Text(Switch2Guest::Sysctl::FormatUnsigned(Sf::CpuFreqMinKHz)));
+      File(Base + "/cpufreq/scaling_governor", 0644, Text(std::string(Sf::CpuGovernor)));
+    }
+    // The one memory node (node_subsys). Linux shows node0 even on a machine without NUMA; libnuma and lscpu read
+    // its cpumap and take a missing one as a broken /sys. The node and cpu links are register_cpu_under_node's.
+    std::vector<uint32_t> AllCpus;
+    for (uint32_t Cpu = 0; Cpu < Cpus; ++Cpu) AllCpus.push_back(Cpu);
+    File("/sys/devices/system/node/node0/cpulist", 0444, Text(Sf::CpuMaskAll(Cpus)));
+    File("/sys/devices/system/node/node0/cpumap", 0444, Text(Sf::FormatCpuMask(AllCpus, Cpus)));
+    File("/sys/devices/system/node/node0/distance", 0444, Text("10\n"));
+    for (const auto* Name : {"possible", "has_cpu", "has_memory", "has_normal_memory"}) {
+      File(std::string("/sys/devices/system/node/") + Name, 0444, Text("0\n"));
+    }
+    for (uint32_t Cpu = 0; Cpu < Cpus; ++Cpu) {
+      const std::string Name = "cpu" + std::to_string(Cpu);
+      T.Add("/sys/devices/system/node/node0/" + Name, Kind::Link, 0777, {{}, {}, "../../cpu/" + Name});
+      T.Add("/sys/devices/system/cpu/" + Name + "/node0", Kind::Link, 0777, {{}, {}, "../../node/node0"});
+    }
+
+    // Power supplies from psm; absent when psm cannot be initialized.
+    if (PowerSupplyAvailable()) {
+      const auto Power = [](auto Format) { return [Format] { const auto State = ReadPowerState(); return State ? Format(*State) : std::string {}; }; };
+      const std::string Bat = "/sys/devices/platform/switch2-battery/power_supply/BAT0";
+      const std::string Adp = "/sys/devices/platform/switch2-charger/power_supply/ADP1";
+      File(Bat + "/type", 0444, Text("Battery\n"));
+      File(Bat + "/present", 0444, Text("1\n"));
+      File(Bat + "/technology", 0444, Text("Li-ion\n"));
+      File(Bat + "/status", 0444, Power([](const Sf::PowerState& S) { return std::string(Sf::BatteryStatus(S)) + "\n"; }));
+      File(Bat + "/capacity", 0444, Power([](const Sf::PowerState& S) { return Sf::BatteryCapacity(S); }));
+      File(Bat + "/capacity_level", 0444, Power([](const Sf::PowerState& S) { return std::string(Sf::CapacityLevel(S.Percent)) + "\n"; }));
+      File(Bat + "/uevent", 0444, Power([](const Sf::PowerState& S) { return Sf::BatteryUevent(S); }));
+      File(Adp + "/type", 0444, Text("Mains\n"));
+      File(Adp + "/online", 0444, Power([](const Sf::PowerState& S) { return Sf::AdapterOnline(S); }));
+      File(Adp + "/uevent", 0444, Power([](const Sf::PowerState& S) { return Sf::AdapterUevent(S); }));
+      T.Add("/sys/class/power_supply/BAT0", Kind::Link, 0777, {{}, {}, "../../devices/platform/switch2-battery/power_supply/BAT0"});
+      T.Add("/sys/class/power_supply/ADP1", Kind::Link, 0777, {{}, {}, "../../devices/platform/switch2-charger/power_supply/ADP1"});
+    }
+
+    // The cgroup2 root (read-only mount: a write fails with EROFS before the files are looked at). Every process is in
+    // the root group, numbered in the reader's PID namespace.
+    T.Add("/sys/fs/cgroup", Kind::Directory, 0555);
+    File("/sys/fs/cgroup/cgroup.procs", 0644, [this] {
+      std::vector<uint32_t> Ids;
+      for (const auto& [PID, Process] : Processes) {
+        if (const auto Number = ViewOut(PID); Number && !Process.Reaped) Ids.push_back(Number);
+      }
+      return Sf::FormatIdList(std::move(Ids));
+    });
+    File("/sys/fs/cgroup/cgroup.threads", 0644, [this] {
+      std::vector<uint32_t> Ids;
+      for (const auto& Thread : Threads) {
+        if (!Thread.Core || Thread.Exited) continue;
+        if (const auto Number = ViewOut(Thread.TID)) Ids.push_back(Number);
+      }
+      return Sf::FormatIdList(std::move(Ids));
+    });
+    File("/sys/fs/cgroup/cgroup.stat", 0444, Text(std::string(Sf::CgroupStat)));
+
+    // Fixed files: DMI, transparent hugepage, cgroup limits, node list.
+    for (const auto& Fixed : Sf::FixedFiles) File(Fixed.Path, Fixed.Mode, Text(std::string(Fixed.Text)));
+    T.Add("/sys/class/dmi/id", Kind::Link, 0777, {{}, {}, "../../devices/virtual/dmi/id"});
+  }
+
+  // The tree node at a guest path, or null (also null for paths the tree does not cover).
+  const KernelTreeType::Node* KernelNode(std::string_view GuestPath) const { return KernelFiles().Find(GuestPath); }
+  bool KernelDirectory(std::string_view GuestPath) const { return KernelFiles().IsDirectory(GuestPath); }
+
+  uint64_t KernelInode(std::string_view GuestPath) const {
+    const auto* Node = KernelNode(GuestPath);
+    return Node && Node->Data.Inode ? Node->Data.Inode : VirtualInode(GuestPath);
+  }
+
+  static void SetInputMetadata(LinuxStat& Info, FileTimestamp Created) {
+    Info.Uid = Info.Gid = 0;
+    Info.Times = {Created, Created, Created};
+  }
+
+  void ApplyInputMetadata(LinuxStat& Info, std::string_view Path) const {
+    if (!PathContains(InputDirectory, Path) && !PathContains(UdevDirectory, Path) &&
+        !PathContains("/sys/class/input", Path) && !PathContains("/sys/devices/virtual/input", Path) &&
+        !Path.starts_with("/sys/dev/char/13:")) return;
+    if (const auto* Node = KernelNode(Path); Node && Node->Data.Created) {
+      SetInputMetadata(Info, *Node->Data.Created);
     } else {
-      for (const auto Name : NamespaceLimits) Entries.push_back({"max_" + std::string(Name) + "_namespaces", false});
+      SetInputMetadata(Info, KernelFilesCreated);
     }
-    return Entries;
   }
 
-  std::optional<std::string> ProcSysFile(std::string_view Name) const {
-    if (!Name.starts_with("/proc/sys/")) return std::nullopt;
-    Name.remove_prefix(10);
-    if (Name.starts_with("kernel/")) {
-      Name.remove_prefix(7);
-      if (Name == "overflowuid" || Name == "overflowgid") return std::to_string(Switch2Guest::Ns::OverflowId) + "\n";
-      if (Name == "hostname") return Task->Ns.Uts->Hostname + "\n";
-      if (Name == "domainname") return Task->Ns.Uts->Domainname + "\n";
-      if (Name == "ostype") return std::string {"Linux\n"};
-      if (Name == "pid_max") return std::string {"32768\n"};  // the default of a machine with up to 32 CPUs
-      if (Name == "osrelease") return std::string(UnameRelease) + "\n";
-    } else if (Name.starts_with("user/max_") && Name.ends_with("_namespaces")) {
-      const auto Which = Name.substr(9, Name.size() - 9 - 11);
-      if (std::find(NamespaceLimits.begin(), NamespaceLimits.end(), Which) != NamespaceLimits.end()) return std::to_string(MaxNamespaces) + "\n";
+  // Mode of a generated file: the tree's own mode for its nodes, 0600 for mem, 0444 for the rest of /proc.
+  uint32_t ProcFileMode(std::string_view Name) const {
+    if (const auto* Node = KernelNode(Name)) return 0100000 | Node->Mode;
+    if (const auto Entry = ProcOf(Name)) {
+      if (IsProcMemFile(*Entry->Process, Entry->Rest)) return 0100600;
+      if (const auto Thread = TaskOf(*Entry->Process, Entry->Rest)) return ProcessFileMode(Thread->File);
+      return ProcessFileMode(Entry->Rest);
     }
-    return std::nullopt;
+    return 0100444;
   }
 
-  // Mode of a proc file: the /proc/sys tunables are 0644, the rest 0444.
-  static uint32_t ProcFileMode(std::string_view Name) { return Name.starts_with("/proc/sys/") ? 0100644 : 0100444; }
+  // Use the device number of the filesystem that owns the generated entry.
+  static uint64_t KernelFileDevice(std::string_view GuestPath) {
+    if (GuestPath.starts_with("/dev/")) return DevDevice;
+    if (PathContains(UdevDirectory, GuestPath)) return UdevDevice;
+    if (GuestPath == "/sys/fs/cgroup" || GuestPath.starts_with("/sys/fs/cgroup/")) return CgroupDevice;
+    return GuestPath == "/sys" || GuestPath.starts_with("/sys/") ? SysDevice : ProcDevice;
+  }
 
   std::optional<std::string> ProcFile(std::string_view Name) const {
-    if (const auto Sys = ProcSysFile(Name)) return Sys;
-    if (Name == "/proc/version") return std::string {"Linux version 5.0.0 (FEX Switch 2 guest)\n"};
+    // Files of the kernel tree (/sys, /proc/sys); a path the tree covers without a file node does not exist.
+    if (KernelFiles().Covers(Name)) {
+      const auto* Node = KernelNode(Name);
+      if (!Node || Node->Type != Switch2Guest::KernelTree::Kind::File) return std::nullopt;
+      return Node->Data.Read ? Node->Data.Read() : std::string {};
+    }
     if (const auto System = ProcSystemFile(Name)) return System;
     const auto Entry = ProcOf(Name);
     if (!Entry) return std::nullopt;
     const auto& Rest = Entry->Rest;
     if (IsProcessFile(Rest)) return ProcessFile(*Entry->Process, nullptr, Rest);
-    if (const auto Task = TaskOf(*Entry->Process, Rest); Task && IsProcessFile(Task->File)) return ProcessFile(*Entry->Process, Task->Thread, Task->File);
+    if (const auto Thread = TaskOf(*Entry->Process, Rest); Thread && IsProcessFile(Thread->File)) {
+      return ProcessFile(*Entry->Process, Thread->Thread, Thread->File);
+    }
+    if (Rest.starts_with("fdinfo/")) return ProcFdinfo(*Entry->Process, Rest.substr(7));
+    if (Rest == "attr/current") return std::string {}; // reading fails with EINVAL (no security module), see OpenFile::ReadError
     if (Rest == "uid_map" || Rest == "gid_map") return Switch2Guest::Ns::RenderIdMap(*Entry->Process->Ns.User, Rest == "gid_map", *Task->Ns.User);
     if (Rest == "setgroups") return Switch2Guest::Ns::RenderSetgroups(*Entry->Process->Ns.User);
     if (Rest == "mountinfo") return Switch2Guest::Mounts::MountInfo(TableOf(*Entry->Process->Ns.Mnt), RootOf(*Entry->Process));
@@ -9085,9 +10344,15 @@ private:
     const auto Entry = ProcOf(GuestPath);
     if (!Entry) return std::nullopt;
     int Kind;
-    if (Entry->Rest == "uid_map") Kind = 0;
-    else if (Entry->Rest == "gid_map") Kind = 1;
-    else if (Entry->Rest == "setgroups") Kind = 2;
+    const auto Thread = TaskOf(*Entry->Process, Entry->Rest);
+    const auto Name = Thread ? Thread->File : Entry->Rest;
+    if (Name == "uid_map" && !Thread) Kind = 0;
+    else if (Name == "gid_map" && !Thread) Kind = 1;
+    else if (Name == "setgroups" && !Thread) Kind = 2;
+    else if (Name == "comm") Kind = OpenFile::ProcWriter::Comm;
+    else if (Name == "oom_score_adj") Kind = OpenFile::ProcWriter::OomScoreAdj;
+    else if (Name == "oom_adj") Kind = OpenFile::ProcWriter::OomAdj;
+    else if (Name == "timerslack_ns") Kind = OpenFile::ProcWriter::TimerSlack;
     else return std::nullopt;
     const auto& Target = *Entry->Process;
     const auto& Mine = Task->Creds;
@@ -9097,7 +10362,67 @@ private:
     if (!Owner && !Override) return std::nullopt;
     const auto Subject = SubjectOf(*Task);
     if (Kind == 2 && !Switch2Guest::Ns::OpenSetgroupsForWrite(*Target.Ns.User, Subject)) return std::nullopt;
-    return OpenFile::ProcWriter {Target.PID, Kind, Subject};
+    return OpenFile::ProcWriter {Target.PID, Kind, Subject, Thread ? Thread->Thread->TID : 0};
+  }
+
+  // A write to comm (comm_write), oom_score_adj and oom_adj (oom_adjust_write) or timerslack_ns (timerslack_ns_write). The
+  // open already checked the mode against the file's owner; these checks are the ones the write itself makes.
+  int64_t WriteProcAttribute(OpenFile& File, uint64_t Address, uint64_t Count) {
+    namespace Sy = Switch2Guest::Sysctl;
+    namespace Pf = Switch2Guest::Procfs;
+    auto* Target = FindProcess(File.ProcWrite->PID);
+    if (!Target || Target->Exited) return -3;
+    const int Kind = File.ProcWrite->Kind;
+    // comm_write keeps at most 15 bytes and reports only those; the others take a short number.
+    const uint64_t Limit = Kind == OpenFile::ProcWriter::Comm ? Target->Name.size() - 1 : 63;
+    Count = std::min<uint64_t>(Count, Limit);
+    if (Count && AccessiblePrefix(Address, Count, PF_R) < Count) return Fault;
+    const std::string_view Text {reinterpret_cast<const char*>(Address), static_cast<size_t>(Count)};
+    if (Kind == OpenFile::ProcWriter::Comm) {
+      // Only the process itself (its thread group) renames; another writer is accepted and ignored, as Linux does.
+      if (Target->PID != Task->PID) return static_cast<int64_t>(Count);
+      const auto Name = Sy::ParseString(Text, Target->Name.size() - 1);
+      Target->Name = {};
+      std::memcpy(Target->Name.data(), Name.data(), Name.size());
+      return static_cast<int64_t>(Count);
+    }
+    if (Kind == OpenFile::ProcWriter::TimerSlack) {
+      const auto Value = Sy::ParseInt(Text, 0, INT64_MAX);
+      if (!Value) return Invalid;
+      GuestThread* Subject {};
+      for (auto& Each : Threads) {
+        if (!Each.Core || Each.Exited || Each.PID != Target->PID) continue;
+        if (File.ProcWrite->Tid ? Each.TID == File.ProcWrite->Tid : (!Subject || Each.TID == Target->PID)) Subject = &Each;
+      }
+      if (!Subject) return -3;
+      // timerslack_ns_write: changing another task needs CAP_SYS_NICE.
+      if (Subject != Current && !Task->Creds.Capable(Switch2Guest::CapSysNice)) return -1;
+      Subject->TimerSlack = *Value ? static_cast<uint64_t>(*Value) : DefaultTimerSlack;
+      return static_cast<int64_t>(Count);
+    }
+    const bool Legacy = Kind == OpenFile::ProcWriter::OomAdj;
+    const auto Value = Legacy ? Sy::ParseInt(Text, Pf::OomDisable, Pf::OomAdjustMax)
+                              : Sy::ParseInt(Text, Pf::OomScoreAdjMin, Pf::OomScoreAdjMax);
+    if (!Value) return Invalid;
+    const int32_t Score = Legacy ? Pf::OomScoreOf(static_cast<int32_t>(*Value)) : static_cast<int32_t>(*Value);
+    const bool Privileged = Task->Creds.Capable(CapSysResource);
+    // __set_oom_adj: below the lowest value an administrator set needs CAP_SYS_RESOURCE; an administrator's write moves that floor.
+    if (Score < Target->OomScoreAdjMin && !Privileged) return -13;
+    Target->OomScoreAdj = Score;
+    if (!Legacy && Privileged) Target->OomScoreAdjMin = Score;
+    return static_cast<int64_t>(Count);
+  }
+
+  // A write to a file of the kernel tree: the node's writer gets the text of this one call (proc_sys_write and
+  // sysfs kernfs_fop_write_iter hand a single buffer of at most a page to the handler).
+  int64_t WriteKernelFile(OpenFile& File, uint64_t Address, uint64_t Count) {
+    Count = std::min<uint64_t>(Count, GuestPageSize);
+    if (Count && AccessiblePrefix(Address, Count, PF_R) < Count) return Fault;
+    const auto* Node = KernelNode(File.Path);
+    if (!Node || !Node->Data.Write) return -5; // the file went away (a removed device): EIO
+    const auto Result = Node->Data.Write(std::string_view {reinterpret_cast<const char*>(Address), static_cast<size_t>(Count)});
+    if (Result > 0) File.Offset += Result;
+    return Result;
   }
 
   // proc_uid_map_write, proc_gid_map_write and proc_setgroups_write.
@@ -9144,10 +10469,11 @@ private:
   // /proc/<pid> and /proc/<pid>/ns exist for a process the caller sees.
   bool IsProcDirectory(std::string_view GuestPath) const {
     if (GuestPath == "/proc/self") return false; // the symlink itself
-    if (ProcSysDirectory(GuestPath)) return true;
+    if (KernelDirectory(GuestPath)) return true;
     const auto Entry = ProcOf(GuestPath);
     if (!Entry) return false;
-    if (Entry->Rest.empty() || Entry->Rest == "ns" || Entry->Rest == "fd" || Entry->Rest == "task") return true;
+    if (Entry->Rest.empty() || Entry->Rest == "ns" || Entry->Rest == "fd" || Entry->Rest == "fdinfo" || Entry->Rest == "attr" ||
+        Entry->Rest == "task") return true;
     const auto Task = TaskOf(*Entry->Process, Entry->Rest);
     return Task && Task->File.empty();
   }
@@ -9161,8 +10487,19 @@ private:
   }
 
   std::string ProcLink(std::string_view Path) const {
-    if (VirtualMount(Path) != 1) return {};
+    const auto Mount = VirtualMount(Path);
+    if (!Mount) return {};
     Path.remove_prefix(RootPath.size());
+    if (const auto* Node = KernelNode(Path); Node && Node->Type == Switch2Guest::KernelTree::Kind::Link)
+      return Node->Data.Target;
+    if (Mount == 2) {
+      // The links of /dev (the udev rules of a real system): descriptors through the caller's /proc.
+      if (Path == "/dev/fd") return "/proc/self/fd";
+      if (Path == "/dev/stdin") return "/proc/self/fd/0";
+      if (Path == "/dev/stdout") return "/proc/self/fd/1";
+      if (Path == "/dev/stderr") return "/proc/self/fd/2";
+      return {};
+    }
     if (Path == "/proc/self") {
       const auto Number = ViewOut(Task->PID);
       return Number ? std::to_string(Number) : std::string {};
@@ -9261,7 +10598,8 @@ private:
       if (const auto Target = ProcLink(Path); !Target.empty()) {
         fsFsClose(&SdCard);
         Info = MakeStat(0120777, Target.size(), VirtualInode(std::string_view(Path).substr(RootPath.size())));
-        Info.Device = ProcDevice;
+        Info.Device = KernelFileDevice(std::string_view(Path).substr(RootPath.size()));
+        ApplyInputMetadata(Info, std::string_view(Path).substr(RootPath.size()));
         if (Resolved) *Resolved = std::move(Path);
         return 0;
       }
@@ -9274,11 +10612,22 @@ private:
           return 0;
         }
       }
+      if (const auto Queue = MqueueEntryName(Path)) {
+        if (const auto Entry = Ipc().MqueueNames.find(*Queue); Entry != Ipc().MqueueNames.end()) {
+          fsFsClose(&SdCard);
+          if (Name.ends_with('/')) return -20;
+          Info = MakeStat(ModeForInode(Entry->second->Inode, 0100000 | Entry->second->Mode), 80, Entry->second->Inode); // FILENT_SIZE
+          Info.Device = DevDevice;
+          if (Resolved) *Resolved = std::move(Path);
+          return 0;
+        }
+      }
       if (const auto VirtualDir = VirtualDirectory(Path); !VirtualDir.empty()) {
         fsFsClose(&SdCard);
-        Info = MakeStat(VirtualDir == PtsDirectory ? 0040755 : 0040555, 0, VirtualInode(VirtualDir));
-        Info.Device = VirtualDir.starts_with("/dev") ? DevDevice : ProcDevice;
+        Info = MakeStat(VirtualDirectoryMode(VirtualDir), 0, VirtualInode(VirtualDir));
+        Info.Device = VirtualDir.starts_with("/dev") ? DevDevice : KernelFileDevice(VirtualDir);
         if (VirtualDir == ShmDirectory) ShmDirectoryStat(Info);
+        ApplyInputMetadata(Info, VirtualDir);
         Info.Links = 2;
         if (Resolved) *Resolved = std::move(Path);
         return 0;
@@ -9301,17 +10650,37 @@ private:
           if (Resolved) *Resolved = std::move(Path);
           return 0;
         }
+        if (GuestPath.starts_with(EventPrefix)) {
+          const auto* Node = EvdevAt(GuestPath);
+          fsFsClose(&SdCard);
+          if (!Node) return -2;
+          if (Name.ends_with('/')) return -20;
+          Info = EvdevStat(**Node);
+          if (Resolved) *Resolved = std::move(Path);
+          return 0;
+        }
         const auto Kind = CharDevAt(GuestPath);
         const bool Device = Kind != CharDev::None;
         const auto Contents = ProcFile(GuestPath);
         if (Device || Contents) {
           fsFsClose(&SdCard);
           if (Name.ends_with('/')) return -20;
-          Info = MakeStat(Device ? 0020666 : ProcFileMode(GuestPath), Device ? 0 : Contents->size(), VirtualInode(GuestPath));
-          Info.Device = Device ? DevDevice : ProcDevice;
+          // Linux reports zero for sysfs/proc attributes and the actual size for udev's regular database files.
+          const bool UdevRecord = PathContains(UdevDirectory, GuestPath);
+          Info = MakeStat(Device ? CharDevMode(Kind) : ProcFileMode(GuestPath),
+                          UdevRecord && Contents ? Contents->size() : 0,
+                          UdevRecord ? KernelInode(GuestPath) : VirtualInode(GuestPath));
+          Info.Device = Device ? DevDevice : KernelFileDevice(GuestPath);
+          ApplyInputMetadata(Info, GuestPath);
           if (Device) Info.Rdev = CharDevRdev(Kind);
+          if (Kind == CharDev::Console) Info.Gid = 5; // root:tty
           if (Kind == CharDev::Pts) PtyNodeStat(Info, PtsSlaveAt(GuestPath).get(), false);
+          if (Resolved) *Resolved = std::move(Path);
           return 0;
+        }
+        if (PathContains(UdevDirectory, GuestPath)) {
+          fsFsClose(&SdCard);
+          return -2;
         }
       }
       const auto* Target = SymlinkAt(Path);
@@ -9628,7 +10997,9 @@ private:
       const auto VirtualDir = VirtualDirectory(File->Path);
       if (VirtualDir == "/proc") {
         Entries.insert(Entries.end(), {{"self", false, true}, {"version", false}, {"mounts", false, true}, {"sys", true}, {"stat", false},
-                                       {"uptime", false}, {"loadavg", false}, {"meminfo", false}, {"cpuinfo", false}});
+                                       {"uptime", false}, {"loadavg", false}, {"meminfo", false}, {"cpuinfo", false},
+                                       {"filesystems", false}, {"swaps", false}, {"partitions", false}, {"cmdline", false},
+                                       {"devices", false}, {"misc", false}});
         // The processes the caller sees, numbered in its PID namespace.
         const ProcViewScope View {*this, File->Mount};
         for (const auto& [PID, Process] : Processes) {
@@ -9639,6 +11010,18 @@ private:
           const std::string_view View = Name;
           if (View != "time" && View != "time_for_children") Entries.push_back({Name, false, true});
         }
+      } else if (VirtualDir.ends_with("/attr") && VirtualDir.starts_with("/proc/")) {
+        Entries.push_back({"current", false});
+      } else if (VirtualDir.ends_with("/fdinfo") && VirtualDir.starts_with("/proc/")) {
+        // One file per open descriptor, as fd/ lists the links.
+        const ProcViewScope View {*this, File->Mount};
+        if (const auto Entry = ProcOf(VirtualDir)) {
+          if (const auto* Table = DescriptorsOf(*Entry->Process)) {
+            for (size_t Index = 0; Index < Table->Files.size(); ++Index) {
+              if (Table->Files[Index]) Entries.push_back({std::to_string(Index), false});
+            }
+          }
+        }
       } else if (VirtualDir.ends_with("/fd") && VirtualDir.starts_with("/proc/")) {
         const ProcViewScope View {*this, File->Mount};
         if (const auto Entry = ProcOf(VirtualDir)) {
@@ -9648,9 +11031,13 @@ private:
             }
           }
         }
-      } else if (ProcSysDirectory(VirtualDir)) {
-        Entries = ProcSysEntries(VirtualDir);
-        Entries.insert(Entries.begin(), {{".", true}, {"..", true}});
+      } else if (KernelDirectory(VirtualDir)) {
+        using Switch2Guest::KernelTree::Kind;
+        for (const auto& [Name, Type] : KernelFiles().Children(VirtualDir)) {
+          const auto Inode = PathContains(UdevDirectory, VirtualDir)
+                               ? KernelInode(std::string(VirtualDir) + '/' + Name) : 0;
+          Entries.push_back({Name, Type == Kind::Directory, Type == Kind::Link, 0, Inode});
+        }
       } else if (VirtualDir.starts_with("/proc/") && VirtualDir.find("/task") != std::string::npos) {
         // /proc/<pid>/task lists the threads; /proc/<pid>/task/<tid> holds the per-thread files.
         const ProcViewScope View {*this, File->Mount};
@@ -9660,17 +11047,28 @@ private:
           if (Rest == "task") {
             for (const auto* Thread : TasksOf(*Entry->Process)) Entries.push_back({std::to_string(ViewOut(Thread->TID)), true});
           } else {
-            for (const auto* Name : {"stat", "statm", "status", "cmdline", "comm", "cgroup"}) Entries.push_back({Name, false});
+            for (const auto Name : ProcessFileNames) Entries.push_back({std::string(Name), false});
+            Entries.insert(Entries.end(), {{"fd", true}, {"fdinfo", true}, {"ns", true}, {"attr", true}});
           }
         }
       } else if (VirtualDir.starts_with("/proc/")) {
-        Entries.insert(Entries.end(), {{"status", false}, {"stat", false}, {"statm", false}, {"cmdline", false}, {"comm", false}, {"cgroup", false},
-                                       {"task", true}, {"mountinfo", false}, {"mounts", false}, {"uid_map", false}, {"gid_map", false},
-                                       {"setgroups", false}, {"ns", true}, {"fd", true}, {"root", false, true}, {"cwd", false, true}, {"exe", false, true}});
+        for (const auto Name : ProcessFileNames) Entries.push_back({std::string(Name), false});
+        Entries.insert(Entries.end(), {{"task", true}, {"mountinfo", false}, {"mounts", false}, {"uid_map", false}, {"gid_map", false},
+                                       {"setgroups", false}, {"ns", true}, {"fd", true}, {"fdinfo", true}, {"attr", true}, {"root", false, true},
+                                       {"cwd", false, true}, {"exe", false, true}});
       } else if (VirtualDir == "/dev") {
-        for (const auto* Name : {"null", "zero", "full", "random", "urandom", "tty", "ptmx"}) Entries.push_back({Name, false, false, 2});
+        for (const auto* Name : {"null", "zero", "full", "random", "urandom", "tty", "ptmx", "console", "kmsg"}) Entries.push_back({Name, false, false, 2});
+        for (const auto* Name : {"fd", "stdin", "stdout", "stderr"}) Entries.push_back({Name, false, true});
+        Entries.push_back({"mqueue", true});
         Entries.push_back({"shm", true});
         Entries.push_back({"pts", true});
+        Entries.push_back({"input", true});
+      } else if (VirtualDir == InputDirectory) {
+        Entries.insert(Entries.end(), {{"by-id", true}, {"by-path", true}});
+        for (const auto& [Number, Node] : EvdevDevices)
+          Entries.push_back({"event" + std::to_string(Number), false, false, 2, Node->Inode});
+      } else if (VirtualDir == MqueueDirectory) {
+        for (const auto& [Name, State] : Ipc().MqueueNames) Entries.push_back({Name, false});
       } else if (VirtualDir == ShmDirectory) {
         for (const auto& [Name, Node] : ShmFiles) Entries.push_back({Name, false});
       } else if (VirtualDir == PtsDirectory) {
@@ -9683,14 +11081,18 @@ private:
         return SdFileError(Status);
       }
       if (File->Path == RootPath) {
-        std::erase_if(Entries, [](const DirectoryEntry& Entry) { return Entry.Name == "dev" || Entry.Name == "proc"; });
-        Entries.insert(Entries.end(), {{"dev", true}, {"proc", true}});
+        std::erase_if(Entries, [](const DirectoryEntry& Entry) { return Entry.Name == "dev" || Entry.Name == "proc" || Entry.Name == "sys"; });
+        Entries.insert(Entries.end(), {{"dev", true}, {"proc", true}, {"sys", true}});
       }
       std::erase_if(Entries, [&](const DirectoryEntry& Entry) {
         const auto Child = (File->Path.ends_with('/') ? File->Path : File->Path + "/") + Entry.Name;
         return IsInodeStorePath(Child) || Switch2Guest::Mounts::HidesPath(File->Mount.get(), Child);
       });
       if (VirtualDir.empty()) AppendGuestDirectoryEntries(File->Path, Entries);
+      if (File->Path == RootPath + "/run") {
+        std::erase_if(Entries, [](const DirectoryEntry& Entry) { return Entry.Name == "udev"; });
+        Entries.push_back({"udev", true});
+      }
       *File->Directory = std::move(Entries);
       File->DirectorySnapshot = true;
     }
@@ -9719,7 +11121,8 @@ private:
         Path += Entry.Name;
       }
       const auto ShmEntry = ShmEntryName(Path);
-      const auto Inode = ShmEntry && ShmFiles.contains(*ShmEntry) ? ShmFiles.find(*ShmEntry)->second.Inode :
+      const auto Inode = Entry.Inode ? Entry.Inode :
+                         ShmEntry && ShmFiles.contains(*ShmEntry) ? ShmFiles.find(*ShmEntry)->second.Inode :
                          VirtualMount(Path) ? VirtualInode(std::string_view(Path).substr(RootPath.size())) : SdInode(Path);
       const uint64_t Next = ++File->Offset;
       auto* EntryBytes = Bytes + Used;
@@ -9738,7 +11141,7 @@ private:
   int64_t SeekGuest(uint64_t FD, int64_t Offset, uint64_t Origin) {
     auto* File = GetFile(FD);
     if (!File || File->PathOnly()) return BadFile;
-    if (File->Socket || File->Inet || File->Console != ConsoleStream::None) return -29;
+    if (File->Socket || File->Inet || File->Console != ConsoleStream::None || File->InputClient) return -29;
     if (Origin > 4) return Invalid;
     if (const auto Kind = CharDevAt(File->Path); Kind == CharDev::Null || Kind == CharDev::Zero || Kind == CharDev::Full) {
       File->Offset = 0; // null_lseek: the position is always 0
@@ -9747,6 +11150,9 @@ private:
       return File->Offset; // noop_llseek
     }
     if (File->AnonName) return File->Offset; // noop_llseek
+    // seq_lseek and mem_lseek: generated files seek from the start or the position only.
+    if (Origin >= 2 && !File->RealFile && !File->Memory && !File->Directory && !File->UdevRecord &&
+        (File->ProcMemPid || ProcFile(File->Path))) return Invalid;
     int64_t Base {};
     if (Origin == 1) Base = File->Offset;
     else if (Origin >= 2) {
@@ -9848,13 +11254,22 @@ private:
     Path.remove_prefix(RootPath.size());
     if (PathContains("/proc", Path)) return 1;
     if (PathContains("/dev", Path)) return 2;
+    if (PathContains("/sys", Path)) return 3;
+    if (PathContains(UdevDirectory, Path)) return 4;
     return 0;
+  }
+
+  // devpts is 0755 and the mqueue root is sticky and world writable (mqueue_fill_super), like /dev/shm.
+  uint32_t VirtualDirectoryMode(std::string_view VirtualDir) const {
+    if (const auto* Node = KernelNode(VirtualDir)) return 0040000 | Node->Mode;
+    return VirtualDir == PtsDirectory || VirtualDir == InputDirectory ? 0040755 : VirtualDir == MqueueDirectory ? 0041777 : 0040555;
   }
 
   std::string_view VirtualDirectory(std::string_view Path) const {
     if (!VirtualMount(Path)) return {};
     Path.remove_prefix(RootPath.size());
-    if (Path == "/dev" || Path == "/proc" || Path == ShmDirectory || Path == PtsDirectory) return Path;
+    if (Path == "/dev" || Path == "/proc" || Path == ShmDirectory || Path == PtsDirectory ||
+        Path == MqueueDirectory || Path == InputDirectory) return Path;
     if (IsProcDirectory(Path)) return Path;
     return {};
   }
@@ -9959,6 +11374,9 @@ private:
   // overflow directories and paths only the store can hold never reach the
   // SD card, so a missing overflow entry is ENOENT rather than a Horizon error.
   int64_t EntryType(FsFileSystem& SdCard, const std::string& Path, FsDirEntryType& Type) {
+    // The udev mount hides any database or control socket left behind in the RootFS.
+    if (PathContains(RootPath, Path) && PathContains(UdevDirectory, std::string_view(Path).substr(RootPath.size())))
+      return -2;
     if (IsOverflowDirectory(Path)) {
       Type = FsDirEntryType_Dir;
       return 0;
@@ -10169,7 +11587,8 @@ private:
         // The scope stays open for the directory check below too: "/proc/<pid>" after a /proc/self link is
         // looked up in the walked mount's PID namespace, not the caller's.
         const auto SyntheticTarget = ProcLink(Path);
-        const auto* Target = SyntheticTarget.empty() ? SymlinkAt(Path) : &SyntheticTarget;
+        const auto* Target = !SyntheticTarget.empty() ? &SyntheticTarget :
+                             PathContains(UdevDirectory, GuestPathNow) ? nullptr : SymlinkAt(Path);
         if (SyntheticTarget.empty() && Target && DropStaleSymlink(SdCard, Path)) Target = nullptr;
         if (Target && (Follow || Slash != Name.npos)) {
           if (Depth == 40 || (Resolve & ResolveNoSymlinks)) return -40;
@@ -10254,6 +11673,12 @@ private:
           !IsUnlinked(File.Inode) && PathContains(Old, File.Path)) File.Path = MovedPath(File.Path);
     });
     for (auto& [PID, Process] : Processes) {
+      Process.Vmas.UpdateNames([&](Switch2Guest::Vma& Range) {
+        if (Range.Deleted || !PathContains(Old, Range.BackingPath)) return;
+        if (KnownInode(MovedPath(Range.BackingPath)) != Range.Inode) return;
+        Range.BackingPath = MovedPath(Range.BackingPath);
+        Range.Name = MappingName(Range.BackingPath, Range.Name);
+      });
       if (!Process.Fs->RemovedWorkingDirectory && PathContains(Old, Process.Fs->Folder)) {
         Process.Fs->Folder = MovedPath(Process.Fs->Folder);
         Process.Fs->WorkingDirectory = GuestWorkingPath(Process.Fs->Folder);
@@ -11245,6 +12670,11 @@ private:
         fsFsClose(&SdCard);
         return UnlinkShmFile(*Shm, Name->ends_with('/'));
       }
+      if (const auto Queue = MqueueEntryName(Path)) {
+        fsFsClose(&SdCard);
+        if (Name->ends_with('/')) return -20;
+        return UnlinkMqueueNamed(*Queue);
+      }
     }
     const bool Virtual = !Error && (SymlinkAt(Path) || SpecialNodeAt(Path));
     const bool Managed = !Error && IsManagedFile(Path);
@@ -11534,8 +12964,8 @@ private:
     return 0;
   }
 
+  static constexpr uint64_t PipeMaxSize = 1024 * 1024; // /proc/sys/fs/pipe-max-size
   int64_t PipeCapacity(OpenFile& File, bool Set, uint32_t Argument) {
-    constexpr uint64_t PipeMaximum = 1024 * 1024; // /proc/sys/fs/pipe-max-size
     constexpr uint32_t LinuxPage = 4096;
     if (!File.Pipe) return BadFile;
     if (!Set) return File.Socket->InputCapacity;
@@ -11543,7 +12973,7 @@ private:
     // needs CAP_SYS_RESOURCE (checked after rounding, so 1048577 is EPERM).
     if (Argument > (1u << 31)) return Invalid;
     const uint64_t Capacity = std::bit_ceil<uint64_t>(std::max(LinuxPage, Argument));
-    if (Capacity > PipeMaximum && !Task->Creds.Capable(CapSysResource)) return -1;
+    if (Capacity > PipeMaxSize && !Task->Creds.Capable(CapSysResource)) return -1;
 
     const auto Peer = File.Socket->Peer.lock();
     if (File.Socket->UsedCapacity() > Capacity || (Peer && Peer->UsedCapacity() > Capacity)) return -16;
@@ -11566,7 +12996,7 @@ private:
     if (File->PathOnly() && Command != 0 && Command != 1030) return BadFile;
     if (Command == 4) {
       // O_NONBLOCK | O_APPEND | O_NOATIME, and O_DIRECT on a pipe (packet mode for later writes)
-      const uint32_t MutableFlags = 04000 | 02000 | NoAtimeFlag | (File->Pipe ? DirectFlag : 0);
+      const uint32_t MutableFlags = 04000 | 02000 | 020000 | NoAtimeFlag | (File->Pipe ? DirectFlag : 0);
       if ((Arg & NoAtimeFlag) && !(File->StatusFlags & NoAtimeFlag) && !OwnsInodeOrRoot(File->Inode)) return -1;
       File->StatusFlags = (File->StatusFlags & ~MutableFlags) | (Arg & MutableFlags);
       if (File->Socket && !File->Fifo) File->Socket->Nonblocking = Arg & 04000;
@@ -12404,7 +13834,7 @@ private:
     const auto* File = GetFile(FD);
     if (!File || File->PathOnly()) return BadFile;
     if ((Flags & ~7U) || Offset > INT64_MAX || Length > INT64_MAX - Offset) return Invalid;
-    if (DescriptorFilesystem(*File) == FilesystemType::Proc) return 0;
+    if (const auto Type = DescriptorFilesystem(*File); Type == FilesystemType::Proc || Type == FilesystemType::Sysfs || Type == FilesystemType::Cgroup2) return 0;
     if (!File->RealFile && !File->Memory && !File->Directory) return -29;
     if (!Flags || File->Memory) return 0;
     if (File->Directory) return SyncSdFilesystem();
@@ -12570,19 +14000,27 @@ private:
   }
 
   enum class FilesystemType : int64_t {
-    Sd = 0x4d44, Proc = 0x9fa0, Tmpfs = 0x01021994, Devpts = 0x1cd1,
+    Sd = 0x4d44, Proc = 0x9fa0, Tmpfs = 0x01021994, Devpts = 0x1cd1, Sysfs = 0x62656572, Cgroup2 = 0x63677270,
     Pipe = 0x50495045, Socket = 0x534f434b,
   };
+
+  // The file system of a generated file or directory: cgroup2 below /sys/fs/cgroup, sysfs elsewhere in /sys, proc.
+  static FilesystemType KernelFilesystem(std::string_view GuestPath) {
+    const auto Device = KernelFileDevice(GuestPath);
+    if (Device == UdevDevice || Device == DevDevice) return FilesystemType::Tmpfs;
+    return Device == CgroupDevice ? FilesystemType::Cgroup2 : Device == SysDevice ? FilesystemType::Sysfs : FilesystemType::Proc;
+  }
 
   FilesystemType DescriptorFilesystem(const OpenFile& File) const {
     const ProcViewScope View {*this, File.Mount};
     const auto VirtualDir = VirtualDirectory(File.Path);
     if (VirtualDir == PtsDirectory) return FilesystemType::Devpts;
-    if (!VirtualDir.empty()) return VirtualDir.starts_with("/dev") ? FilesystemType::Tmpfs : FilesystemType::Proc;
+    if (File.UdevRecord) return FilesystemType::Tmpfs;
+    if (!VirtualDir.empty()) return VirtualDir.starts_with("/dev") ? FilesystemType::Tmpfs : KernelFilesystem(VirtualDir);
     if (File.RealFile || File.Directory || File.Fifo) return FilesystemType::Sd;
-    if (File.NsObject || ProcFile(File.Path) || !ProcLink(File.Path).empty()) return FilesystemType::Proc;
+    if (File.NsObject || ProcFile(File.Path) || !ProcLink(File.Path).empty()) return KernelFilesystem(File.Path);
     if (File.Tty && File.Tty->Pty && File.Path.starts_with("/dev/pts/")) return FilesystemType::Devpts;
-    if (File.Memory || CharDevAt(File.Path) != CharDev::None) return FilesystemType::Tmpfs;
+    if (File.Memory || File.InputNode || CharDevAt(File.Path) != CharDev::None) return FilesystemType::Tmpfs;
     if (File.PathOnly()) return FilesystemType::Sd;
     if (File.Pipe) return FilesystemType::Pipe;
     if (File.Socket) return FilesystemType::Socket;
@@ -12597,7 +14035,8 @@ private:
     Info.BlockSize = Info.FragmentSize = GuestPageSize;
     Info.NameLength = 255;
     Info.Flags = 0x20; // ST_VALID
-    if (Type == FilesystemType::Proc) Info.Flags |= 0xe; // NOSUID | NODEV | NOEXEC
+    if (Type == FilesystemType::Proc || Type == FilesystemType::Sysfs || Type == FilesystemType::Cgroup2) Info.Flags |= 0xe; // NOSUID | NODEV | NOEXEC
+    if (Type == FilesystemType::Cgroup2) Info.Flags |= 1; // ST_RDONLY: the cgroup2 root is mounted read-only
     return CopyOut(Output, Info);
   }
 
@@ -12607,8 +14046,14 @@ private:
     LinuxStat Info {};
     const auto Error = PathStat(CurrentDirectory, *Name, Info);
     if (Error) return Error;
-    if (StatMount && StatMount->Sb->Dev >= 40 && StatMount->Sb->Type != "proc") return StatMountedFilesystem(*StatMount, Output);
+    if (StatMount && StatMount->Sb->Dev >= 40 && StatMount->Sb->Type != "proc" && StatMount->Sb->Type != "sysfs" &&
+        StatMount->Sb->Type != "cgroup2") {
+      return StatMountedFilesystem(*StatMount, Output);
+    }
     if (Info.Device == ProcDevice) return StatFilesystem(FilesystemType::Proc, Output);
+    if (Info.Device == SysDevice) return StatFilesystem(FilesystemType::Sysfs, Output);
+    if (Info.Device == CgroupDevice) return StatFilesystem(FilesystemType::Cgroup2, Output);
+    if (Info.Device == UdevDevice && StatMount) return StatMountedFilesystem(*StatMount, Output);
     if (Info.Device == DevDevice || Info.Device == ShmDevice) return StatFilesystem(FilesystemType::Tmpfs, Output);
     return StatSdFilesystem(Output, StatMount.get());
   }
@@ -12634,6 +14079,7 @@ private:
   int64_t StatFilesystemDescriptor(uint64_t FD, uint64_t Output) {
     const auto* File = GetFile(FD);
     if (!File) return BadFile;
+    if (File->Mount && File->Mount->Sb->Dev == UdevDevice) return StatMountedFilesystem(*File->Mount, Output);
     if (File->Mount && File->Mount->Sb->Dev >= 40 && File->Mount->Sb->Type != "proc") return StatMountedFilesystem(*File->Mount, Output);
     if (File->Mount && DescriptorFilesystem(*File) == FilesystemType::Sd) return StatSdFilesystem(Output, File->Mount.get());
     return StatFilesystem(DescriptorFilesystem(*File), Output);
@@ -13852,6 +15298,13 @@ private:
     if (Error < 0 && Error != -115) return Error;
     Socket.PeerAddress = Target.Ip;
     Socket.PeerPort = Target.Port;
+    // A nonblocking TCP connect on Linux always reports EINPROGRESS: tcp_v4_connect only sends the SYN, and the
+    // SYN-ACK (even over loopback) is processed after the call returns. The console's stack can complete a loopback
+    // connect at once; that outcome is then reported as Linux reports a finished one (poll, SO_ERROR, connect again).
+    if (Error == 0 && Stream && Socket.Nonblocking) {
+      Socket.Connecting = true;
+      return -115;
+    }
     if (Error == 0) {
       Socket.Connected = true;
       NoteInetLocalName(Socket, Socket.GuestAddress != 0);
@@ -14758,6 +16211,7 @@ private:
   }
 
   int64_t PollGuest(uint64_t Address, uint64_t Count, std::optional<uint64_t> Duration) {
+    PumpEvdev();
     struct PollFD { int32_t FD; int16_t Events, Revents; };
     if (Count > Task->Limits[ResourceNofile][0]) return Invalid; // poll: nfds above RLIMIT_NOFILE
     if (Count > Descriptors().Files.size()) return -12;
@@ -14793,6 +16247,7 @@ private:
     uint32_t Mask {};
     if (File.Socket) Mask = static_cast<uint16_t>(StreamPoll(File, static_cast<int16_t>(Requested & 0x2007)));
     else if (File.Inet) Mask = static_cast<uint16_t>(InetReadiness(*File.Inet, Requested & 0x2007));
+    else if (File.InputClient) return File.InputClient->PollMask();
     else if (File.AnonName || File.PidfdTarget || File.Mqueue) return DescriptorEvents(File);
     else if (File.Console == ConsoleStream::Input && !Interactive) return 0;
     else Mask = DescriptorEvents(File);
@@ -14821,6 +16276,7 @@ private:
       InetReadiness(*File.Inet, 0x2007);
       return Mix(File.Inet->Generation, File.Inet->Connected | File.Inet->Listening << 1 | File.Inet->Connecting << 2);
     }
+    if (File.InputClient) return File.InputClient->Generation();
     if (File.TimerFd) return File.TimerFd->Changes;
     if (File.Mqueue) return File.Mqueue->Changes;
     if (File.Event) return File.Event->Changes;
@@ -14869,6 +16325,7 @@ private:
 
   // core_sys_select: n above the descriptor table is clamped, negative n is EINVAL.
   int64_t SelectCore(uint64_t CountArgument, uint64_t Read, uint64_t Write, uint64_t Except, std::optional<uint64_t> Duration) {
+    PumpEvdev();
     if (static_cast<int32_t>(CountArgument) < 0) return Invalid;
     const size_t Count = std::min<size_t>(static_cast<uint32_t>(CountArgument), Descriptors().Files.size());
     using Mask = std::array<uint64_t, DescriptorCount / 64>;
@@ -15496,8 +16953,9 @@ private:
 
   // uname: the host and domain name of the caller's UTS namespace, zero padded to 64 bytes as Linux copies them.
   int64_t UnameGuest(uint64_t Address) {
-    char Names[6][65] {"Linux", "", "", "#1 FEX Switch 2", "x86_64", ""};
+    char Names[6][65] {"Linux", "", "", "", "x86_64", ""};
     std::memcpy(Names[2], UnameRelease.data(), UnameRelease.size());
+    std::memcpy(Names[3], UnameVersion.data(), UnameVersion.size());
     const auto& Uts = *Task->Ns.Uts;
     std::memcpy(Names[1], Uts.Hostname.data(), std::min<size_t>(Uts.Hostname.size(), 64));
     std::memcpy(Names[5], Uts.Domainname.data(), std::min<size_t>(Uts.Domainname.size(), 64));
@@ -16167,14 +17625,31 @@ private:
       if (const auto Denied = MountDenies(StatMount, false)) return Denied;
     }
 
+    const auto ReadValue = [&](std::string_view Data) -> int64_t {
+      if (!Size || Data.empty()) return Data.size();
+      if (Size < Data.size()) return -34;
+      if (Available(Value, PF_W) < Data.size()) return Fault;
+      std::memcpy(reinterpret_cast<void*>(Value), Data.data(), Data.size());
+      return Data.size();
+    };
+    const bool Evdev = IsEvdevStat(Info);
+    const auto SeatUser = Evdev && (Operation == XattrOp::List || Name == AccessAcl)
+      ? EvdevAclUser(EvdevAt(Info)) : std::nullopt;
+    if (Evdev && Name == AccessAcl) {
+      if (Operation != XattrOp::Get) return -95;
+      if (!SeatUser) return -61;
+      const auto Uid = Task->Ns.User->Uid.FromKernel(*SeatUser).value_or(UINT32_MAX);
+      return ReadValue(EncodeSeatAccessAcl(Uid));
+    }
+
     const auto Metadata = Inodes.find(Info.Inode);
     auto* Attributes = Metadata == Inodes.end() ? nullptr : &Metadata->second.Attributes;
     const bool Admin = Task->Creds.Capable(CapSysAdmin);
     const auto Visible = [&](std::string_view Attribute) {
-      return Admin || !Attribute.starts_with("trusted.");
+      return !(Evdev && Attribute == AccessAcl) && (Admin || !Attribute.starts_with("trusted."));
     };
     if (Operation == XattrOp::List) {
-      size_t Bytes = 0;
+      size_t Bytes = SeatUser ? AccessAcl.size() + 1 : 0;
       if (Attributes) {
         for (const auto& [Name, Data] : *Attributes) {
           if (Visible(Name)) Bytes += Name.size() + 1;
@@ -16185,10 +17660,16 @@ private:
       if (Bytes > MaxValue) return -7;
       if (Available(Value, PF_W) < Bytes) return Fault;
       auto* Output = reinterpret_cast<char*>(Value);
-      for (const auto& [Name, Data] : *Attributes) {
-        if (!Visible(Name)) continue;
-        std::memcpy(Output, Name.c_str(), Name.size() + 1);
-        Output += Name.size() + 1;
+      if (SeatUser) {
+        std::memcpy(Output, AccessAcl.data(), AccessAcl.size() + 1);
+        Output += AccessAcl.size() + 1;
+      }
+      if (Attributes) {
+        for (const auto& [Name, Data] : *Attributes) {
+          if (!Visible(Name)) continue;
+          std::memcpy(Output, Name.c_str(), Name.size() + 1);
+          Output += Name.size() + 1;
+        }
       }
       return Bytes;
     }
@@ -16255,17 +17736,15 @@ private:
       return 0;
     }
     if (!Present) return -61;
-    const auto& Data = Existing->second;
-    if (!Size || Data.empty()) return Data.size();
-    if (Size < Data.size()) return -34;
-    if (Available(Value, PF_W) < Data.size()) return Fault;
-    std::memcpy(reinterpret_cast<void*>(Value), Data.data(), Data.size());
-    return Data.size();
+    return ReadValue(Existing->second);
   }
 
-  int64_t TerminalIoctl(uint64_t FD, uint64_t Command, uint64_t Argument) {
-    const auto* File = GetFile(FD);
+  // The ioctl entry (vfs_ioctl): the requests every file answers, then those of its kind (anonymous inode, socket,
+  // regular file, random device), and last the terminal requests, which answer ENOTTY for everything that is not one.
+  int64_t Ioctl(uint64_t FD, uint64_t Command, uint64_t Argument) {
+    auto* File = GetFile(FD);
     if (!File || File->PathOnly()) return BadFile;
+    if (File->InputClient) PumpEvdev();
     if (Command == 0x5450 || Command == 0x5451) { // FIONCLEX / FIOCLEX
       Descriptors().Flags[FD] = Command == 0x5451;
       return 0;
@@ -16276,6 +17755,7 @@ private:
       std::memcpy(&Enable, reinterpret_cast<const void*>(Argument), sizeof(Enable));
       return FileControl(FD, 4, (File->StatusFlags & ~04000u) | (Enable ? 04000u : 0));
     }
+    if (File->InputClient) return InputIoctl(*File, Command, Argument);
     if (File->AnonName) return AnonymousIoctl(*const_cast<OpenFile*>(File), Command, Argument);
     if (File->Inet && (Command == 0x541b || Command == 0x5411)) { // FIONREAD (SIOCINQ) and SIOCOUTQ
       // Deliberate: the host reports no send queue, so SIOCOUTQ is 0.
@@ -16307,7 +17787,91 @@ private:
       }
       return CopyOut(Argument, static_cast<int32_t>(Queue.Input.size()));
     }
+    if (const auto Result = FileIoctl(FD, *File, Command, Argument)) return *Result;
     return TtyIoctl(FD, *File, Command, Argument);
+  }
+
+  // The generic requests of fs/ioctl.c for regular files, directories and the random devices (GuestIoctl.h decides what
+  // each one answers). Nothing here applies to a terminal: it answers through TtyIoctl. Returns nothing for a request that
+  // is not one of these.
+  std::optional<int64_t> FileIoctl(uint64_t FD, const OpenFile& File, uint64_t Command, uint64_t Argument) {
+    namespace Io = Switch2Guest::Ioctl;
+    const auto Typed = [&](LinuxStat& Info) { return FileStat(FD, Info); };
+    const bool Terminal = TtyHandle(File) != nullptr;
+    switch (Command) {
+    case Io::FIOASYNC: {
+      // fcntl(F_SETFL, O_ASYNC) through ioctl_fioasync: only files with a fasync operation take it (pipes, sockets,
+      // terminals, inotify); SIGIO is not delivered yet (Partial in KernelFilesInventory.md).
+      const bool HasFasync = File.Pipe || File.Socket || File.Inet || File.Inotify || Terminal || File.Console != ConsoleStream::None;
+      if (!HasFasync) return Io::Enotty;
+      int32_t Enable {};
+      if (Available(Argument, PF_R) < sizeof(Enable)) return Fault;
+      std::memcpy(&Enable, reinterpret_cast<const void*>(Argument), sizeof(Enable));
+      return FileControl(FD, 4, (File.StatusFlags & ~020000u) | (Enable ? 020000u : 0));
+    }
+    case Io::FIONREAD: {
+      if (Terminal || File.AnonName || File.Mqueue) return std::nullopt;
+      LinuxStat Info {};
+      if (const auto Error = Typed(Info)) return Error;
+      if (!Io::FionreadApplies(Io::KindOfMode(Info.Mode))) return Io::Enotty;
+      return CopyOut(Argument, Io::FionreadValue(File.Memory ? File.Memory->Size : Info.Size, static_cast<int64_t>(File.Offset)));
+    }
+    case Io::FIOQSIZE: {
+      LinuxStat Info {};
+      if (const auto Error = Typed(Info)) return Error;
+      if (!Io::FioqsizeApplies(Io::KindOfMode(Info.Mode))) return Io::Enotty;
+      return CopyOut(Argument, static_cast<int64_t>(Info.Blocks) * 512); // inode_get_bytes: the bytes the inode occupies
+    }
+    case Io::FIGETBSZ:
+      return CopyOut(Argument, Io::BlockSize);
+    case Io::FS_IOC_GETFLAGS: case Io::FS_IOC_SETFLAGS: {
+      LinuxStat Info {};
+      if (const auto Error = Typed(Info)) return Error;
+      if (!Io::FileFlagsApply(Io::KindOfMode(Info.Mode))) return Io::Enotty;
+      if (Command == Io::FS_IOC_GETFLAGS) return CopyOut(Argument, int64_t {0});
+      int64_t Flags {};
+      if (Available(Argument, PF_R) < sizeof(Flags)) return Fault;
+      std::memcpy(&Flags, reinterpret_cast<const void*>(Argument), sizeof(Flags));
+      const bool OwnerOrCapable = OwnsInodeOrRoot(File.Inode) || Task->Creds.Capable(CapFowner);
+      return Io::SetFlagsResult(static_cast<uint64_t>(Flags), OwnerOrCapable);
+    }
+    case Io::FICLONE: case Io::FICLONERANGE: {
+      // The source is a descriptor: the argument itself (FICLONE) or the first field of file_clone_range.
+      int64_t Source {};
+      if (Command == Io::FICLONE) {
+        Source = static_cast<int32_t>(Argument);
+      } else {
+        if (Available(Argument, PF_R) < sizeof(Source)) return Fault;
+        std::memcpy(&Source, reinterpret_cast<const void*>(Argument), sizeof(Source));
+      }
+      const auto* From = Source >= 0 ? GetFile(static_cast<uint64_t>(Source)) : nullptr;
+      if (!From || From->PathOnly()) return BadFile;
+      LinuxStat Src {}, Dst {};
+      if (const auto Error = FileStat(static_cast<uint64_t>(Source), Src)) return Error;
+      if (const auto Error = Typed(Dst)) return Error;
+      const bool SameMount = File.Mount && From->Mount && File.Mount->Sb == From->Mount->Sb;
+      return Io::CloneResult(SameMount, WriteAccess(File.StatusFlags), Io::KindOfMode(Src.Mode), Io::KindOfMode(Dst.Mode));
+    }
+    default: break;
+    }
+    // The random devices (random_ioctl).
+    if (const auto Kind = CharDevAt(File.Path); Kind == CharDev::Random || Kind == CharDev::Urandom) {
+      if (Command == Io::RNDGETENTCNT) return CopyOut(Argument, Io::RandomEntropyCount);
+      if (Io::IsRandomPrivileged(Command)) {
+        if (const auto Denied = Io::RandomPrivilegedResult(Task->Creds.Capable(CapSysAdmin))) return Denied;
+        if (Command == Io::RNDADDTOENTCNT && Available(Argument, PF_R) < sizeof(int32_t)) return Fault;
+        if (Command == Io::RNDADDENTROPY) {
+          // rand_pool_info {entropy_count, buf_size, buf[]}: the data is accepted and mixed into nothing (the console RNG
+          // has no pool to feed).
+          int32_t Header[2] {};
+          if (Available(Argument, PF_R) < sizeof(Header)) return Fault;
+          std::memcpy(Header, reinterpret_cast<const void*>(Argument), sizeof(Header));
+          if (Header[1] < 0 || Available(Argument + sizeof(Header), PF_R) < static_cast<uint64_t>(Header[1])) return Fault;
+        }
+        return 0;
+      }
+    }
+    return std::nullopt;
   }
 
   // The terminal a descriptor belongs to: its pty (the slave side for either end), or the console for the
@@ -16668,8 +18232,8 @@ private:
         if (const auto Access = TerminalAccess(Tty, SigTtou)) return Access;
       }
       if (!Tty.OutputBlocked()) Used = Tty.WriteSlave(Buffer, Count);
-      // Detailed and Trace logs keep the program output (the test suites' result lines reach the downloaded log).
-      if (Used && Service && Logging != LogLevel::Standard) LogGuestOutput(Buffer, Used);
+      // Log output at the launcher's terminal. A guest pty relay such as sudo writes the same bytes there.
+      if (Used && Service && !Tty.Queue && Logging != LogLevel::Standard) LogGuestOutput(Buffer, Used);
     }
     if (Used) {
       ++IOEpoch;
@@ -17289,6 +18853,25 @@ private:
     if (Offset && (File->Socket || File->Inet || File->Console != ConsoleStream::None || File->AnonName)) return -29;
     if (!WriteAccess(File->StatusFlags)) return BadFile;
     if (!IsGuestUserRange(Address, Count)) return Fault;
+    if (File->InputClient) {
+      using namespace Switch2Guest::Evdev;
+      if (Offset) return -29;
+      PumpEvdev();
+      if (File->InputClient->Revoked) return Enodev;
+      if (Count && Count < InputEventSize) return Invalid;
+      const auto Transfer = std::min<uint64_t>(Count, MaxRWCount) / InputEventSize * InputEventSize;
+      const auto Accessible = Transfer ? AccessiblePrefix(Address, Transfer, PF_R) : 0;
+      if (Transfer && Accessible < InputEventSize) return Fault;
+      return WriteEvdev(*File, reinterpret_cast<void*>(Address), Accessible);
+    }
+    if (File->ProcWrite && File->ProcWrite->Kind == OpenFile::ProcWriter::KernelTree) return WriteKernelFile(*File, Address, Count);
+    if (File->ProcMemPid) {
+      if (Count && AccessiblePrefix(Address, std::min<uint64_t>(Count, GuestPageSize), PF_R) == 0) return Fault;
+      const auto Result = ProcMemTransfer(*File, true, Address, Count, Offset.value_or(File->Offset));
+      if (Result > 0 && !Offset) File->Offset += Result;
+      return Result;
+    }
+    if (File->ProcWrite && File->ProcWrite->Kind >= OpenFile::ProcWriter::Comm) return WriteProcAttribute(*File, Address, Count);
     if (File->ProcWrite) return Offset ? -29 : WriteProcNamespaceFile(*File, Address, Count);
     if (File->AnonName) {
       Count = std::min<uint64_t>(Count, 65536);
@@ -17315,6 +18898,7 @@ private:
 
   int64_t WriteDescriptor(OpenFile& Descriptor, const char* Buffer, uint64_t Count, AppendMode Append = AppendMode::Descriptor, bool Synchronous = false) {
     auto* File = &Descriptor;
+    if (File->InputClient) return WriteEvdev(*File, Buffer, Count);
     if (IsDataDev(File->Path)) return WriteCharDev(CharDevAt(File->Path), Count);
     if (File->Mqueue) return Invalid; // mqueue files have no write operation
     if (File->Tty) return WritePty(*File, Buffer, Count);
@@ -17529,6 +19113,14 @@ private:
         Descriptors().Flags[FD] = (Flags & CloseOnExec) != 0;
         return FD;
       }
+      if (const auto Queue = MqueueEntryName(Path)) {
+        // The mqueue file system: a name is a queue; opening creates it with O_CREAT (mqueue_create) like mq_open.
+        fsFsClose(&SdCard);
+        if ((Flags & DirectoryOnly) || Name->ends_with('/')) return -20;
+        if (Queue->size() > Switch2Guest::MqNameMax) return -36;
+        if (*Queue == "." || *Queue == "..") return -13;
+        return OpenMqueueNamed(*Queue, Flags, CreationMode, MqAttr {0, Switch2Guest::MqDefaultMaxMsg, Switch2Guest::MqDefaultMsgSize, 0}, false);
+      }
       if (const auto Shm = ShmEntryName(Path)) {
         fsFsClose(&SdCard);
         const auto Error = OpenShmFile(*File, *Shm, Flags, CreationMode, Name->ends_with('/'));
@@ -17553,7 +19145,35 @@ private:
           Descriptors().Flags[FD] = (Flags & CloseOnExec) != 0;
           return FD;
         }
-        const auto Contents = ProcFile(GuestPath);
+        auto Contents = ProcFile(GuestPath);
+        if (GuestPath.starts_with(EventPrefix)) {
+          const auto* Node = EvdevAt(GuestPath);
+          fsFsClose(&SdCard);
+          if (!Node) return -2;
+          if ((Flags & DirectoryOnly) || Name->ends_with('/')) return -20;
+          if ((Flags & Create) && (Flags & Exclusive)) return -17;
+          File->InputNode = *Node;
+          if (!PathOnly) {
+            using namespace Switch2Guest;
+            if (File->Mount && (File->Mount->Flags & Mounts::MntNodev)) return -13;
+            const unsigned Access = (ReadAccess(Flags) ? 4 : 0) | (WriteAccess(Flags) ? 2 : 0);
+            if (!EvdevAllows((*Node)->Gid, EvdevAclUser(Node->get()), Access)) return -13;
+            if ((Flags & NoAtimeFlag) && Task->Creds.Uid[3] != 0 &&
+                !HasCapForOwner(CapFowner, false, 0, (*Node)->Gid)) return -1;
+            File->InputClient.emplace((*Node)->Device);
+            File->InputOpenGeneration = InputFeed().ReleasedGeneration();
+            File->InputOpenCount = &EvdevOpenCount;
+            ++EvdevOpenCount;
+            (*Node)->Clients.push_back(&*File->InputClient);
+          }
+          File->Inode = (*Node)->Inode;
+          File->LinkPath = Path;
+          File->Path = GuestPath;
+          Descriptors().Files[FD] = std::move(File);
+          Descriptors().Flags[FD] = (Flags & CloseOnExec) != 0;
+          if (!PathOnly) PumpEvdev();
+          return FD;
+        }
         const auto Kind = CharDevAt(GuestPath);
         const bool Device = Kind != CharDev::None;
         const bool Tty = Kind == CharDev::Tty && Task->Ctty;
@@ -17562,26 +19182,65 @@ private:
           if ((Flags & DirectoryOnly) || Name->ends_with('/')) return -20;
           // proc_mountinfo_open and proc_mounts_open: another user's mount table needs ptrace_may_access (read)
           if (Contents && !PathOnly) {
-            if (const auto Entry = ProcOf(GuestPath); Entry && (Entry->Rest == "mountinfo" || Entry->Rest == "mounts") && !MayPtrace(*Entry->Process)) return -13;
+            if (const auto Entry = ProcOf(GuestPath)) {
+              const auto Thread = TaskOf(*Entry->Process, Entry->Rest);
+              const auto Name = Thread ? Thread->File : Entry->Rest;
+              const bool Maps = IsProcMapFile(Name);
+              // proc_maps_open and proc_mem_open apply mm_access to the target process; environ, auxv, io, wchan,
+              // syscall, stack, personality, mountstats and fdinfo check ptrace_may_access (read) as well.
+              const bool Mem = Name == "mem";
+              if (ProcFileNeedsPtrace(Name) && !MayPtrace(*Entry->Process)) return -13;
+              if (Mem) File->ProcMemPid = Entry->Process->PID;
+              if (Name == "environ") {
+                File->ProcEnvironPid = Entry->Process->PID;
+                File->ProcEnvironExec = Entry->Process->ExecGeneration;
+              }
+              if (Maps) Contents = ProcMaps(*Entry->Process, Name);
+              // proc_pid_stack needs CAP_SYS_ADMIN (and is empty: no stack tracing); attr/current has no security module.
+              if (Name == "stack" && !Task->Creds.Capable(CapSysAdmin)) File->ReadError = -13;
+              if (Entry->Rest == "attr/current") File->ReadError = -22;
+            }
           }
           // may_open_dev: a device node on a nodev mount cannot be opened
           if (Device && !PathOnly && File->Mount && (File->Mount->Flags & Switch2Guest::Mounts::MntNodev)) return -13;
           // tty_open: without a controlling terminal the open fails
           if (Kind == CharDev::Tty && !Tty && !PathOnly) return -6;
+          // /dev/console (root:tty 0600) and /dev/kmsg (root 0644): the owner check of a device node. devkmsg_open
+          // lets a write-only open through; reading needs CAP_SYSLOG (kernel.dmesg_restrict is 1).
+          if ((Kind == CharDev::Console || Kind == CharDev::Kmsg) && !PathOnly) {
+            const bool Root = Task->Creds.OwnCapable(Switch2Guest::CapDacOverride) || Task->Creds.Uid[3] == 0;
+            const bool Reads = (Flags & 3) != 1, Writes = (Flags & 3) != 0;
+            if (Kind == CharDev::Console && !Root) return -13;
+            if (Kind == CharDev::Kmsg && Writes && !Root) return -13;
+            if (Kind == CharDev::Kmsg && Reads && !Task->Creds.Capable(CapSyslog)) return -1;
+          }
           if ((Flags & Create) && (Flags & Exclusive)) return -17;
           if (!PathOnly && Kind == CharDev::Ptmx) {
             if (const auto Error = OpenPtyMaster(*File)) return Error;
           } else if (!PathOnly && Kind == CharDev::Pts) {
             if (const auto Error = OpenPtySlave(*File, PtsSlaveAt(GuestPath), Flags, true)) return Error;
           }
-          if (!PathOnly && Contents && (Flags & 3)) {
-            const auto Writer = OpenProcWriter(GuestPath);
-            if (!Writer) return -13;
-            File->ProcWrite = *Writer;
+          if (!PathOnly && Contents && (Flags & 3) && !File->ProcMemPid) {
+            if (const auto Error = MountDenies(File->Mount, false)) return Error; // a read-only mount: EROFS
+            if (const auto* Node = KernelNode(GuestPath)) {
+              // A file of the kernel tree: the mode decides (root may write 0644 files; nobody 0444 ones), then it
+              // must have a writer.
+              const bool Root = Task->Creds.OwnCapable(Switch2Guest::CapDacOverride) || Task->Creds.Uid[3] == 0;
+              if (!(Node->Mode & 0222) || (!(Node->Mode & 0022) && !Root) || !Node->Data.Write) return -13;
+              File->ProcWrite = OpenFile::ProcWriter {0, OpenFile::ProcWriter::KernelTree, {}};
+            } else {
+              const auto Writer = OpenProcWriter(GuestPath);
+              if (!Writer) return -13;
+              File->ProcWrite = *Writer;
+            }
           }
-          File->Inode = VirtualInode(GuestPath);
+          File->UdevRecord = PathContains(UdevDirectory, GuestPath);
+          if (File->UdevRecord) File->UdevCreated = KernelNode(GuestPath)->Data.Created.value_or(KernelFilesCreated);
+          File->Inode = File->UdevRecord ? KernelInode(GuestPath) : VirtualInode(GuestPath);
           if ((Flags & NoAtimeFlag) && !OwnsInodeOrRoot(File->Inode)) return -1;
-          File->Contents = Contents.value_or(std::string {});
+          if (Contents) File->Contents = std::move(*Contents);
+          // /dev/console: the launcher's console terminal, the object the standard streams of an interactive run use.
+          if (Kind == CharDev::Console && !PathOnly) File->Console = ConsoleStream::Terminal;
           if (Tty && !PathOnly) {
             // /dev/tty: another description of the controlling terminal
             File->Console = ConsoleStream::Terminal;
@@ -17595,6 +19254,13 @@ private:
           Descriptors().Files[FD] = std::move(File);
           Descriptors().Flags[FD] = (Flags & CloseOnExec) != 0;
           return FD;
+        }
+        if (PathContains(UdevDirectory, GuestPath)) {
+          fsFsClose(&SdCard);
+          if (Flags & Create) {
+            if (const auto Denied = MountDenies(OpenParentMount, true)) return Denied;
+          }
+          return -2;
         }
       }
       if (SymlinkAt(Path)) {
@@ -17744,6 +19410,11 @@ private:
     if (!File || File->PathOnly()) return BadFile;
     if (Offset && (File->Socket || File->Inet || File->Console != ConsoleStream::None)) return -29;
     if (!(Writing ? WriteAccess(File->StatusFlags) : ReadAccess(File->StatusFlags))) return BadFile;
+    if (File->InputClient) {
+      if (Offset) return -29;
+      PumpEvdev();
+      if (File->InputClient->Revoked) return Switch2Guest::Evdev::Enodev;
+    }
     if (Count > 1024) return Invalid;
     if (!Count) return 0;
     const auto VectorBytes = Count * sizeof(IoVector);
@@ -17771,8 +19442,9 @@ private:
     const size_t Limit = File->Console != ConsoleStream::None ? (Writing ? 4096 : 65536) :
                          // Vectored stream writes are gathered into one copy per
                          // attempt, so they are bounded to keep that copy small.
-                         (File->Socket ? (Writing ? VectorStreamWriteLimit : File->Socket->InputCapacity) :
-                          File->Inet ? (Writing ? VectorStreamWriteLimit : 65536) : IsDataDev(File->Path) ? 65536 : MaxRWCount);
+                         File->Socket ? (Writing ? VectorStreamWriteLimit : File->Socket->InputCapacity) :
+                         File->Inet ? (Writing ? VectorStreamWriteLimit : 65536) :
+                         (File->InputClient || IsDataDev(File->Path)) ? 65536 : MaxRWCount;
     size_t Total = 0;
     bool BufferFault = false;
     // One backend operation preserves pipe write atomicity and avoids
@@ -17791,11 +19463,12 @@ private:
       }
     }
     Vectors.resize(Used);
+    if (File->InputClient && BufferFault && Total < Switch2Guest::Evdev::InputEventSize) return Fault;
     if (!Total) return Writing ? Fault : ReadBufferFault(*File, Offset.value_or(File->Offset));
     std::unique_ptr<char[]> Buffer {new (std::nothrow) char[Total]};
     if (!Buffer) return -12;
     if (Writing) {
-      if (!File->RealFile && !File->Memory && !File->Socket && !File->Inet &&
+      if (!File->InputClient && !File->RealFile && !File->Memory && !File->Socket && !File->Inet &&
           File->Console == ConsoleStream::None) return BadFile;
       if (BufferFault && File->Pipe) return Fault;
       size_t Copied = 0;
@@ -17848,6 +19521,18 @@ private:
     if (Offset && (File->Socket || File->Inet || File->Console != ConsoleStream::None || File->AnonName)) return -29;
     if (!ReadAccess(File->StatusFlags)) return BadFile;
     if (!IsGuestUserRange(Address, Count)) return Fault;
+    if (File->InputClient) {
+      using namespace Switch2Guest::Evdev;
+      if (Offset) return -29;
+      PumpEvdev();
+      if (File->InputClient->Revoked) return Enodev;
+      if (Count && Count < InputEventSize) return Invalid;
+      const auto Transfer = std::min<uint64_t>(Count, MaxRWCount) / InputEventSize * InputEventSize;
+      if (!Transfer || !File->InputClient->Readable()) return ReadEvdev(*File, nullptr, Transfer);
+      const auto Accessible = AccessiblePrefix(Address, Transfer, PF_W);
+      if (Accessible < InputEventSize) return Fault;
+      return ReadEvdev(*File, reinterpret_cast<void*>(Address), Accessible);
+    }
     if (File->AnonName) {
       // Anonymous descriptors check the size themselves; a zero count is not special.
       Count = std::min<uint64_t>(Count, 65536);
@@ -17870,6 +19555,7 @@ private:
 
   int64_t ReadDescriptor(OpenFile& Descriptor, char* Buffer, uint64_t Count) {
     auto* File = &Descriptor;
+    if (File->InputClient) return ReadEvdev(*File, Buffer, Count);
     if (IsDataDev(File->Path)) return ReadCharDev(CharDevAt(File->Path), Buffer, Count);
     if (File->Tty) {
       if (!ReadAccess(File->StatusFlags)) return BadFile;
@@ -17975,6 +19661,30 @@ private:
       if (Read && !(File.StatusFlags & NoAtimeFlag)) MarkInodeAccessed(File.Inode);
       return Read;
     }
+    if (File.ProcMemPid) return ProcMemTransfer(File, false, reinterpret_cast<uint64_t>(Buffer), Count, Offset);
+    if (File.ProcEnvironPid) {
+      const auto* Target = FindProcess(File.ProcEnvironPid);
+      if (!Target || Target->Exited || Target->ExecGeneration != File.ProcEnvironExec) return 0;
+      const auto Size = Target->EnvironEnd - Target->EnvironStart;
+      if (Offset >= Size || !Count) return 0;
+      const auto Limit = std::min<uint64_t>(Count, Size - Offset);
+      const bool Live = Target == Task || !Target->RestorePending;
+      std::array<char, GuestPageSize> Page;
+      size_t Done = 0;
+      while (Done < Limit) {
+        const auto Start = Target->EnvironStart + Offset + Done;
+        const auto* Mapping = Target->Vmas.Find(Start);
+        // environ_read uses FOLL_ANON so a file mapping over the original environment is not read back.
+        if (!Mapping || Mapping->Backing != Switch2Guest::Vma::Anonymous || Mapping->Shared) break;
+        const auto Chunk = std::min<uint64_t>({Page.size(), Limit - Done, Mapping->End - Start});
+        const auto Read = Target->Memory.CopyFromProcess(Start, Page.data(), Chunk, Live);
+        if (!Read) break;
+        std::memcpy(static_cast<char*>(Buffer) + Done, Page.data(), Read);
+        Done += Read;
+      }
+      return Done;
+    }
+    if (File.ReadError) return File.ReadError;
     if (!File.RealFile) {
       if (Offset >= File.Contents.size()) return 0;
       const auto Data = std::string_view(File.Contents).substr(Offset);
@@ -18053,6 +19763,10 @@ private:
     }
     if (Socket || Locked) ++IOEpoch;
     return 0;
+  }
+
+  static uint8_t LinuxProtection(uint32_t Flags) {
+    return ((Flags & PF_R) ? 1 : 0) | ((Flags & PF_W) ? 2 : 0) | ((Flags & PF_X) ? 4 : 0);
   }
 
   static uint8_t PageFlags(uint64_t Protection) {
@@ -18277,6 +19991,36 @@ private:
       if (WantLock) Task->Memory.ChangeAttribute(Start, Rounded, GuestAddressSpace::Locked, true);
     };
 
+    const auto Track = [&](uint64_t Start, bool MayWrite = true) {
+      using Switch2Guest::Vma;
+      Vma Range {.Start = Start, .End = Start + Rounded, .Prot = static_cast<uint8_t>(Protection & 7), .Shared = IsShared,
+                 .GrowsDown = bool(Flags & GrowsDown), .MayWrite = MayWrite,
+                 .Accounted = !IsShared && (Protection & 2) && !(Flags & NoReserve),
+                 .MayExecute = !File || !File->Mount || !(File->Mount->Flags & Switch2Guest::Mounts::MntNoexec)};
+      if (File) {
+        const bool Memfd = File->Path.starts_with("memfd:");
+        const bool PosixShm = File->Memory && !Memfd;
+        Range.Offset = Offset;
+        Range.Inode = File->Inode;
+        Range.Backing = File->Memory ? Vma::Shmem : Vma::File;
+        Range.DevMinor = PosixShm ? ShmDevice : CharDevAt(File->Path) != CharDev::None ? DevDevice : CardDevice;
+        if (File->Mount && File->Mount->Sb->Dev >= 40) Range.DevMinor = File->Mount->Sb->Dev;
+        Range.Name = Memfd ? "/" + File->Path : MappingName(File->Path, File->Path, File->Mount);
+        Range.Deleted = Memfd || IsUnlinked(File->Inode);
+        if (File->RealFile || PosixShm) Range.BackingPath = File->Path;
+      } else if (IsShared) {
+        // shmem_zero_setup: an anonymous shared mapping is backed by an unlinked /dev/zero file in the shmem mount.
+        // The object is the address it was created at, which fork keeps, so its sharers can be found.
+        Range.Backing = Vma::Shmem;
+        Range.Object = Start;
+        Range.DevMinor = ShmDevice;
+        Range.Inode = Start / GuestPageSize;
+        Range.Name = "/dev/zero";
+        Range.Deleted = true;
+      }
+      Task->Vmas.Map(std::move(Range));
+    };
+
     if (!IsAnonymous && IsShared && !File->Memory) {
       // A shared view of an SD file: filled from the file, written back at
       // msync, munmap, fsync, exit and exec (dirty pages cannot be found).
@@ -18305,6 +20049,7 @@ private:
       PruneSharedFileViews();
       SharedFileViews.emplace(File->Inode, SharedFileView {Storage, Descriptors().Files[FD], Offset, Rounded, MayWrite, std::move(Snapshot)});
       Lock(Base);
+      Track(Base, MayWrite);
       RecordMapping(Base, Rounded, Offset, File->Path);
       return Base;
     }
@@ -18322,6 +20067,7 @@ private:
       EnableTso(*Task, "shared memory mapping");
       MappedMemoryFiles[Memory.Storage.get()] = File->Memory;
       Lock(Base);
+      Track(Base, MayWrite);
       return Base;
     }
 
@@ -18342,6 +20088,7 @@ private:
       }
       if (Initial != Access) Task->Memory.Set(Address, Rounded, Access, true);
       Lock(Address);
+      Track(Address);
       RecordMapping(Address, Rounded, Offset, File ? std::string_view(File->Path) : std::string_view {});
       return Address;
     }
@@ -18356,12 +20103,12 @@ private:
       }
       if (Initial != Access) Task->Memory.Set(Address, Rounded, Access, true);
       Lock(Address);
+      Track(Address);
       RecordMapping(Address, Rounded, Offset, File ? std::string_view(File->Path) : std::string_view {});
       return Address;
     }
-    // Replacing part of a mapping of the other sharing kind would keep the old kind.
-    if (Task->Memory.IsShared(Address, Rounded) != IsShared && Task->Memory.AnyMapped(Address, Rounded)) return -12;
     SuspendPipePages(*Task, Address, Rounded, true);
+    if (!Task->Memory.CanReplace(Address, Rounded, IsShared)) return -12;
     InvalidateExecutableRange(Frame, Address, Rounded, Access);
     Task->Memory.Discard(Address, Rounded);
     Task->Memory.ChangeAttribute(Address, Rounded, GuestAddressSpace::DontFork | GuestAddressSpace::WipeOnFork | GuestAddressSpace::Locked, false);
@@ -18369,14 +20116,23 @@ private:
       // Discard left the old protection on uncommitted pages; an access would
       // fault the CPU. Linux has already unmapped the old mapping here.
       Task->Memory.Set(Address, Rounded, Task->Memory.Unmapped, true);
+      Task->Vmas.Unmap(Address, Rounded);
       RecordMapping(Address, Rounded, 0, {});
       if (!SharedFileViews.empty()) PruneSharedFileViews();
       return -12;
     }
+    // MAP_FIXED replaces only the covered pages, which can have a different sharing kind from their neighbors.
+    Task->Memory.ChangeAttribute(Address, Rounded, GuestAddressSpace::SharedPage, IsShared);
     if (IsShared) Task->Memory.Zero(Address, Rounded);
-    if (Fill(Address)) return -5;
+    if (Fill(Address)) {
+      Task->Memory.Set(Address, Rounded, Task->Memory.Unmapped, true);
+      Task->Vmas.Unmap(Address, Rounded);
+      RecordMapping(Address, Rounded, 0, {});
+      return -5;
+    }
     if (Initial != Access) Task->Memory.Set(Address, Rounded, Access, true);
     Lock(Address);
+    Track(Address);
     RecordMapping(Address, Rounded, Offset, File ? std::string_view(File->Path) : std::string_view {});
     return Address;
   }
@@ -18392,7 +20148,9 @@ private:
     if ((Access & PF_W) && !Task->Memory.AllowsFileMappingWrite(Address, Rounded)) return -13;
     InvalidateExecutableRange(Frame, Address, Rounded, Access);
     switch (Task->Memory.SetPages(Address, Rounded, Access)) {
-    case GuestAddressSpace::SetStatus::Ok: return 0;
+    case GuestAddressSpace::SetStatus::Ok:
+      Task->Vmas.Protect(Address, Rounded, Protection & 7);
+      return 0;
     case GuestAddressSpace::SetStatus::NoMemory: return -12;
     default: return Invalid;
     }
@@ -18410,12 +20168,15 @@ private:
       if (!Task->Memory.Owns(Start, Length)) return Invalid;
     }
     if (Task->Memory.AnyHave(Address, Rounded, GuestAddressSpace::Sealed)) return -1;
+    // VmHWM sampling: before a large unmap drops pages, note the resident size (see ProcRssPeak).
+    if (Rounded >= (1u << 20)) Task->RssPeak = std::max<uint64_t>(Task->RssPeak, Task->Memory.ResidentBytes());
     SuspendPipePages(*Task, Address, Rounded, true);
     InvalidateExecutableRange(Frame, Address, Rounded, 0);
     FlushSharedFileViews(0, Address, Rounded);
     for (const auto& [Start, Length] : Runs) {
       if (!Task->Memory.Set(Start, Length, Task->Memory.Unmapped, true)) return Invalid;
     }
+    Task->Vmas.Unmap(Address, Rounded);
     RecordMapping(Address, Rounded, 0, {});
     if (!SharedFileViews.empty()) PruneSharedFileViews();
     return 0;
@@ -18440,11 +20201,14 @@ private:
       if (Task->Memory.SetPages(Task->HeapStart + OldSize, NewSize - OldSize, PF_R | PF_W, true) != GuestAddressSpace::SetStatus::Ok) {
         return Task->HeapEnd;
       }
+      Task->Vmas.Map({.Start = Task->HeapStart + OldSize, .End = Task->HeapStart + NewSize, .Prot = 3,
+                      .Special = Switch2Guest::Vma::Heap, .Accounted = true});
       if (Task->LockFuture) Task->Memory.ChangeAttribute(Task->HeapStart + OldSize, NewSize - OldSize, GuestAddressSpace::Locked, true);
     } else if (NewSize < OldSize) {
       // The pages above the new break are unmapped and go back to the arena;
       // regrown memory reads zero.
       Task->Memory.Set(Task->HeapStart + NewSize, OldSize - NewSize, GuestAddressSpace::Unmapped, true);
+      Task->Vmas.Unmap(Task->HeapStart + NewSize, OldSize - NewSize);
     }
     Task->HeapEnd = Requested;
     return Task->HeapEnd;
@@ -18480,8 +20244,11 @@ private:
     case GuestAddressSpace::RemapStatus::Ok: break;
     case GuestAddressSpace::RemapStatus::Fault: return Fault;
     case GuestAddressSpace::RemapStatus::Invalid: return Invalid;
-    case GuestAddressSpace::RemapStatus::NoMemory: return -12;
+    case GuestAddressSpace::RemapStatus::NoMemory:
+      if (Flags & FixedMove) DropUnmappedVmas(*Task, NewAddress, NewRounded);
+      return -12;
     }
+    Task->Vmas.Remap(OldAddress, OldRounded, Result, NewRounded, Flags & DontUnmap);
     InvalidateExecutableRange(Frame, Result, NewRounded, 0);
     RecordMapping(OldAddress, OldRounded, 0, {});
     RecordMapping(Result, NewRounded, 0, {});
@@ -18694,6 +20461,34 @@ private:
       }
     }
     return Total;
+  }
+
+  // mem_rw: /proc/<pid>/mem reads or writes the process's memory at Remote, a page at a time, through the copies
+  // process_vm_readv uses. It stops at the first page that is not mapped: EIO when nothing was copied. A process
+  // whose memory is gone (it exited) reads 0 bytes. Reads land in Local, a buffer the read path already checked.
+  int64_t ProcMemTransfer(OpenFile& File, bool Writing, uint64_t Local, uint64_t Count, uint64_t Remote) {
+    auto* Target = FindProcess(File.ProcMemPid);
+    if (!Target || Target->Exited) return 0;
+    const bool Live = Target == Task || !Target->RestorePending;
+    std::vector<uint8_t> Buffer(GuestPageSize);
+    int64_t Total {};
+    while (Count) {
+      const auto Chunk = std::min<uint64_t>(Count, GuestPageSize - Remote % GuestPageSize);
+      if (Writing) {
+        if (Available(Local, PF_R) < Chunk) return Total ? Total : Fault;
+        if (Target->Memory.CopyToProcess(Remote, reinterpret_cast<const void*>(Local), Chunk, Live) < Chunk) break;
+        // The target's translations of its PF_X pages go stale too.
+        if (Current && Current->Core) InvalidateExecutableRange(Current->Core->CurrentFrame, Remote, Chunk, 0, Target);
+      } else {
+        if (Target->Memory.CopyFromProcess(Remote, Buffer.data(), Chunk, Live) < Chunk) break;
+        std::memcpy(reinterpret_cast<void*>(Local), Buffer.data(), Chunk);
+      }
+      Local += Chunk;
+      Remote += Chunk;
+      Count -= Chunk;
+      Total += static_cast<int64_t>(Chunk);
+    }
+    return Total ? Total : -5;
   }
 
   // ---- membarrier --------------------------------------------------------------
@@ -18986,6 +20781,7 @@ private:
   // Guest CLOCK_REALTIME: the Horizon RTC second at startup, then real elapsed time. Process-global
   // for this launch; clock_settime and friends change it, never Horizon's clock, and it is not persisted.
   Switch2Guest::RealtimeBase Realtime {static_cast<int64_t>(time(nullptr)) * 1'000'000'000, MonotonicNs()};
+  const FileTimestamp KernelFilesCreated = WallClock();
   // settimeofday's timezone (gettimeofday reports it) and the NTP state adjtimex reads and writes.
   int32_t TimezoneMinutesWest {}, TimezoneDstTime {};
   struct NtpState {
@@ -19402,10 +21198,11 @@ Result ReadRootfsDirectory(const std::string& Folder, std::vector<DirectoryEntry
   return Status;
 }
 
-// Network files of the guest rootfs: /etc/resolv.conf from the connection's DNS servers (rewritten only
+// Prepare the RootFS account database and network files. /etc/group supplies the input device GID.
+// Network files: /etc/resolv.conf from the connection's DNS servers (rewritten only
 // when it is absent or carries our marker line, and only with a connection) and /etc/hosts with a
 // localhost line (only when absent). Once per distinct content per launcher run.
-static void PrepareNetworkFiles() {
+static int64_t PrepareRootfsFiles() {
   static constexpr std::string_view Marker = "# Generated by FEX Switch 2 launcher\n";
   static std::string LastResolv;
   static bool HostsChecked {};
@@ -19422,9 +21219,15 @@ static void PrepareNetworkFiles() {
     Resolv += "options timeout:2 attempts:2\n";
   }
   const bool NeedResolv = !Resolv.empty() && Resolv != LastResolv;
-  if (!NeedResolv && HostsChecked) return;
+  // The installer writes the input group into a new RootFS, so one repair per launcher run covers this RootFS. Later
+  // launches skip opening the file service (an inode store load and save) when nothing else needs writing.
+  static int64_t InputGid {};
+  if (!NeedResolv && HostsChecked && InputGid > 0) return InputGid;
   GuestFileService Service;
-  if (!Service.Ready()) return;
+  if (!Service.Ready()) {
+    WriteLog("Guest input: could not open the RootFS account database.");
+    return -5;
+  }
   FtpEntry Entry {};
   if (NeedResolv) {
     LastResolv = Resolv;
@@ -19456,12 +21259,16 @@ static void PrepareNetworkFiles() {
       Service.WriteFile("/etc/hosts", RootfsSetup::Bytes(Hosts), 0644, 0, 0, static_cast<int64_t>(std::time(nullptr)));
     }
   }
+  // Repair existing installations through the same atomic account-file writer as the installer.
+  if (InputGid <= 0) InputGid = RootfsSetup::EnsureInputGroup(Service, static_cast<int64_t>(std::time(nullptr)));
+  if (InputGid < 0) WriteLog("Guest input: could not set up the input group in /etc/group.");
+  return InputGid;
 }
 
 static std::optional<uint64_t> RunGuestOnCurrentThread(uint64_t Entry, std::span<const Segment> Segments, const std::string& Folder,
                                  std::string_view Program, std::span<const std::string> Arguments,
                                  const ElfImage* ProgramImage, uint64_t InterpreterBase, const std::string& WorkingDirectory, bool SingleBlock, bool Interactive) {
-  PrepareNetworkFiles();
+  const auto InputGid = PrepareRootfsFiles();
   using namespace FEXCore;
   Config::Set(Config::CONFIG_IS64BIT_MODE, "1");
   Config::Set(Config::CONFIG_DISKCACHE, "0");
@@ -19471,7 +21278,8 @@ static std::optional<uint64_t> RunGuestOnCurrentThread(uint64_t Entry, std::span
 
   if (Logging == LogLevel::Trace) WriteRunCheckpoint("Launcher entered guest runtime");
   auto Syscalls = fextl::make_unique<GuestSyscalls>(Segments, Folder, Root, WorkingDirectory, Interactive);
-  if (ProgramImage) Syscalls->TrackInitialExecutable(Program);
+  Syscalls->SetInputGroup(InputGid);
+  if (ProgramImage) Syscalls->TrackInitialExecutable(Program, *ProgramImage, Segments);
   if (Logging == LogLevel::Trace) WriteRunCheckpoint("Launcher initializing guest context");
   PrintStage("Creating FEXCore context and dispatcher...");
   Core::CPUState State {};
@@ -19501,9 +21309,7 @@ static std::optional<uint64_t> RunGuestOnCurrentThread(uint64_t Entry, std::span
     Environment.insert(Environment.end(), {"HISTFILE=", "TERMINFO=/lib/terminfo", "PS1=\\[\\e[36m\\]fex\\[\\e[0m\\]:\\w\\$ "});
   }
   // The auxiliary vector carries the launch identity (AT_EUID of a root run is 0), as an exec would.
-  const auto LaunchIds = Switch2Guest::AuxvIds(LaunchCredentials ? Switch2Guest::LaunchCredentialsFor(LaunchCredentials->first, LaunchCredentials->second)
-                                                                 : Switch2Guest::Credentials {});
-  State.gregs[X86State::REG_RSP] = BuildInitialStack(StackBase, Program, Argv, Environment, ProgramImage, InterpreterBase, LaunchIds);
+  State.gregs[X86State::REG_RSP] = Syscalls->InitialStack(StackBase, Program, Argv, Environment, ProgramImage, InterpreterBase);
 
   if (!Syscalls->AddMainThread(State)) {
     PrintStage("Could not allocate the guest return stack.");
@@ -19671,7 +21477,7 @@ void RunGuestServiceThread(GuestService& Service) {
   struct LogScope {
     ~LogScope() { EndGuestLog(); }
   } GuestLogScope;
-  PrepareNetworkFiles();
+  const auto InputGid = PrepareRootfsFiles();
   using namespace FEXCore;
   Config::Set(Config::CONFIG_IS64BIT_MODE, "1");
   Config::Set(Config::CONFIG_DISKCACHE, "0");
@@ -19679,6 +21485,7 @@ void RunGuestServiceThread(GuestService& Service) {
   Config::Set(Config::CONFIG_MAXINST, "64");
   Config::Set(Config::CONFIG_DISABLE_VIXL_INDIRECT_RUNTIME_CALLS, "1");
   auto Syscalls = fextl::make_unique<GuestSyscalls>(std::span<const Segment> {}, Root, Root, "/", false, false, true);
+  Syscalls->SetInputGroup(InputGid);
   Syscalls->Service = &Service;
   Syscalls->RunThreads();
   Syscalls.reset();  // saves the inode store

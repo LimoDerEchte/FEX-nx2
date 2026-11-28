@@ -306,12 +306,16 @@ void TestSchema() {
   for (const SettingDef& D : S)
     if (M.Enabled(D))
       ++Enabled;
-  CHECK(Enabled == 10 && S.size() == 10);  // reinstall, wipe, start folder, theme, accent, log level, then the four developer actions
+  CHECK(Enabled == 11 && S.size() == 11);
   CHECK(M.Get("log_level") == "standard" && M.Get("start_folder") == "/fex/games");
   const SettingDef* Sf = M.Find("start_folder");
   CHECK(Sf && Sf->Type == RowType::Path && Sf->Folder && Sf->Store == StoreKind::App);
   const SettingDef* Ll = M.Find("log_level");
   CHECK(Ll && Ll->Options.size() == 3 && Ll->Options[0].Id == "standard" && Ll->Options[2].Id == "trace");
+  const SettingDef* Identity = M.Find("gamepad_identity");
+  CHECK(Identity && Identity->Section == "Developer" && Identity->Label == "Gamepad identity");
+  CHECK(Identity->Store == StoreKind::App && M.Get("gamepad_identity") == "xbox360" && Identity->Options.size() == 2);
+  CHECK(Identity->Options[0].Label == "Xbox 360 controller" && Identity->Options[1].Label == "Switch Pro Controller");
   // Dependency: the custom command needs the Custom mode (generic row machinery, test schema).
   SettingsModel M2(RichSchema());
   const SettingDef& Dep = *M2.Find("ex_cmd");
@@ -349,6 +353,7 @@ void TestPersistence() {
   CHECK(M.Get("log_level") == "detailed");  // from ui.json
   CHECK(!M.Changed());
   M.Set("log_level", "trace");
+  M.Set("gamepad_identity", "switch_pro");
   M.Set("accent", "violet");
   M.Set("ex_toggle", "false");
   M.Set("ex_slider", "9000");
@@ -373,6 +378,7 @@ void TestPersistence() {
   // Round trip into a new model.
   SettingsModel M2(RichSchema());
   CHECK(M2.Load(St, P, W));
+  CHECK(M2.Get("gamepad_identity") == "switch_pro");
   CHECK(M2.Get("log_level") == "trace" && M2.Get("accent") == "violet" && !M2.GetBool("ex_toggle") && M2.Get("ex_slider") == "9000");
   CHECK(M2.Get("start_folder") == "/fex/games/demo" && M2.Get("ex_file") == "sdmc:/fex/rootfs/Ubuntu_22_04.sqsh");
 

@@ -239,6 +239,10 @@ bool App::DoFrame(bool Nested) {
   }
   if (Stack.back().S.get() != Before)
     Stack.back().S->Update(Now, R.Scale(), {});  // the new top gets its first update before its first draw
+  for (auto& Entry : Stack) {
+    if (Entry.K == ScreenKind::Shell)
+      static_cast<ShellScreen&>(*Entry.S).SetForeground(&Entry == &Stack.back());
+  }
   const Theme& T = CurrentTheme();
   DrawContext C {R, F, I, T, R.Scale()};
   if (FadeOut && Now >= FadeStart + FadeMs) {

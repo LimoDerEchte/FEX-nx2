@@ -20,6 +20,7 @@
 #include <optional>
 
 #include "GuestFtp.h"
+#include "GuestInputFeed.h"
 #include "GuestRootFS.h"
 #include "GuestService.h"
 #include "HostNet.h"
@@ -351,6 +352,10 @@ public:
 
   // ---- settings of the launcher itself
   void ApplySetting(const std::string& Key, const std::string& Value) override {
+    if (Key == "gamepad_identity") {
+      InputFeed().SetGamepadIdentity(Value == "switch_pro" ? Evdev::GamepadIdentity::SwitchPro :
+                                                            Evdev::GamepadIdentity::Xbox360);
+    }
     if (Key == "log_level") Logging = Value == "trace" ? LogLevel::Trace : Value == "detailed" ? LogLevel::Detailed : LogLevel::Standard;
   }
 
@@ -456,9 +461,13 @@ public:
     Host.Master.SetSize(Cols, Rows);
     Host.Sized.store(true);
   }
+  void SessionForeground(int Id, bool Value) override {
+    if (Service && Sessions.contains(Id)) Service->SetForeground(Id, Value);
+  }
   void SessionClose(int Id) override {
     auto It = Sessions.find(Id);
     if (It == Sessions.end()) return;
+    SessionForeground(Id, false);
     It->second.Host->CloseRequested.store(true);
     Sessions.erase(It);
   }

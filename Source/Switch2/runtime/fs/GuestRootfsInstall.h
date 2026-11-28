@@ -725,6 +725,8 @@ inline const char* EverydaySetup(RootfsWriter& Writer, const std::vector<uint32_
       Stats.Notes.push_back("added group " + User + " (1000)");
     }
   }
+  if (const auto Gid = RootfsSetup::EnsureInputGroup(Writer, Time); Gid < 0)
+    return Fail("/etc/group (input)", Gid);
   if (const auto* Error = Account("/etc/shadow", 0640, 0, "root:*:19000:0:99999:7:::\n" + User + ":*:19000:0:99999:7:::\n",
                                   User + ":*:19000:0:99999:7:::\n", User + ":"))
     return Error;

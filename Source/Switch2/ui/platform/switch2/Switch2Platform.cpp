@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "GuestInputFeed.h"
 #include "platform/HidKeyMap.h"
 #include "platform/Log.h"
 #include "platform/Platform.h"
@@ -25,6 +26,8 @@
 
 namespace ui {
 namespace {
+
+using namespace Switch2Guest;
 
 uint64_t NowMs() {
   using namespace std::chrono;
@@ -194,6 +197,8 @@ public:
     Log("step input init: ok (9 pads, touch, %s, pointer gain %.2f)", NmouseOk ? "nmouse" : "legacy mouse", double(Gain));
   }
   ~Switch2Input() override {
+    for (auto& Pad : Vibration)
+      SendVibration(Pad, 0, 0);
     if (NmouseOk)
       for (int I = 8; I >= 0; --I)
         padPointerExit(&Pointers[I]);
@@ -214,6 +219,7 @@ public:
 
   void Poll(std::vector<Event>& Out) override {
     const uint64_t Now = NowMs();
+    FrameNs = armTicksToNs(armGetSystemTick());
     if (D.SizeSerial() != LastSerial) {
       LastSerial = D.SizeSerial();
       Event E;
@@ -225,6 +231,16 @@ public:
     }
     for (int I = 0; I < 9; ++I)
       padUpdate(&Pads[I]);
+    PublishPads();
+    PollRumble();
+    const bool OwnsPads = InputFeed().IsOwned(InputClass::Pad);
+    if (OwnsPads && !PadsOwned)
+      Out.push_back({.Kind = Event::Type::PadCancel, .TimeMs = Now});
+    PadsOwned = OwnsPads;
+    MouseOwned = InputFeed().IsOwned(InputClass::Mouse);
+    if (MouseOwned)
+      for (size_t I = 0; I < MouseOut.size(); ++I)
+        EmitButton(Out, Now, static_cast<MouseButton>(I), false, true);
     std::fill(std::begin(SuppressMask), std::end(SuppressMask), u64(0));
     if (NmouseOk)
       PollNmouse(Out, Now);
@@ -236,6 +252,112 @@ public:
   }
 
 private:
+  struct PlayingRumble {
+    Evdev::RumbleRequest Request;
+    uint64_t StartNs;
+  };
+
+  struct PadVibration {
+    std::array<std::optional<PlayingRumble>, 16> Effects;
+    HidVibrationDeviceHandle Handles[2] {};
+    int Count {};
+    uint32_t Strong {}, Weak {};
+  };
+
+  uint64_t FrameNs {};
+  std::array<int, InputPadCount> FeedPads {};
+  std::array<uint32_t, InputPadCount> FeedStyles {};
+  std::array<uint64_t, InputPadCount> FeedConnections {};
+  std::array<PadVibration, InputPadCount> Vibration {};
+  uint64_t ReleasedGeneration {};
+
+  static void SendVibration(PadVibration& Pad, uint32_t Strong, uint32_t Weak) {
+    if (!Pad.Count || (Pad.Strong == Strong && Pad.Weak == Weak))
+      return;
+    const HidVibrationValue Value {float(Strong) / 65535.0f, 160.0f, float(Weak) / 65535.0f, 320.0f};
+    const HidVibrationValue Values[] {Value, Value};
+    if (R_SUCCEEDED(hidSendVibrationValues(Pad.Handles, Values, Pad.Count))) {
+      Pad.Strong = Strong;
+      Pad.Weak = Weak;
+    }
+  }
+
+  void PublishPads() {
+    int HandheldSlot = -1;
+    if (padIsConnected(&Pads[8])) {
+      for (size_t I = 0; I < InputPadCount; ++I) {
+        if (!padIsConnected(&Pads[I]) && (HandheldSlot < 0 || FeedPads[I] == 8))
+          HandheldSlot = int(I);
+      }
+    }
+    for (size_t I = 0; I < InputPadCount; ++I) {
+      const int Physical = int(I) == HandheldSlot ? 8 : int(I);
+      const auto& Pad = Pads[Physical];
+      const bool Connected = padIsConnected(&Pad);
+      const uint32_t Style = Connected ? padGetStyleSet(&Pad) : 0;
+      if (FeedStyles[I] && (FeedPads[I] != Physical || FeedStyles[I] != Style))
+        InputFeed().PublishPad(I, {}, FrameNs);
+      FeedPads[I] = Physical;
+      FeedStyles[I] = Style;
+      const auto Left = padGetStickPos(&Pad, 0), Right = padGetStickPos(&Pad, 1);
+      const auto Connection = InputFeed().PublishPad(
+        I, {padGetButtons(&Pad), Left.x, Left.y, Right.x, Right.y, Style, Connected}, FrameNs);
+      if (FeedConnections[I] != Connection) {
+        SendVibration(Vibration[I], 0, 0);
+        Vibration[I] = {};
+        FeedConnections[I] = Connection;
+      }
+    }
+  }
+
+  void PollRumble() {
+    const uint64_t Generation = InputFeed().ReleasedGeneration();
+    const auto Requests = InputFeed().TakeRumble();
+    if (Generation != ReleasedGeneration) {
+      for (auto& Pad : Vibration)
+        Pad.Effects = {};
+      ReleasedGeneration = Generation;
+    }
+    for (const auto& [Index, Request] : Requests) {
+      if (!FeedStyles[Index] || Request.EffectId < 0 || Request.EffectId >= int(Vibration[Index].Effects.size()))
+        continue;
+      auto& Pad = Vibration[Index];
+      auto& Effect = Pad.Effects[Request.EffectId];
+      if (Request.Stop) {
+        Effect.reset();
+        continue;
+      }
+      if (!Pad.Count) {
+        const int Physical = FeedPads[Index];
+        const auto Id = Physical == 8 ? HidNpadIdType_Handheld : static_cast<HidNpadIdType>(Physical);
+        const auto Style = static_cast<HidNpadStyleTag>(FeedStyles[Index]);
+        const int Count = Style == HidNpadStyleTag_NpadJoyLeft || Style == HidNpadStyleTag_NpadJoyRight ? 1 : 2;
+        if (R_FAILED(hidInitializeVibrationDevices(Pad.Handles, Count, Id, Style)))
+          continue;
+        Pad.Count = Count;
+      }
+      Effect = PlayingRumble {Request, FrameNs};
+    }
+    for (auto& Pad : Vibration) {
+      uint32_t Strong = 0, Weak = 0;
+      for (auto& Effect : Pad.Effects) {
+        if (!Effect)
+          continue;
+        const auto& Request = Effect->Request;
+        const uint64_t ElapsedMs = (FrameNs - Effect->StartNs) / 1'000'000;
+        const uint32_t ReplayMs = uint32_t {Request.DelayMs} + Request.DurationMs;
+        if (Request.DurationMs && ElapsedMs / ReplayMs >= Request.PlayCount) {
+          Effect.reset();
+          continue;
+        }
+        const auto [StrongSample, WeakSample] = Evdev::RumbleAt(Request, Request.DurationMs ? ElapsedMs % ReplayMs : ElapsedMs);
+        Strong += StrongSample;
+        Weak += WeakSample;
+      }
+      SendVibration(Pad, std::min(Strong, 65535u), std::min(Weak, 65535u));
+    }
+  }
+
   static bool KeyboardEvent(const HidKeyboardState& State, int Usage, uint64_t Now, Event& E) {
     const auto Mods = State.modifiers;
     // The mapping of USB HID usages to events is host code (platform/HidKeyMap.h) so that the unit tests cover it.
@@ -252,7 +374,11 @@ private:
   void PollKeyboard(std::vector<Event>& Out, uint64_t Now) {
     HidKeyboardState States[16];
     const size_t Count = hidGetKeyboardStates(States, std::size(States));
+    const bool Owned = InputFeed().IsOwned(InputClass::Keyboard);
+    if (Owned)
+      RepeatUsage = 0;
     if (!Count) {
+      InputFeed().PublishKeyboard({}, FrameNs);
       Keyboard = {};
       RepeatUsage = 0;
       return;
@@ -263,6 +389,19 @@ private:
       if (Current.sampling_number <= Keyboard.sampling_number)
         continue;
       auto Held = [&](int Usage) { return hidKeyboardStateGetKey(&Current, HidKeyboardKey(Usage)); };
+      KeyboardReport Report {};
+      for (size_t Usage = 0; Usage < Report.Usages.size(); ++Usage)
+        Report.Usages[Usage] = Held(int(Usage));
+      for (size_t I = 0; I < 8; ++I) {
+        if (Report.Usages[0xe0 + I])
+          Report.Modifiers |= 1 << I;
+        Report.Usages.reset(0xe0 + I);
+      }
+      InputFeed().PublishKeyboard(Report, FrameNs);
+      if (Owned) {
+        Keyboard = Current;
+        continue;
+      }
       if (RepeatUsage && !Held(RepeatUsage))
         RepeatUsage = 0;
       for (int Usage = HidKeyboardKey_A; Usage <= HidKeyboardKey_NumPadEquals; ++Usage) {
@@ -300,8 +439,12 @@ private:
   bool NmouseOk = false;
   float StickX[9][2] {}, StickY[9][2] {};
   u64 HeldOut[9] {};   // buttons already reported per pad
+  bool PadsOwned = false;
+  u64 GuestHeld[9] {};
   u64 SuppressMask[9] {};  // bits that the Joy-Con pointer owns this poll (ZL/ZR as click)
   bool MouseSeen = false;
+  bool MouseOwned = false;
+  std::array<bool, static_cast<size_t>(MouseButton::Count)> MouseOut {};
   float Gain = 1.0f;
   float PX = 0, PY = 0;  // pointer, output pixels
 
@@ -324,7 +467,8 @@ private:
   u64 StdSeen = 0;
   bool StdPrimed = false;
   u32 StdButtons = 0;
-  bool LeftDown = false;  // click state reported for the Joy-Con pointer
+  bool LeftDown = false;  // Physical trigger state of the active Joy-Con pointer.
+  bool JoyLeftOut = false;
   int SeenDevices = 0;
   long long RawDx = 0, RawDy = 0, RawWheel = 0;
   uint64_t Samples = 0, Skipped = 0;
@@ -341,6 +485,11 @@ private:
   std::vector<Finger> Fingers;
 
   const char* ActiveName() const { return HasActive ? (ActiveLeft ? "JoyLeft" : "JoyRight") : "none"; }
+
+  void PublishMouse(int32_t X = 0, int32_t Y = 0, int32_t Wheel = 0, int32_t HWheel = 0) {
+    const uint8_t Buttons = uint8_t((NmouseOk ? StdButtons : LastMouseButtons) | (LeftDown ? HidMouseButton_Left : 0));
+    InputFeed().PublishMouse({X, Y, Wheel, HWheel, Buttons}, FrameNs);
+  }
 
   void LoadGainFile() {
     // Optional sidecar sdmc:/fex/ui-pointer-gain.txt with one number (a test aid, never required).
@@ -360,6 +509,8 @@ private:
   }
 
   void EmitMove(std::vector<Event>& Out, uint64_t Now, float DxCounts, float DyCounts) {
+    if (MouseOwned)
+      return;
     const Size Sz = D.GetSize();
     const float K = Gain * float(Sz.W) / float(AreaW);
     const float Ox = PX, Oy = PY;
@@ -376,15 +527,21 @@ private:
       Out.push_back(E);
     }
   }
-  void EmitButton(std::vector<Event>& Out, uint64_t Now, MouseButton B, bool Pressed) {
+  void EmitButton(std::vector<Event>& Out, uint64_t Now, MouseButton B, bool Pressed, bool Cancel = false) {
+    auto& WasPressed = MouseOut[static_cast<size_t>(B)];
+    if ((MouseOwned && Pressed) || WasPressed == Pressed)
+      return;
+    WasPressed = Pressed;
     Event E;
-    E.Kind = Event::Type::MouseButton;
+    E.Kind = Cancel ? Event::Type::MouseCancel : Event::Type::MouseButton;
     E.TimeMs = Now;
     E.Mouse = B;
     E.Pressed = Pressed;
     Out.push_back(E);
   }
   void EmitWheel(std::vector<Event>& Out, uint64_t Now, float Dy) {
+    if (MouseOwned)
+      return;
     Event E;
     E.Kind = Event::Type::MouseWheel;
     E.TimeMs = Now;
@@ -404,10 +561,13 @@ private:
   }
 
   void PollNmouse(std::vector<Event>& Out, uint64_t Now) {
-    const u64 NowNs = armTicksToNs(armGetSystemTick());
+    const uint64_t NowNs = FrameNs;
+    const bool JoyLeftWasDown = LeftDown;
+    const bool PreviousJoyLeftOut = JoyLeftOut;
     for (Dev& V : Devs)
       V.Alive = false;
     int Count = 0;
+    int32_t JoyX = 0, JoyY = 0, JoyWheel = 0;
     bool ActiveSeen = false;
     for (int Pad = 0; Pad < 9; ++Pad) {
       padPointerUpdate(&Pointers[Pad], &Pads[Pad]);
@@ -431,15 +591,15 @@ private:
           Log("input: nmouse type set 0x%x (1 merged, 2 JoyLeft, 4 JoyRight, 8 StandardMouse)", Types);
           continue;
         }
-        float Dx = 0, Dy = 0, Wheel = 0;
+        int32_t Dx = 0, Dy = 0, Wheel = 0;
         for (size_t I = 0; I < Total; ++I) {
           if (St[I].sampling_number <= V.Seen)
             break;  // newest first
           ++Samples;
-          Wheel += float(St[I].wheel_delta_y);
+          Wheel += St[I].wheel_delta_y;
           if (St[I].flags & 2) {  // bit 1 clear: the sensor did not track (lifted off the surface)
-            Dx += float(St[I].delta_x);
-            Dy += float(St[I].delta_y);
+            Dx += St[I].delta_x;
+            Dy += St[I].delta_y;
           } else {
             ++Skipped;
           }
@@ -460,23 +620,23 @@ private:
           Log("input: joy-con pointer in use: %s on pad %d", IsLeft ? "left" : "right", Pad);
         }
         if (HasActive && ActiveHandle == H.handle) {
+          JoyX = Dx;
+          JoyY = Dy;
+          JoyWheel = Wheel;
           ActiveSeen = true;
           MouseSeen = true;
           RawDx += (long long)Dx;
           RawDy += (long long)Dy;
           RawWheel += (long long)Wheel;
-          if (Dx != 0 || Dy != 0)
+          if (!PadsOwned && (Dx != 0 || Dy != 0))
             EmitMove(Out, Now, Dx, Dy);
-          if (Wheel != 0)
+          if (!PadsOwned && Wheel != 0)
             EmitWheel(Out, Now, Wheel);
           // The click is the Joy-Con's own ZL (left) or ZR (right), so that trigger is not also a button meanwhile.
           const u64 Bit = ActiveLeft ? HidNpadButton_ZL : HidNpadButton_ZR;
           const bool Down = (padGetButtons(&Pads[Pad]) & Bit) != 0;
           SuppressMask[Pad] |= Bit;
-          if (Down != LeftDown) {
-            LeftDown = Down;
-            EmitButton(Out, Now, MouseButton::Left, Down);
-          }
+          LeftDown = Down;
           if (Dx != 0 || Dy != 0 || Down)
             ActiveSinceStill = NowNs;
         }
@@ -485,12 +645,18 @@ private:
     SeenDevices = Count;
     // Release the Joy-Con when it left the list or has been still for 3 s (the trigger is a button again).
     if (HasActive && (!ActiveSeen || NowNs - ActiveSinceStill >= StillNs)) {
-      if (LeftDown)
-        EmitButton(Out, Now, MouseButton::Left, false);
       LeftDown = false;
       Log("input: joy-con pointer released (%s)", ActiveSeen ? "still for 3 s" : "device gone");
       HasActive = false;
     }
+    if (!LeftDown || PadsOwned || MouseOwned)
+      JoyLeftOut = false;
+    else if (!JoyLeftWasDown)
+      JoyLeftOut = true;
+    if (JoyLeftOut != PreviousJoyLeftOut)
+      EmitButton(Out, Now, MouseButton::Left, JoyLeftOut || (StdButtons & HidMouseButton_Left),
+                 PadsOwned || !ActiveSeen);
+    PublishMouse(JoyX, JoyY, JoyWheel);
     PollStandardMouse(Out, Now);
   }
 
@@ -512,6 +678,12 @@ private:
     size_t Total = 0;
     if (R_FAILED(hidGetNmouseStatesWithDelta(StdHandle, St, 16, &Total))) {
       HasStd = false;
+      StdButtons = 0;
+      PublishMouse();
+      for (size_t I = 0; I < MouseOut.size(); ++I) {
+        if (I != 0 || !JoyLeftOut)
+          EmitButton(Out, Now, static_cast<MouseButton>(I), false, true);
+      }
       Log("input: nmouse standard mouse gone");
       return;
     }
@@ -521,16 +693,23 @@ private:
       StdPrimed = true;
       StdSeen = St[0].sampling_number;
       StdButtons = St[0].buttons;
+      PublishMouse();
       return;
     }
     float Dx = 0, Dy = 0, Wheel = 0;
-    for (size_t I = 0; I < Total && St[I].sampling_number > StdSeen; ++I) {
-      Dx += float(St[I].delta_x);
-      Dy += float(St[I].delta_y);
-      Wheel += float(St[I].wheel_delta_y);
+    const u32 PreviousButtons = StdButtons;
+    for (size_t I = Total; I-- > 0;) {
+      const auto& Sample = St[I];
+      if (Sample.sampling_number <= StdSeen)
+        continue;
+      StdButtons = Sample.buttons;
+      PublishMouse(Sample.delta_x, Sample.delta_y, Sample.wheel_delta_y);
+      Dx += float(Sample.delta_x);
+      Dy += float(Sample.delta_y);
+      Wheel += float(Sample.wheel_delta_y);
     }
     StdSeen = St[0].sampling_number;
-    if (Dx != 0 || Dy != 0 || Wheel != 0 || St[0].buttons != StdButtons)
+    if (Dx != 0 || Dy != 0 || Wheel != 0 || StdButtons != PreviousButtons)
       MouseSeen = true;
     RawDx += (long long)Dx;
     RawDy += (long long)Dy;
@@ -539,19 +718,27 @@ private:
       EmitMove(Out, Now, Dx, Dy);
     if (Wheel != 0)
       EmitWheel(Out, Now, Wheel);
-    const u32 Changed = St[0].buttons ^ StdButtons;
+    const u32 Changed = StdButtons ^ PreviousButtons;
     static const u32 Bits[5] = {HidMouseButton_Left, HidMouseButton_Right, HidMouseButton_Middle, HidMouseButton_Back, HidMouseButton_Forward};
     static const MouseButton Map[5] = {MouseButton::Left, MouseButton::Right, MouseButton::Middle, MouseButton::Back, MouseButton::Forward};
     for (int B = 0; B < 5; ++B)
       if (Changed & Bits[B])
-        EmitButton(Out, Now, Map[B], (St[0].buttons & Bits[B]) != 0);
-    StdButtons = St[0].buttons;
+        EmitButton(Out, Now, Map[B], (StdButtons & Bits[B]) != 0 || (B == 0 && JoyLeftOut));
   }
 
   void PollPads(std::vector<Event>& Out, uint64_t Now) {
     for (int I = 0; I < 9; ++I) {
       // Report the difference between what the pad holds (minus what the pointer owns) and what was reported before.
-      const u64 Held = padGetButtons(&Pads[I]) & ~SuppressMask[I];
+      const u64 Buttons = padGetButtons(&Pads[I]);
+      if (PadsOwned) {
+        GuestHeld[I] = Buttons;
+        HeldOut[I] = 0;
+        for (unsigned S = 0; S < 2; ++S)
+          StickX[I][S] = StickY[I][S] = 0;
+        continue;
+      }
+      GuestHeld[I] &= Buttons;
+      const u64 Held = Buttons & ~(SuppressMask[I] | GuestHeld[I]);
       const u64 Diff = Held ^ HeldOut[I];
       for (int Bit = 0; Bit < 16; ++Bit) {
         if (Diff & (1ull << Bit)) {
@@ -565,7 +752,7 @@ private:
       }
       HeldOut[I] = Held;
       for (unsigned S = 0; S < 2; ++S) {
-        HidAnalogStickState St = padGetStickPos(&Pads[I], S);
+        const auto St = padGetStickPos(&Pads[I], S);
         float X = float(St.x) / 32767.0f, Y = float(St.y) / 32767.0f;
         if (X != StickX[I][S] || Y != StickY[I][S]) {
           StickX[I][S] = X;
@@ -626,12 +813,19 @@ private:
   void PollLegacyMouse(std::vector<Event>& Out, uint64_t Now) {
     HidMouseState States[8] {};
     size_t Count = hidGetMouseStates(States, 8);
-    if (!Count)
+    if (!Count || !(States[0].attributes & HidMouseAttribute_IsConnected)) {
+      MousePrimed = false;
+      LastMouseButtons = 0;
+      PublishMouse();
+      for (size_t I = 0; I < MouseOut.size(); ++I)
+        EmitButton(Out, Now, static_cast<MouseButton>(I), false, true);
       return;
+    }
     if (!MousePrimed) {
       MousePrimed = true;
       LastMouseSample = States[0].sampling_number;
       LastMouseButtons = States[0].buttons;
+      PublishMouse();
       return;
     }
     for (size_t I = Count; I-- > 0;) {
@@ -649,6 +843,7 @@ private:
         if (Changed & Bits[B])
           EmitButton(Out, Now, Map[B], (M.buttons & Bits[B]) != 0);
       LastMouseButtons = M.buttons;
+      PublishMouse(M.delta_x, M.delta_y, M.wheel_delta_y, M.wheel_delta_x);
       if (M.wheel_delta_y)
         EmitWheel(Out, Now, float(M.wheel_delta_y));
     }
